@@ -14,12 +14,15 @@ namespace EyeTracking.Recording
         [SerializeField] private bool findRecordDotByName = true;
         [SerializeField] private bool createRecordDotIfMissing = true;
         [SerializeField] private bool ignoreInputWhileSystemMenuHeld = true;
+        [SerializeField] private bool logControllerInputStatus = true;
+        [SerializeField, Min(0.5f)] private float controllerInputStatusIntervalSeconds = 3f;
         [SerializeField] private Vector3 recordDotLocalPosition = new Vector3(0.22f, 0.16f, 0.7f);
         [SerializeField] private Vector3 calibrationDotLocalPosition = new Vector3(0.18f, 0.16f, 0.7f);
         [SerializeField] private float recordDotScale = 0.025f;
 
         private bool lastDotVisible;
         private bool lastCalibrationDotVisible;
+        private float nextControllerInputStatusTime;
 
         private void Awake()
         {
@@ -31,6 +34,7 @@ namespace EyeTracking.Recording
         private void Update()
         {
             ResolveReferences();
+            LogControllerInputStatus();
 
             if (ignoreInputWhileSystemMenuHeld && QuestRecordingInputGuard.ShouldIgnoreRecordingInput())
             {
@@ -113,13 +117,43 @@ namespace EyeTracking.Recording
         private static bool RightAButtonDown()
         {
             return OVRInput.GetDown(OVRInput.RawButton.A, OVRInput.Controller.RTouch) ||
-                   OVRInput.GetDown(OVRInput.Button.One, OVRInput.Controller.RTouch);
+                   OVRInput.GetDown(OVRInput.RawButton.A, OVRInput.Controller.All) ||
+                   OVRInput.GetDown(OVRInput.Button.One, OVRInput.Controller.RTouch) ||
+                   OVRInput.GetDown(OVRInput.Button.One, OVRInput.Controller.All);
         }
 
         private static bool RightBButtonDown()
         {
             return OVRInput.GetDown(OVRInput.RawButton.B, OVRInput.Controller.RTouch) ||
-                   OVRInput.GetDown(OVRInput.Button.Two, OVRInput.Controller.RTouch);
+                   OVRInput.GetDown(OVRInput.RawButton.B, OVRInput.Controller.All) ||
+                   OVRInput.GetDown(OVRInput.Button.Two, OVRInput.Controller.RTouch) ||
+                   OVRInput.GetDown(OVRInput.Button.Two, OVRInput.Controller.All);
+        }
+
+        private void LogControllerInputStatus()
+        {
+            if (!logControllerInputStatus || Time.unscaledTime < nextControllerInputStatusTime)
+            {
+                return;
+            }
+
+            nextControllerInputStatusTime = Time.unscaledTime + controllerInputStatusIntervalSeconds;
+            OVRInput.Controller connected = OVRInput.GetConnectedControllers();
+            bool rTouchConnected = (connected & OVRInput.Controller.RTouch) != 0;
+            bool anyTouchConnected =
+                (connected & (OVRInput.Controller.LTouch | OVRInput.Controller.RTouch | OVRInput.Controller.Touch)) != 0;
+            bool aHeld = OVRInput.Get(OVRInput.RawButton.A, OVRInput.Controller.All) ||
+                         OVRInput.Get(OVRInput.Button.One, OVRInput.Controller.All);
+            bool bHeld = OVRInput.Get(OVRInput.RawButton.B, OVRInput.Controller.All) ||
+                         OVRInput.Get(OVRInput.Button.Two, OVRInput.Controller.All);
+            bool rPos = OVRInput.GetControllerPositionTracked(OVRInput.Controller.RTouch);
+            bool rRot = OVRInput.GetControllerOrientationTracked(OVRInput.Controller.RTouch);
+            Debug.Log(
+                "[QuestCameraRecorderHotkeys] input " +
+                $"connected={connected} rTouchConnected={rTouchConnected} anyTouchConnected={anyTouchConnected} " +
+                $"rPos={rPos} rRot={rRot} aHeld={aHeld} bHeld={bHeld} " +
+                $"recording={recorder != null && recorder.IsRecording} calibration={calibrationRecorder != null && calibrationRecorder.IsRecording}",
+                this);
         }
 
         private static GameObject FindSceneObjectByName(string objectName)
