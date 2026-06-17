@@ -24,6 +24,8 @@ DEFAULT_CAPTURE_INTERVAL_SECONDS = 0.35
 DEFAULT_FLEXIV_RDK_ROOT: Path | None = None
 DEFAULT_FLEXIV_ROBOT_SN = "Rizon4-062713"
 DEFAULT_END_CAMERA_SERIAL = "750612070265"
+MIN_HAND_EYE_EE_TRANSLATION_SPAN_M = 0.02
+MIN_HAND_EYE_EE_ROTATION_SPAN_DEG = 2.0
 DEFAULT_CONTROLLER_TRANSLATION_SCALE = 1.0
 DEFAULT_CONTROLLER_MAX_OFFSET_M = 0.18
 DEFAULT_CONTROLLER_MAX_STEP_M = 0.015
@@ -988,6 +990,8 @@ def calibrate_robot_realsense_run(
     if len(observations) < int(min_detections):
         raise ValueError(f"Need at least {min_detections} valid end-camera detections, got {len(observations)}")
 
+    diversity = observation_pose_diversity(observations)
+    require_hand_eye_pose_diversity(diversity)
     solution = solve_end_hand_eye(observations)
     result = {
         "ok": True,
@@ -1002,6 +1006,7 @@ def calibrate_robot_realsense_run(
             "detections": len(observations),
             "rot180_selected": int(sum(obs["selected"] == 1 for obs in observations)),
         },
+        "diversity": diversity,
         "end_camera": {
             "T_ee_realsense": transform_to_json(solution["T_ee_camera"]),
             "T_realsense_ee": transform_to_json(invert_transform(solution["T_ee_camera"])),
@@ -1129,6 +1134,47 @@ def solve_end_hand_eye(observations: list[dict[str, Any]]) -> dict[str, Any]:
         "T_base_board": t_base_board,
         "residual_summary": residual_summary(residuals),
     }
+
+
+def observation_pose_diversity(observations: list[dict[str, Any]]) -> dict[str, Any]:
+    poses = [np.asarray(obs["T_base_ee"], dtype=float) for obs in observations]
+    translations = np.asarray([pose[:3, 3] for pose in poses], dtype=float)
+    max_translation = 0.0
+    max_rotation = 0.0
+    pair_count = 0
+    for i, a in enumerate(poses):
+        for b in poses[i + 1 :]:
+            pair_count += 1
+            delta = invert_transform(a) @ b
+            max_translation = max(max_translation, float(np.linalg.norm(delta[:3, 3])))
+            max_rotation = max(max_rotation, rotation_angle_deg(delta[:3, :3]))
+    axis_span = np.ptp(translations, axis=0) if translations.size else np.zeros(3, dtype=float)
+    return {
+        "samples": len(observations),
+        "pairCount": pair_count,
+        "eeTranslationSpanM": float(max_translation),
+        "eeRotationSpanDeg": float(max_rotation),
+        "eeAxisSpanM": [float(v) for v in axis_span],
+        "minTranslationSpanM": MIN_HAND_EYE_EE_TRANSLATION_SPAN_M,
+        "minRotationSpanDeg": MIN_HAND_EYE_EE_ROTATION_SPAN_DEG,
+    }
+
+
+def require_hand_eye_pose_diversity(diversity: dict[str, Any]) -> None:
+    translation_span = float(diversity.get("eeTranslationSpanM") or 0.0)
+    rotation_span = float(diversity.get("eeRotationSpanDeg") or 0.0)
+    if (
+        translation_span >= MIN_HAND_EYE_EE_TRANSLATION_SPAN_M
+        or rotation_span >= MIN_HAND_EYE_EE_ROTATION_SPAN_DEG
+    ):
+        return
+    raise ValueError(
+        "Need robot/end-camera pose diversity for hand-eye calibration: "
+        f"max EE translation span {translation_span * 1000.0:.1f} mm "
+        f"(need >= {MIN_HAND_EYE_EE_TRANSLATION_SPAN_M * 1000.0:.1f} mm) or "
+        f"rotation span {rotation_span:.2f} deg "
+        f"(need >= {MIN_HAND_EYE_EE_ROTATION_SPAN_DEG:.2f} deg)."
+    )
 
 
 def hand_eye_residual_vector(params: np.ndarray, observations: list[dict[str, Any]], selected: list[int]) -> np.ndarray:
@@ -1328,6 +1374,12 @@ def pose_residual(target: np.ndarray, value: np.ndarray) -> dict[str, np.ndarray
         "translation": delta[:3, 3],
         "rotation": Rotation.from_matrix(delta[:3, :3]).as_rotvec(),
     }
+
+
+def rotation_angle_deg(rotation: np.ndarray) -> float:
+    trace = float(np.trace(rotation))
+    cosine = max(-1.0, min(1.0, (trace - 1.0) * 0.5))
+    return float(math.degrees(math.acos(cosine)))
 
 
 def residual_summary(residuals: list[dict[str, np.ndarray]]) -> dict[str, Any]:
