@@ -10,6 +10,7 @@ namespace EyeTracking.Recording
     public sealed class QuestCameraRecorderCommandBridge : MonoBehaviour
     {
         [SerializeField] private QuestCameraRecorder recorder;
+        [SerializeField] private QuestPcCalibrationRecorder calibrationRecorder;
         [SerializeField] private bool enableFileCommands = true;
         [SerializeField] private string commandFileName = "record_command.txt";
         [SerializeField, Min(0.1f)] private float pollIntervalSeconds = 0.25f;
@@ -31,7 +32,7 @@ namespace EyeTracking.Recording
 
         private void Awake()
         {
-            ResolveRecorder();
+            ResolveReferences();
             commandPath = Path.Combine(Application.persistentDataPath, commandFileName);
             if (logCommandStatus)
             {
@@ -52,7 +53,7 @@ namespace EyeTracking.Recording
 
         public void RequestStartRecording()
         {
-            ResolveRecorder();
+            ResolveReferences();
             if (recorder == null)
             {
                 Debug.LogWarning("[QuestCameraRecorderCommandBridge] Cannot start: recorder reference is missing.", this);
@@ -76,7 +77,7 @@ namespace EyeTracking.Recording
 
         public void RequestStopRecording()
         {
-            ResolveRecorder();
+            ResolveReferences();
             if (pendingStart != null)
             {
                 StopCoroutine(pendingStart);
@@ -91,6 +92,45 @@ namespace EyeTracking.Recording
 
             recorder.StopRecording();
             LogStatus("stop requested.");
+        }
+
+        public void RequestStartCalibrationRecording()
+        {
+            ResolveReferences();
+            if (calibrationRecorder == null)
+            {
+                Debug.LogWarning("[QuestCameraRecorderCommandBridge] Cannot start calibration: calibration recorder reference is missing.", this);
+                return;
+            }
+
+            calibrationRecorder.StartCalibrationRecording();
+            LogStatus("calibration start requested.");
+        }
+
+        public void RequestStopCalibrationRecording()
+        {
+            ResolveReferences();
+            if (calibrationRecorder == null)
+            {
+                Debug.LogWarning("[QuestCameraRecorderCommandBridge] Cannot stop calibration: calibration recorder reference is missing.", this);
+                return;
+            }
+
+            calibrationRecorder.StopCalibrationRecording();
+            LogStatus("calibration stop requested.");
+        }
+
+        public void RequestToggleCalibrationRecording()
+        {
+            ResolveReferences();
+            if (calibrationRecorder == null)
+            {
+                Debug.LogWarning("[QuestCameraRecorderCommandBridge] Cannot toggle calibration: calibration recorder reference is missing.", this);
+                return;
+            }
+
+            calibrationRecorder.ToggleCalibrationRecording();
+            LogStatus("calibration toggle requested.");
         }
 
         private IEnumerator StartWhenReady()
@@ -177,20 +217,45 @@ namespace EyeTracking.Recording
                 return;
             }
 
-            Debug.LogWarning("[QuestCameraRecorderCommandBridge] Unknown command: " + commandText, this);
-        }
-
-        private void ResolveRecorder()
-        {
-            if (recorder != null)
+            if (command == "calib_start" || command == "calibration_start" || command == "start_calibration")
             {
+                RequestStartCalibrationRecording();
                 return;
             }
 
-            recorder = GetComponent<QuestCameraRecorder>();
+            if (command == "calib_stop" || command == "calibration_stop" || command == "stop_calibration")
+            {
+                RequestStopCalibrationRecording();
+                return;
+            }
+
+            if (command == "calib_toggle" || command == "calibration_toggle" || command == "toggle_calibration")
+            {
+                RequestToggleCalibrationRecording();
+                return;
+            }
+
+            Debug.LogWarning("[QuestCameraRecorderCommandBridge] Unknown command: " + commandText, this);
+        }
+
+        private void ResolveReferences()
+        {
             if (recorder == null)
             {
-                recorder = FindFirstObjectByType<QuestCameraRecorder>();
+                recorder = GetComponent<QuestCameraRecorder>();
+                if (recorder == null)
+                {
+                    recorder = FindFirstObjectByType<QuestCameraRecorder>();
+                }
+            }
+
+            if (calibrationRecorder == null)
+            {
+                calibrationRecorder = GetComponent<QuestPcCalibrationRecorder>();
+                if (calibrationRecorder == null)
+                {
+                    calibrationRecorder = FindFirstObjectByType<QuestPcCalibrationRecorder>();
+                }
             }
         }
 
