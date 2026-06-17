@@ -6,6 +6,7 @@ import json
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,13 @@ def main() -> int:
     parser.add_argument("--project-root", type=Path, default=DEFAULT_PROJECT_ROOT)
     parser.add_argument("--host", action="append", dest="hosts", help="Host/IP to ping and port-probe. May repeat.")
     parser.add_argument("--ports", default=",".join(str(port) for port in DEFAULT_PORTS))
+    parser.add_argument("--robot-sn", help="Optionally try a read-only Flexiv RDK Robot connection with this serial.")
+    parser.add_argument(
+        "--network-interface",
+        action="append",
+        dest="network_interfaces",
+        help="Local IPv4 address for the Flexiv RDK network interface whitelist. May repeat.",
+    )
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     args = parser.parse_args()
 
@@ -35,6 +43,7 @@ def main() -> int:
         "network": network_info(),
         "elements": elements_info(args.elements_root),
         "probe": probe_hosts(hosts, ports),
+        "robotConnection": robot_connection_info(args.robot_sn, args.network_interfaces),
     }
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -55,6 +64,37 @@ def flexivrdk_info() -> dict[str, Any]:
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+
+def robot_connection_info(robot_sn: str | None, network_interfaces: list[str] | None) -> dict[str, Any] | None:
+    if not robot_sn:
+        return None
+    started = time.monotonic()
+    interfaces = normalize_network_interfaces(network_interfaces)
+    try:
+        import flexivrdk  # type: ignore[import-not-found]
+
+        robot = flexivrdk.Robot(robot_sn.strip(), interfaces) if interfaces else flexivrdk.Robot(robot_sn.strip())
+        states = robot.states()
+        return {
+            "ok": True,
+            "robotSn": robot_sn.strip(),
+            "networkInterfaces": interfaces,
+            "elapsedSeconds": time.monotonic() - started,
+            "connected": bool(robot.connected()),
+            "mode": str(robot.mode()),
+            "q": [float(v) for v in getattr(states, "q", [])],
+            "tcpPose": [float(v) for v in getattr(states, "tcp_pose", [])],
+            "flangePose": [float(v) for v in getattr(states, "flange_pose", [])],
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "robotSn": robot_sn.strip(),
+            "networkInterfaces": interfaces,
+            "elapsedSeconds": time.monotonic() - started,
+            "error": str(exc),
+        }
 
 
 def realsense_info() -> dict[str, Any]:
@@ -164,12 +204,34 @@ def print_human(result: dict[str, Any]) -> None:
     print("  probes:")
     for row in result.get("probe") or []:
         print(f"    {row['host']}: ping={row['ping']} open={row['openPorts']}")
+    connection = result.get("robotConnection")
+    if connection is not None:
+        print("  RDK connection:")
+        print(f"    ok={connection.get('ok')} sn={connection.get('robotSn')} iface={connection.get('networkInterfaces')}")
+        if connection.get("ok"):
+            print(f"    mode={connection.get('mode')} connected={connection.get('connected')}")
+            print(f"    q={connection.get('q')}")
+            print(f"    tcpPose={connection.get('tcpPose')}")
+        else:
+            print(f"    error={connection.get('error')}")
 
 
 def indent(text: str, prefix: str) -> str:
     if not text:
         return prefix + "n/a"
     return "\n".join(prefix + line for line in text.splitlines())
+
+
+def normalize_network_interfaces(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = value.replace(";", ",").split(",")
+    elif isinstance(value, (list, tuple)):
+        items = value
+    else:
+        return []
+    return [str(item).strip() for item in items if str(item).strip()]
 
 
 if __name__ == "__main__":

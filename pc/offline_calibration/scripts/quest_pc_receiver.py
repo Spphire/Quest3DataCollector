@@ -203,6 +203,15 @@ def main() -> int:
         help="Optional legacy Flexiv RDK root containing lib_py. Default: use the active Python flexivrdk package.",
     )
     receive_parser.add_argument(
+        "--flexiv-network-interface",
+        action="append",
+        dest="flexiv_network_interfaces",
+        help=(
+            "Optional local IPv4 address for the Flexiv RDK network interface whitelist. "
+            "Repeat to allow multiple interfaces, for example --flexiv-network-interface 192.168.2.108."
+        ),
+    )
+    receive_parser.add_argument(
         "--realsense-serial",
         default=DEFAULT_END_CAMERA_SERIAL,
         help=f"Default end-mounted RealSense serial. Default: {DEFAULT_END_CAMERA_SERIAL}",
@@ -1331,6 +1340,7 @@ def receive(args: argparse.Namespace) -> int:
                 robot_sn=args.flexiv_robot_sn,
                 robot_pose_field=args.flexiv_pose_field,
                 flexiv_rdk=args.flexiv_rdk,
+                flexiv_network_interfaces=args.flexiv_network_interfaces,
                 camera_serial=args.realsense_serial,
                 width=args.realsense_width,
                 height=args.realsense_height,
@@ -3579,6 +3589,9 @@ label {
           </select>
         </label>
       </div>
+      <label>RDK local IP
+        <input id="robotNetworkInterfaces" spellcheck="false" placeholder="optional, e.g. 192.168.2.108">
+      </label>
       <div class="robot-grid">
         <label>Capture interval
           <input id="robotInterval" type="number" min="0.05" step="0.05">
@@ -3636,6 +3649,7 @@ const recordingDetail = document.getElementById('recordingDetail');
 const robotCamera = document.getElementById('robotCamera');
 const robotSn = document.getElementById('robotSn');
 const robotPoseField = document.getElementById('robotPoseField');
+const robotNetworkInterfaces = document.getElementById('robotNetworkInterfaces');
 const robotInterval = document.getElementById('robotInterval');
 const robotHandEye = document.getElementById('robotHandEye');
 const robotMotionScale = document.getElementById('robotMotionScale');
@@ -3797,6 +3811,7 @@ function robotPayloadFromControls() {
   return {
     robotSn: robotSn.value.trim(),
     poseField: robotPoseField.value,
+    networkInterfaces: robotNetworkInterfaces.value.split(/[,\s;]+/).map(v => v.trim()).filter(Boolean),
     cameraSerial: robotCamera.value,
     captureIntervalSeconds: Number(robotInterval.value || 0.35),
     runHandEye: robotHandEye.value === 'true',
@@ -3888,6 +3903,9 @@ function applyRobotStatus(payload) {
   const config = payload?.config || {};
   if (config.robotSn && !robotSn.value) robotSn.value = config.robotSn;
   if (config.poseField) robotPoseField.value = config.poseField;
+  if (Array.isArray(config.networkInterfaces) && !robotNetworkInterfaces.value) {
+    robotNetworkInterfaces.value = config.networkInterfaces.join(', ');
+  }
   if (config.cameraSerial && !robotCamera.value) {
     const existing = Array.from(robotCamera.options).some(option => option.value === config.cameraSerial);
     if (!existing) {
@@ -3920,6 +3938,7 @@ function renderRobotStatus(payload) {
     `robot: ${robot.connected ? 'connected' : 'not connected'} ${robot.robotSn || ''}`.trim(),
     `motion: ${robot.motionArmed ? 'ARMED' : 'disarmed'}`,
     `pose: ${robot.poseField || 'n/a'}`,
+    `rdk iface: ${(payload.config?.networkInterfaces || []).join(', ') || 'default'}`,
     `camera: ${payload.config?.cameraSerial || 'n/a'}`,
     `session: ${payload.activeSession ? `${payload.activeSession.samples || 0} samples, ${payload.activeSession.images || 0} images` : 'idle'}`
   ];
@@ -4531,7 +4550,7 @@ robotConnect.addEventListener('click', connectRobot);
 robotArmMotion.addEventListener('click', armRobotMotion);
 robotDisarmMotion.addEventListener('click', disarmRobotMotion);
 robotDisconnect.addEventListener('click', disconnectRobot);
-for (const input of [robotCamera, robotSn, robotPoseField, robotInterval, robotHandEye, robotMotionScale, robotMaxOffset, robotMaxStep]) {
+for (const input of [robotCamera, robotSn, robotPoseField, robotNetworkInterfaces, robotInterval, robotHandEye, robotMotionScale, robotMaxOffset, robotMaxStep]) {
   input.addEventListener('change', configureRobot);
 }
 document.getElementById('records').addEventListener('click', () => {

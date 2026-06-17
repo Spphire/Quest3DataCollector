@@ -34,6 +34,7 @@ class FlexivRealSenseConfig:
     robot_sn: str = DEFAULT_FLEXIV_ROBOT_SN
     robot_pose_field: str = "flange_pose"
     flexiv_rdk: Path | None = DEFAULT_FLEXIV_RDK_ROOT
+    flexiv_network_interfaces: list[str] | None = None
     camera_serial: str = DEFAULT_END_CAMERA_SERIAL
     width: int = DEFAULT_REALSENSE_WIDTH
     height: int = DEFAULT_REALSENSE_HEIGHT
@@ -66,6 +67,7 @@ class FlexivRobotClient:
         robot_sn: str,
         pose_field: str = "flange_pose",
         flexiv_rdk: Path | None = None,
+        network_interfaces: list[str] | None = None,
         wait_seconds: float = 0.2,
     ) -> dict[str, Any]:
         robot_sn = str(robot_sn or "").strip()
@@ -77,7 +79,11 @@ class FlexivRobotClient:
         with self.lock:
             self.disconnect()
             flexivrdk = import_flexivrdk(flexiv_rdk)
-            self.robot = flexivrdk.Robot(robot_sn)
+            interface_whitelist = normalize_network_interfaces(network_interfaces)
+            if interface_whitelist:
+                self.robot = flexivrdk.Robot(robot_sn, interface_whitelist)
+            else:
+                self.robot = flexivrdk.Robot(robot_sn)
             self.robot_sn = robot_sn
             self.pose_field = pose_field
             self.last_error = None
@@ -543,6 +549,8 @@ class FlexivRealSenseManager:
                 self.config.robot_pose_field = str(payload["poseField"])
             if "cameraSerial" in payload:
                 self.config.camera_serial = str(payload.get("cameraSerial") or "").strip()
+            if "networkInterfaces" in payload:
+                self.config.flexiv_network_interfaces = normalize_network_interfaces(payload.get("networkInterfaces"))
             for key, attr in (
                 ("width", "width"),
                 ("height", "height"),
@@ -573,6 +581,7 @@ class FlexivRealSenseManager:
                 self.config.robot_sn,
                 self.config.robot_pose_field,
                 self.config.flexiv_rdk,
+                self.config.flexiv_network_interfaces,
                 wait_seconds=float(payload.get("waitSeconds") or 0.2),
             )
             self.last_error = None
@@ -1269,6 +1278,7 @@ def config_to_json(config: FlexivRealSenseConfig) -> dict[str, Any]:
         "robotSn": config.robot_sn,
         "poseField": config.robot_pose_field,
         "flexivRdk": str(config.flexiv_rdk) if config.flexiv_rdk is not None else None,
+        "networkInterfaces": normalize_network_interfaces(config.flexiv_network_interfaces),
         "cameraSerial": config.camera_serial,
         "width": config.width,
         "height": config.height,
@@ -1295,3 +1305,15 @@ def normalize_quaternion(value: list[float]) -> list[float]:
 
 def is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def normalize_network_interfaces(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = value.replace(";", ",").split(",")
+    elif isinstance(value, (list, tuple)):
+        items = value
+    else:
+        return []
+    return [str(item).strip() for item in items if str(item).strip()]

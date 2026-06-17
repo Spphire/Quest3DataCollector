@@ -95,9 +95,9 @@ Robot serial candidates tested:
 - `Rizon4-H6uDOq`
 - `Rizon4-062713`
 
-With RDK v1.7 loaded, both still stopped at robot discovery (`Searching for [...]`). At that point the remaining likely causes are Flexiv Remote mode/Ethernet not enabled, wrong serial string, firewall, or network path. The receiver UI keeps the robot SN editable so the operator can retry without changing code.
+With RDK v1.7 loaded, `Rizon4-H6uDOq` is accepted as a valid Rizon serial and RDK normalizes the Elements display string `Rizon 4-H6uDOq` to that value. It still stopped at robot discovery (`Searching for [...]`). At that point the remaining likely causes are Flexiv Remote mode/Ethernet or the RDK server not being enabled, firewall policy, or a robot-side service state. The receiver UI keeps the robot SN editable so the operator can retry without changing code.
 
-Network diagnostics on 2026-06-17 showed a wired interface `enx6c1ff75afb1f` at `192.168.2.108/24` and a reachable peer at `192.168.2.100` with port `8000` open. If RDK still searches by SN and fails, verify Flexiv Remote mode/Ethernet is enabled for the arm/control box and that the robot SN expected by RDK is `Rizon4-H6uDOq`.
+Network diagnostics on 2026-06-17 showed a wired interface `enx6c1ff75afb1f` at `192.168.2.108/24` and a reachable peer at `192.168.2.100` with port `8000` open. RDK was also retried with the explicit network interface whitelist `["192.168.2.108"]` and still failed at discovery, so the next site checks should be Flexiv Elements Remote/RDK server mode and host firewall rules rather than RDK/Elements version mismatch or multi-NIC routing.
 
 ### Receiver command
 
@@ -118,6 +118,7 @@ Useful options:
 - `--realsense-serial <serial>` sets the default end-mounted RealSense.
 - `--flexiv-robot-sn <sn>` sets the default robot serial shown in the UI.
 - `--flexiv-pose-field flange_pose|tcp_pose` selects the robot state pose used as `T_base_ee`.
+- `--flexiv-network-interface 192.168.2.108` limits Flexiv RDK discovery to the PC interface connected to the robot network. This can also be entered in the web UI as `RDK local IP`.
 - `--robot-capture-interval 0.35` controls how often robot/RealSense samples are taken during B-button calibration.
 - `--no-flexiv-realsense` hides/disables the robot bridge.
 - `--no-robot-hand-eye` records robot/RealSense data but skips the automatic hand-eye solve.
@@ -133,6 +134,15 @@ Read-only hardware diagnostics:
 ```
 
 This prints the active `flexivrdk` package, detected RealSense cameras, Elements serial/version info, network interfaces, routes, neighbors, and ping/port probes for likely robot hosts such as `192.168.2.100`.
+
+To include the read-only RDK connection test:
+
+```bash
+/ssd1/shenyibo/Quest3DataCollector/.venv312/bin/python \
+  /ssd1/shenyibo/Quest3DataCollector/pc/offline_calibration/scripts/flexiv_realsense_diagnostics.py \
+  --robot-sn Rizon4-H6uDOq \
+  --network-interface 192.168.2.108
+```
 
 ### Web workflow
 
