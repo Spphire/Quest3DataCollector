@@ -99,9 +99,9 @@ Robot serial candidates tested:
 - `Rizon4-H6uDOq`
 - `Rizon4-062713`
 
-With RDK v1.7 loaded, `Rizon4-H6uDOq` is accepted as a valid Rizon serial and RDK normalizes the Elements display string `Rizon 4-H6uDOq` to that value. It still stopped at robot discovery (`Searching for [...]`). At that point the remaining likely causes are Flexiv Remote mode/Ethernet or the RDK server not being enabled, firewall policy, or a robot-side service state. The receiver UI keeps the robot SN editable so the operator can retry without changing code.
+With RDK v1.7 loaded, `Rizon4-062713` connects successfully and returns robot state. `Rizon4-H6uDOq` is the arm serial shown in the local Flexiv Elements `system_version.info`, but it does not match the RDK-discoverable robot on the current network and fails at discovery. Use `Rizon4-062713` as the default robot SN for this setup; the receiver UI keeps the robot SN editable so the operator can retry if the physical robot changes.
 
-Network diagnostics on 2026-06-17 showed a wired interface `enx6c1ff75afb1f` at `192.168.2.108/24`, MTU `1500`, and a reachable peer at `192.168.2.100` with ports `8000`, `15001`, `17001`, `17005`, and `17006` open. RDK was also retried with no whitelist, the local Ethernet IP `192.168.2.108`, the interface name `enx6c1ff75afb1f`, CIDR `192.168.2.108/24`, and the Wi-Fi IP `10.128.0.227`; all variants failed at the same discovery step. That makes an RDK/Elements version mismatch or one obviously wrong whitelist parameter unlikely. The next site checks should be Flexiv Elements Remote/RDK server mode, Auto(Remote), and host firewall rules.
+Network diagnostics on 2026-06-17 showed a wired interface `enx6c1ff75afb1f` at `192.168.2.108/24`, MTU `1500`, and a reachable peer at `192.168.2.100` with ports `8000`, `15001`, `17001`, `17005`, and `17006` open. RDK connection succeeds with SN `Rizon4-062713` and the explicit network interface whitelist `["192.168.2.108"]`.
 
 Official Flexiv RDK connection checklist for this state:
 
@@ -158,7 +158,7 @@ To include the read-only RDK connection test:
 ```bash
 /ssd1/shenyibo/Quest3DataCollector/.venv312/bin/python \
   /ssd1/shenyibo/Quest3DataCollector/pc/offline_calibration/scripts/flexiv_realsense_diagnostics.py \
-  --robot-sn Rizon4-H6uDOq \
+  --robot-sn Rizon4-062713 \
   --network-interface 192.168.2.108
 ```
 

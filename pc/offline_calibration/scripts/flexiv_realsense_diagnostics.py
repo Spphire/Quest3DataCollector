@@ -404,6 +404,7 @@ def interpret_result(result: dict[str, Any]) -> dict[str, Any]:
         next_steps.append("Install the RDK package that matches Flexiv Elements robot software.")
 
     system = (result.get("elements") or {}).get("systemVersion") or {}
+    serials = system.get("serial_number") if isinstance(system, dict) else {}
     versions = system.get("software_version") if isinstance(system, dict) else {}
     robot_version = versions.get("RobotControlApp") if isinstance(versions, dict) else None
     if robot_version:
@@ -435,6 +436,13 @@ def interpret_result(result: dict[str, Any]) -> dict[str, Any]:
 
     connection = result.get("robotConnection")
     if connection is not None:
+        requested_sn = normalize_robot_serial(str(connection.get("robotSn") or ""))
+        elements_sn = normalize_robot_serial(str(serials.get("Arm serial number") or "")) if isinstance(serials, dict) else ""
+        if requested_sn and elements_sn and requested_sn != elements_sn:
+            summary.append(
+                "Elements metadata arm serial differs from requested RDK serial: "
+                f"Elements={serials.get('Arm serial number')} requested={connection.get('robotSn')}."
+            )
         if connection.get("ok"):
             summary.append("RDK Robot connection OK.")
         else:
@@ -458,6 +466,10 @@ def interpret_result(result: dict[str, Any]) -> dict[str, Any]:
         summary.append("No RealSense cameras detected.")
 
     return {"severity": severity, "summary": summary, "nextSteps": dedupe(next_steps)}
+
+
+def normalize_robot_serial(value: str) -> str:
+    return "".join(ch for ch in str(value).lower() if ch.isalnum())
 
 
 def dedupe(items: list[str]) -> list[str]:
