@@ -198,6 +198,8 @@ PY
 
 Expected output is three successful rows, three JPEGs under `smoke_robot_realsense/robot_realsense/images/`, and `jointpose` length `7`. This test is read-only for the robot; it does not arm or send motion commands.
 
+The smoke images do not need to see the checkerboard. The real B-button calibration run does: the end-mounted RealSense must capture the checkerboard from at least `minHandEyeDetections` valid robot poses, default `6`, or the hand-eye step will fail with a message like `Need at least 6 valid end-camera detections`.
+
 ### Web workflow
 
 Open:
@@ -214,7 +216,7 @@ Then:
 4. Optional: click `Arm Motion` if the right controller should drive bounded TCP offsets.
 5. Press Quest B once to start PC calibration capture.
 6. Move the Quest for Quest/checkerboard pose diversity.
-7. Move the robot/end camera for robot/checkerboard pose diversity.
+7. Move the robot/end camera for robot/checkerboard pose diversity while keeping the checkerboard visible to the end-mounted RealSense in at least six captured samples.
 8. Press Quest B again to stop. Stopping also disarms controller motion.
 
 The PC receiver writes:
