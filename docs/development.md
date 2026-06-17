@@ -243,7 +243,7 @@ The PC receiver writes:
 
 - Quest videos/frame metadata/trajectory under `raw/<recordId>/`.
 - Robot states, `jointpose`, `T_base_ee`, and RealSense images under `raw/<recordId>/robot_realsense/`.
-- Right-controller robot target commands under `raw/<recordId>/robot_realsense/controller_motion.jsonl` when `Arm Motion` is enabled.
+- Right-controller robot target commands under `raw/<recordId>/robot_realsense/controller_motion.jsonl` when `Arm Motion` is enabled. Motion rows include the controller anchor, robot TCP anchor, total offset, per-step offset, and target TCP pose so the relative controller-to-robot command can be audited after the run.
 - Quest/checkerboard result under `outputs/pc_live_calibration/<recordId>/`.
 - Robot hand-eye result under `raw/<recordId>/robot_realsense/robot_hand_eye_result.json`.
 

@@ -4711,6 +4711,10 @@ function renderRobotStatus(payload) {
   if (state.robotMotion) {
     const offset = Array.isArray(state.robotMotion.offsetM) ? state.robotMotion.offsetM.map(v => Number(v).toFixed(3)).join(', ') : (state.robotMotion.reason || state.robotMotion.error || 'n/a');
     lines.push(`motion: ${state.robotMotion.ok ? 'sent' : 'skip'} ${offset}`);
+    if (state.robotMotion.anchored !== undefined) {
+      const step = Array.isArray(state.robotMotion.stepOffsetM) ? state.robotMotion.stepOffsetM.map(v => Number(v).toFixed(3)).join(', ') : 'n/a';
+      lines.push(`motion anchor: ${state.robotMotion.anchored ? 'set' : 'waiting'}${state.robotMotion.createdAnchor ? ' (new)' : ''}, step ${step}`);
+    }
   }
   if (state.robotCalibration) {
     lines.push(state.robotCalibration.type === 'robot_calibration_result' ? 'hand-eye: done' : `hand-eye: failed ${state.robotCalibration.error || ''}`);

@@ -494,6 +494,7 @@ class RobotRealsenseSession:
                 "record_id": self.record_id,
                 "captured_at": datetime.now(timezone.utc).isoformat(),
                 "quest_sample_index": quest_sample.get("sampleIndex"),
+                "anchored": self.controller_anchor_world is not None and self.robot_anchor_tcp_pose is not None,
             }
         controller = quest_sample.get("rightController")
         if not isinstance(controller, dict) or not controller.get("hasPose"):
@@ -503,6 +504,7 @@ class RobotRealsenseSession:
                 "record_id": self.record_id,
                 "captured_at": datetime.now(timezone.utc).isoformat(),
                 "quest_sample_index": quest_sample.get("sampleIndex"),
+                "anchored": self.controller_anchor_world is not None and self.robot_anchor_tcp_pose is not None,
             }
         position = vec3_array(controller.get("position"))
         if position is None:
@@ -512,8 +514,10 @@ class RobotRealsenseSession:
                 "record_id": self.record_id,
                 "captured_at": datetime.now(timezone.utc).isoformat(),
                 "quest_sample_index": quest_sample.get("sampleIndex"),
+                "anchored": self.controller_anchor_world is not None and self.robot_anchor_tcp_pose is not None,
             }
-        if self.controller_anchor_world is None or self.robot_anchor_tcp_pose is None:
+        created_anchor = self.controller_anchor_world is None or self.robot_anchor_tcp_pose is None
+        if created_anchor:
             self.controller_anchor_world = position
             self.robot_anchor_tcp_pose = self.robot.read_tcp_pose()
         raw_offset = (position - self.controller_anchor_world) * float(self.config.controller_translation_scale)
@@ -521,9 +525,11 @@ class RobotRealsenseSession:
         target = list(self.robot_anchor_tcp_pose)
         target[:3] = [float(target[i] + offset[i]) for i in range(3)]
         last = self.robot.motion_last_target_pose
+        step_offset = np.zeros(3, dtype=float)
         if last is not None:
             step = np.asarray(target[:3], dtype=float) - np.asarray(last[:3], dtype=float)
             step = clamp_vector_norm(step, float(self.config.controller_max_step_m))
+            step_offset = step
             target[:3] = [float(last[i] + step[i]) for i in range(3)]
         self.robot.send_cartesian_target(target)
         return {
@@ -534,8 +540,12 @@ class RobotRealsenseSession:
             "quest_recording_timestamp_seconds": quest_sample.get("recordingTimestampSeconds"),
             "controller_position_world": [float(v) for v in position],
             "controller_anchor_world": [float(v) for v in self.controller_anchor_world],
+            "robot_anchor_tcp_pose_wxyz": [float(v) for v in self.robot_anchor_tcp_pose],
+            "anchored": True,
+            "created_anchor": created_anchor,
             "raw_offset_m": [float(v) for v in raw_offset],
             "offset_m": [float(v) for v in offset],
+            "step_offset_m": [float(v) for v in step_offset],
             "target_tcp_pose_wxyz": target,
             "limits": {
                 "scale": self.config.controller_translation_scale,
@@ -1271,6 +1281,9 @@ def robot_motion_event(row: dict[str, Any]) -> dict[str, Any]:
         "questSampleIndex": row.get("quest_sample_index"),
         "targetTcpPose": row.get("target_tcp_pose_wxyz"),
         "offsetM": row.get("offset_m"),
+        "stepOffsetM": row.get("step_offset_m"),
+        "anchored": row.get("anchored"),
+        "createdAnchor": row.get("created_anchor"),
         "reason": row.get("reason"),
         "error": row.get("error"),
     }
