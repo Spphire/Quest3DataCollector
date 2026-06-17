@@ -40,6 +40,10 @@ class FlexivRealSenseConfig:
     height: int = DEFAULT_REALSENSE_HEIGHT
     fps: int = DEFAULT_REALSENSE_FPS
     warmup_frames: int = 2
+    realsense_auto_exposure: bool = True
+    realsense_exposure: float | None = None
+    realsense_gain: float | None = None
+    board_check_warmup_frames: int = 60
     capture_interval_seconds: float = DEFAULT_CAPTURE_INTERVAL_SECONDS
     pattern_cols: int = DEFAULT_PATTERN_COLS
     pattern_rows: int = DEFAULT_PATTERN_ROWS
@@ -237,7 +241,16 @@ class RealSenseColorCamera:
         self.fps = DEFAULT_REALSENSE_FPS
         self.metadata: dict[str, Any] | None = None
 
-    def start(self, serial: str, width: int, height: int, fps: int) -> dict[str, Any]:
+    def start(
+        self,
+        serial: str,
+        width: int,
+        height: int,
+        fps: int,
+        auto_exposure: bool = True,
+        exposure: float | None = None,
+        gain: float | None = None,
+    ) -> dict[str, Any]:
         if self.pipeline is not None and self.serial == serial and self.width == width and self.height == height and self.fps == fps:
             return self.metadata or {}
         self.stop()
@@ -248,7 +261,7 @@ class RealSenseColorCamera:
         config.enable_device(serial)
         config.enable_stream(rs.stream.color, int(width), int(height), rs.format.rgb8, int(fps))
         profile = pipeline.start(config)
-        configure_color_sensor(profile)
+        color_options = configure_color_sensor(profile, auto_exposure, exposure, gain)
         self.pipeline = pipeline
         self.profile = profile
         self.serial = serial
@@ -256,6 +269,7 @@ class RealSenseColorCamera:
         self.height = int(height)
         self.fps = int(fps)
         self.metadata = camera_metadata_from_profile(profile, serial)
+        self.metadata["colorOptions"] = color_options
         return self.metadata
 
     def stop(self) -> None:
@@ -331,6 +345,9 @@ class RobotRealsenseSession:
                 self.config.width,
                 self.config.height,
                 self.config.fps,
+                self.config.realsense_auto_exposure,
+                self.config.realsense_exposure,
+                self.config.realsense_gain,
             )
             write_json({"end": self.camera_metadata}, self.directory / "cameras.json")
         summary = self.summary("recording")
@@ -563,6 +580,18 @@ class FlexivRealSenseManager:
                     setattr(self.config, attr, int(payload[key]))
             if "captureIntervalSeconds" in payload and is_number(payload["captureIntervalSeconds"]):
                 self.config.capture_interval_seconds = float(payload["captureIntervalSeconds"])
+            if "realsenseAutoExposure" in payload:
+                self.config.realsense_auto_exposure = bool(payload["realsenseAutoExposure"])
+            if "realsenseExposure" in payload:
+                self.config.realsense_exposure = (
+                    float(payload["realsenseExposure"]) if is_number(payload["realsenseExposure"]) else None
+                )
+            if "realsenseGain" in payload:
+                self.config.realsense_gain = (
+                    float(payload["realsenseGain"]) if is_number(payload["realsenseGain"]) else None
+                )
+            if "boardCheckWarmupFrames" in payload and is_number(payload["boardCheckWarmupFrames"]):
+                self.config.board_check_warmup_frames = max(1, int(payload["boardCheckWarmupFrames"]))
             if "runHandEye" in payload:
                 self.config.run_hand_eye = bool(payload["runHandEye"])
             if "controllerMotionEnabled" in payload:
@@ -631,8 +660,11 @@ class FlexivRealSenseManager:
                 self.config.width,
                 self.config.height,
                 self.config.fps,
+                self.config.realsense_auto_exposure,
+                self.config.realsense_exposure,
+                self.config.realsense_gain,
             )
-            rgb = camera.capture_rgb(max(self.config.warmup_frames, 60))
+            rgb = camera.capture_rgb(self.config.board_check_warmup_frames)
         finally:
             camera.stop()
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
@@ -813,13 +845,28 @@ def list_realsense_cameras() -> list[dict[str, Any]]:
     return cameras
 
 
-def configure_color_sensor(profile: Any) -> None:
+def configure_color_sensor(
+    profile: Any,
+    auto_exposure: bool = True,
+    exposure: float | None = None,
+    gain: float | None = None,
+) -> dict[str, Any]:
     import pyrealsense2 as rs  # type: ignore[import-not-found]
 
+    payload: dict[str, Any] = {
+        "autoExposureRequested": bool(auto_exposure),
+        "exposureRequested": exposure,
+        "gainRequested": gain,
+        "sensorName": None,
+        "autoExposure": None,
+        "exposure": None,
+        "gain": None,
+        "errors": [],
+    }
     try:
         device = profile.get_device()
     except Exception:
-        return
+        return payload
     for sensor in device.query_sensors():
         try:
             name = sensor.get_info(rs.camera_info.name) if sensor.supports(rs.camera_info.name) else ""
@@ -827,11 +874,30 @@ def configure_color_sensor(profile: Any) -> None:
             name = ""
         if "RGB" not in name and "Color" not in name:
             continue
+        payload["sensorName"] = name
         if sensor.supports(rs.option.enable_auto_exposure):
             try:
-                sensor.set_option(rs.option.enable_auto_exposure, 1)
-            except Exception:
-                pass
+                sensor.set_option(rs.option.enable_auto_exposure, 1 if auto_exposure else 0)
+            except Exception as exc:
+                payload["errors"].append(f"set auto exposure failed: {exc}")
+        if not auto_exposure and exposure is not None and sensor.supports(rs.option.exposure):
+            try:
+                sensor.set_option(rs.option.exposure, float(exposure))
+            except Exception as exc:
+                payload["errors"].append(f"set exposure failed: {exc}")
+        if gain is not None and sensor.supports(rs.option.gain):
+            try:
+                sensor.set_option(rs.option.gain, float(gain))
+            except Exception as exc:
+                payload["errors"].append(f"set gain failed: {exc}")
+        for key, option in (("autoExposure", rs.option.enable_auto_exposure), ("exposure", rs.option.exposure), ("gain", rs.option.gain)):
+            if sensor.supports(option):
+                try:
+                    payload[key] = float(sensor.get_option(option))
+                except Exception as exc:
+                    payload["errors"].append(f"read {key} failed: {exc}")
+        break
+    return payload
 
 
 def safe_filename(value: str) -> str:
@@ -1393,6 +1459,10 @@ def config_to_json(config: FlexivRealSenseConfig) -> dict[str, Any]:
         "height": config.height,
         "fps": config.fps,
         "warmupFrames": config.warmup_frames,
+        "realsenseAutoExposure": config.realsense_auto_exposure,
+        "realsenseExposure": config.realsense_exposure,
+        "realsenseGain": config.realsense_gain,
+        "boardCheckWarmupFrames": config.board_check_warmup_frames,
         "captureIntervalSeconds": config.capture_interval_seconds,
         "pattern": [config.pattern_cols, config.pattern_rows],
         "squareSizeM": config.square_size_m,

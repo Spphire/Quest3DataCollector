@@ -229,6 +229,9 @@ def main() -> int:
     receive_parser.add_argument("--realsense-width", type=int, default=1280, help="RealSense color width. Default: 1280")
     receive_parser.add_argument("--realsense-height", type=int, default=720, help="RealSense color height. Default: 720")
     receive_parser.add_argument("--realsense-fps", type=int, default=30, help="RealSense color FPS. Default: 30")
+    receive_parser.add_argument("--realsense-manual-exposure", action="store_true", help="Disable RealSense RGB auto exposure.")
+    receive_parser.add_argument("--realsense-exposure", type=float, default=None, help="Manual RealSense RGB exposure value.")
+    receive_parser.add_argument("--realsense-gain", type=float, default=None, help="RealSense RGB gain value.")
     receive_parser.add_argument(
         "--robot-capture-interval",
         type=float,
@@ -1412,6 +1415,9 @@ def receive(args: argparse.Namespace) -> int:
                 width=args.realsense_width,
                 height=args.realsense_height,
                 fps=args.realsense_fps,
+                realsense_auto_exposure=not args.realsense_manual_exposure,
+                realsense_exposure=args.realsense_exposure,
+                realsense_gain=args.realsense_gain,
                 capture_interval_seconds=args.robot_capture_interval,
                 run_hand_eye=not args.no_robot_hand_eye,
                 controller_translation_scale=args.controller_motion_scale,
@@ -3680,6 +3686,23 @@ label {
         </label>
       </div>
       <div class="robot-grid">
+        <label>RGB exposure
+          <select id="robotExposureMode">
+            <option value="auto">auto</option>
+            <option value="manual">manual</option>
+          </select>
+        </label>
+        <label>Exposure
+          <input id="robotExposure" type="number" min="1" max="10000" step="1">
+        </label>
+      </div>
+      <label>Gain
+        <input id="robotGain" type="number" min="0" max="128" step="1">
+      </label>
+      <label>Board warmup
+        <input id="robotBoardWarmup" type="number" min="1" max="120" step="1">
+      </label>
+      <div class="robot-grid">
         <label>Motion scale
           <input id="robotMotionScale" type="number" min="0" step="0.1">
         </label>
@@ -3731,6 +3754,10 @@ const robotPoseField = document.getElementById('robotPoseField');
 const robotNetworkInterfaces = document.getElementById('robotNetworkInterfaces');
 const robotInterval = document.getElementById('robotInterval');
 const robotHandEye = document.getElementById('robotHandEye');
+const robotExposureMode = document.getElementById('robotExposureMode');
+const robotExposure = document.getElementById('robotExposure');
+const robotGain = document.getElementById('robotGain');
+const robotBoardWarmup = document.getElementById('robotBoardWarmup');
 const robotMotionScale = document.getElementById('robotMotionScale');
 const robotMaxOffset = document.getElementById('robotMaxOffset');
 const robotMaxStep = document.getElementById('robotMaxStep');
@@ -3898,6 +3925,10 @@ function robotPayloadFromControls() {
     networkInterfaces: robotNetworkInterfaces.value.split(/[,\s;]+/).map(v => v.trim()).filter(Boolean),
     cameraSerial: robotCamera.value,
     captureIntervalSeconds: Number(robotInterval.value || 0.35),
+    realsenseAutoExposure: robotExposureMode.value !== 'manual',
+    realsenseExposure: robotExposure.value ? Number(robotExposure.value) : null,
+    realsenseGain: robotGain.value ? Number(robotGain.value) : null,
+    boardCheckWarmupFrames: Number(robotBoardWarmup.value || 60),
     runHandEye: robotHandEye.value === 'true',
     controllerMotionEnabled: false,
     controllerTranslationScale: Number(robotMotionScale.value || 1.0),
@@ -3986,6 +4017,10 @@ function renderRobotBoardCheck(payload) {
   if (Number.isFinite(payload?.brightness?.mean) && Number.isFinite(payload?.brightness?.p95)) {
     lines.push(`brightness: mean ${payload.brightness.mean.toFixed(1)}, p95 ${payload.brightness.p95.toFixed(1)}`);
   }
+  if (payload?.camera?.colorOptions) {
+    const opts = payload.camera.colorOptions;
+    lines.push(`sensor: ae ${opts.autoExposure ?? 'n/a'}, exp ${opts.exposure ?? 'n/a'}, gain ${opts.gain ?? 'n/a'}`);
+  }
   if (payload?.method) lines.push(`method: ${payload.method}`);
   if (payload?.message) lines.push(payload.message);
   if (payload?.overlayUrl) lines.push(`overlay: ${payload.overlayUrl}`);
@@ -4070,6 +4105,10 @@ function applyRobotStatus(payload) {
     robotCamera.value = config.cameraSerial;
   }
   if (Number.isFinite(config.captureIntervalSeconds)) robotInterval.value = config.captureIntervalSeconds;
+  if (typeof config.realsenseAutoExposure === 'boolean') robotExposureMode.value = config.realsenseAutoExposure ? 'auto' : 'manual';
+  if (Number.isFinite(config.realsenseExposure)) robotExposure.value = config.realsenseExposure;
+  if (Number.isFinite(config.realsenseGain)) robotGain.value = config.realsenseGain;
+  if (Number.isFinite(config.boardCheckWarmupFrames)) robotBoardWarmup.value = config.boardCheckWarmupFrames;
   if (typeof config.runHandEye === 'boolean') robotHandEye.value = config.runHandEye ? 'true' : 'false';
   if (Number.isFinite(config.controllerTranslationScale)) robotMotionScale.value = config.controllerTranslationScale;
   if (Number.isFinite(config.controllerMaxOffsetM)) robotMaxOffset.value = config.controllerMaxOffsetM;
@@ -4093,6 +4132,7 @@ function renderRobotStatus(payload) {
     `pose: ${robot.poseField || 'n/a'}`,
     `rdk iface: ${(payload.config?.networkInterfaces || []).join(', ') || 'default'}`,
     `camera: ${payload.config?.cameraSerial || 'n/a'}`,
+    `exposure: ${payload.config?.realsenseAutoExposure === false ? 'manual' : 'auto'}${Number.isFinite(payload.config?.realsenseExposure) ? ` ${payload.config.realsenseExposure}` : ''}${Number.isFinite(payload.config?.realsenseGain) ? ` gain ${payload.config.realsenseGain}` : ''}`,
     `session: ${payload.activeSession ? `${payload.activeSession.samples || 0} samples, ${payload.activeSession.images || 0} images` : 'idle'}`
   ];
   if (state.robotSample) {
@@ -4727,7 +4767,7 @@ robotConnect.addEventListener('click', connectRobot);
 robotArmMotion.addEventListener('click', armRobotMotion);
 robotDisarmMotion.addEventListener('click', disarmRobotMotion);
 robotDisconnect.addEventListener('click', disconnectRobot);
-for (const input of [robotCamera, robotSn, robotPoseField, robotNetworkInterfaces, robotInterval, robotHandEye, robotMotionScale, robotMaxOffset, robotMaxStep]) {
+for (const input of [robotCamera, robotSn, robotPoseField, robotNetworkInterfaces, robotInterval, robotHandEye, robotExposureMode, robotExposure, robotGain, robotBoardWarmup, robotMotionScale, robotMaxOffset, robotMaxStep]) {
   input.addEventListener('change', configureRobot);
 }
 document.getElementById('records').addEventListener('click', () => {
