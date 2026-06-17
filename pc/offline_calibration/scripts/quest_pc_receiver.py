@@ -29,6 +29,8 @@ from flexiv_realsense_bridge import (
     FlexivRealSenseConfig,
     FlexivRealSenseManager,
     RobotRealsenseSession,
+    ee_pose_diversity,
+    transform_from_json,
 )
 from flexiv_realsense_diagnostics import DEFAULT_PORTS as DEFAULT_ROBOT_DIAGNOSTIC_PORTS
 from flexiv_realsense_diagnostics import (
@@ -2423,6 +2425,7 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
     if not samples_path.exists():
         return None
     rows: list[dict[str, Any]] = []
+    ee_poses: list[np.ndarray] = []
     with samples_path.open("r", encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
@@ -2432,6 +2435,9 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
                 continue
             pose = row.get("T_base_ee") if isinstance(row.get("T_base_ee"), dict) else None
             translated_pose = translate_transform_payload(pose, origin) if pose is not None else None
+            pose_matrix = transform_from_json(pose)
+            if pose_matrix is not None:
+                ee_poses.append(pose_matrix)
             rows.append(
                 {
                     "sampleIndex": row.get("sample_index"),
@@ -2449,6 +2455,7 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
     return {
         "directory": str(robot_dir),
         "samples": rows,
+        "poseDiversity": ee_pose_diversity(ee_poses),
         "result": result if isinstance(result, dict) else None,
         "failure": failure if isinstance(failure, dict) else None,
     }
@@ -4219,6 +4226,9 @@ function renderRobotStatus(payload) {
   ];
   if (state.robotSample) {
     lines.push(`last sample: ${state.robotSample.sampleIndex} quest ${state.robotSample.questSampleIndex}`);
+    lines.push(`hand-eye motion: ${poseDiversityText(state.robotSample.poseDiversity)}`);
+  } else if (payload.activeSession?.poseDiversity) {
+    lines.push(`hand-eye motion: ${poseDiversityText(payload.activeSession.poseDiversity)}`);
   }
   if (state.robotMotion) {
     const offset = Array.isArray(state.robotMotion.offsetM) ? state.robotMotion.offsetM.map(v => Number(v).toFixed(3)).join(', ') : (state.robotMotion.reason || state.robotMotion.error || 'n/a');
@@ -4229,6 +4239,16 @@ function renderRobotStatus(payload) {
   }
   if (robot.lastError || payload.lastError) lines.push(`error: ${robot.lastError || payload.lastError}`);
   robotStatus.textContent = lines.join('\n');
+}
+
+function poseDiversityText(diversity) {
+  if (!diversity || !Number.isFinite(diversity.eeTranslationSpanM)) return 'n/a';
+  const mm = diversity.eeTranslationSpanM * 1000;
+  const deg = Number(diversity.eeRotationSpanDeg || 0);
+  const minMm = Number(diversity.minTranslationSpanM || 0.02) * 1000;
+  const minDeg = Number(diversity.minRotationSpanDeg || 2.0);
+  const ok = mm >= minMm || deg >= minDeg;
+  return `${ok ? 'ok' : 'need motion'} ${mm.toFixed(1)}mm / ${deg.toFixed(2)}deg`;
 }
 
 function renderRobotDiagnostics(payload) {
@@ -5227,14 +5247,26 @@ function updateRobotInfo() {
   const counts = result.counts || {};
   const residual = result.end_camera?.residuals?.translation_mm || {};
   const align = result.questAlignment || {};
+  const diversity = result.diversity || rr.poseDiversity;
   const kv = [
     ['samples', String(rr.samples?.length || 0)],
     ['detections', counts.detections ?? 'n/a'],
+    ['ee motion', replayPoseDiversityText(diversity)],
     ['hand-eye', result.ok ? 'ok' : (rr.failure ? 'failed' : 'pending')],
     ['residual', Number.isFinite(residual.median) ? `med ${residual.median.toFixed(1)}mm p95 ${Number(residual.p95 || 0).toFixed(1)}mm` : 'n/a'],
     ['quest-base', align.ok ? 'T_world_base ready' : (align.reason || 'n/a')]
   ];
   robotKv.innerHTML = kv.map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
+}
+
+function replayPoseDiversityText(diversity) {
+  if (!diversity || !Number.isFinite(diversity.eeTranslationSpanM)) return 'n/a';
+  const mm = diversity.eeTranslationSpanM * 1000;
+  const deg = Number(diversity.eeRotationSpanDeg || 0);
+  const minMm = Number(diversity.minTranslationSpanM || 0.02) * 1000;
+  const minDeg = Number(diversity.minRotationSpanDeg || 2.0);
+  const ok = mm >= minMm || deg >= minDeg;
+  return `${ok ? 'ok' : 'need motion'} ${mm.toFixed(1)}mm / ${deg.toFixed(2)}deg`;
 }
 
 function statText(stats, unit) {

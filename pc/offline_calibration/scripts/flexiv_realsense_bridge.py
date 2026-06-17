@@ -331,6 +331,7 @@ class RobotRealsenseSession:
         self.motion_command_count = 0
         self.motion_skip_count = 0
         self.motion_error_count = 0
+        self.ee_pose_history: list[np.ndarray] = []
 
     def start(self) -> dict[str, Any]:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -416,6 +417,10 @@ class RobotRealsenseSession:
             self.sample_count += 1
             if row.get("ok"):
                 self.image_count += 1
+                t_base_ee = transform_from_json(row.get("T_base_ee"))
+                if t_base_ee is not None:
+                    self.ee_pose_history.append(t_base_ee)
+                    row["poseDiversity"] = ee_pose_diversity(self.ee_pose_history)
             self._publish(robot_sample_event(row))
             return row
 
@@ -449,6 +454,7 @@ class RobotRealsenseSession:
             "motionCommands": self.motion_command_count,
             "motionSkips": self.motion_skip_count,
             "motionErrors": self.motion_error_count,
+            "poseDiversity": ee_pose_diversity(self.ee_pose_history),
             "lastError": self.last_error,
         }
 
@@ -1137,7 +1143,10 @@ def solve_end_hand_eye(observations: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def observation_pose_diversity(observations: list[dict[str, Any]]) -> dict[str, Any]:
-    poses = [np.asarray(obs["T_base_ee"], dtype=float) for obs in observations]
+    return ee_pose_diversity([np.asarray(obs["T_base_ee"], dtype=float) for obs in observations])
+
+
+def ee_pose_diversity(poses: list[np.ndarray]) -> dict[str, Any]:
     translations = np.asarray([pose[:3, 3] for pose in poses], dtype=float)
     max_translation = 0.0
     max_rotation = 0.0
@@ -1150,7 +1159,7 @@ def observation_pose_diversity(observations: list[dict[str, Any]]) -> dict[str, 
             max_rotation = max(max_rotation, rotation_angle_deg(delta[:3, :3]))
     axis_span = np.ptp(translations, axis=0) if translations.size else np.zeros(3, dtype=float)
     return {
-        "samples": len(observations),
+        "samples": len(poses),
         "pairCount": pair_count,
         "eeTranslationSpanM": float(max_translation),
         "eeRotationSpanDeg": float(max_rotation),
@@ -1246,6 +1255,7 @@ def robot_sample_event(row: dict[str, Any]) -> dict[str, Any]:
         "capturedAt": row.get("captured_at"),
         "T_base_ee": row.get("T_base_ee"),
         "jointpose": row.get("jointpose"),
+        "poseDiversity": row.get("poseDiversity"),
         "poseField": state.get("poseField"),
         "robotSn": state.get("robotSn"),
         "error": row.get("error"),
