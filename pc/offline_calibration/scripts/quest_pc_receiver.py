@@ -2424,6 +2424,10 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
     samples_path = robot_dir / "samples.jsonl"
     if not samples_path.exists():
         return None
+    result = read_json_if_exists(robot_dir / "robot_hand_eye_result.json")
+    failure = read_json_if_exists(robot_dir / "robot_hand_eye_failure.json")
+    alignment = result.get("questAlignment") if isinstance(result, dict) else None
+    t_world_base = transform_from_json(alignment.get("T_world_base")) if isinstance(alignment, dict) else None
     rows: list[dict[str, Any]] = []
     ee_poses: list[np.ndarray] = []
     with samples_path.open("r", encoding="utf-8") as handle:
@@ -2434,10 +2438,17 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
             if not isinstance(row, dict):
                 continue
             pose = row.get("T_base_ee") if isinstance(row.get("T_base_ee"), dict) else None
-            translated_pose = translate_transform_payload(pose, origin) if pose is not None else None
             pose_matrix = transform_from_json(pose)
+            world_pose = None
+            display_pose = None
+            display_frame = "unaligned_robot_base"
             if pose_matrix is not None:
                 ee_poses.append(pose_matrix)
+                if t_world_base is not None:
+                    world_matrix = t_world_base @ pose_matrix
+                    world_pose = transform_payload_from_matrix(world_matrix)
+                    display_pose = translate_transform_payload(world_pose, origin)
+                    display_frame = "quest_world_axes_translated_to_board_origin"
             rows.append(
                 {
                     "sampleIndex": row.get("sample_index"),
@@ -2445,19 +2456,27 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
                     "recordingTimestampSeconds": row.get("quest_recording_timestamp_seconds"),
                     "ok": bool(row.get("ok")),
                     "T_base_ee": pose,
-                    "T_display_ee": translated_pose,
+                    "T_world_ee": world_pose,
+                    "T_display_ee": display_pose,
+                    "displayFrame": display_frame,
                     "jointpose": row.get("jointpose"),
                     "error": row.get("error"),
                 }
             )
-    result = read_json_if_exists(robot_dir / "robot_hand_eye_result.json")
-    failure = read_json_if_exists(robot_dir / "robot_hand_eye_failure.json")
     return {
         "directory": str(robot_dir),
         "samples": rows,
+        "displayFrame": "quest_world_axes_translated_to_board_origin" if t_world_base is not None else "unaligned_robot_base",
         "poseDiversity": ee_pose_diversity(ee_poses),
         "result": result if isinstance(result, dict) else None,
         "failure": failure if isinstance(failure, dict) else None,
+    }
+
+
+def transform_payload_from_matrix(matrix: np.ndarray) -> dict[str, Any]:
+    return {
+        "matrix_4x4": [[float(value) for value in row] for row in matrix[:4, :4]],
+        "translation_m": [float(value) for value in matrix[:3, 3]],
     }
 
 
@@ -4485,11 +4504,12 @@ function draw() {
 }
 
 function drawRobotLive() {
+  if (!state.robotWorldBase) return;
   const pose = state.robotSample?.T_base_ee;
   const matrix = pose?.matrix_4x4;
   if (!matrix) return;
-  const worldMatrix = state.robotWorldBase ? multiplyMatrix4(state.robotWorldBase, matrix) : matrix;
-  drawRobotSkeleton(state.robotSample?.jointpose, state.robotWorldBase || identityMatrix4());
+  const worldMatrix = multiplyMatrix4(state.robotWorldBase, matrix);
+  drawRobotSkeleton(state.robotSample?.jointpose, state.robotWorldBase);
   const p = relPoint(matrixTranslation(worldMatrix));
   if (!p) return;
   drawPoint(p, '#ffffff', 6, 'EE');
