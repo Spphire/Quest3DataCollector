@@ -3998,7 +3998,6 @@ function robotPayloadFromControls() {
     realsenseGain: robotGain.value ? Number(robotGain.value) : null,
     boardCheckWarmupFrames: Number(robotBoardWarmup.value || 60),
     runHandEye: robotHandEye.value === 'true',
-    controllerMotionEnabled: false,
     controllerTranslationScale: Number(robotMotionScale.value || 1.0),
     controllerMaxOffsetM: Number(robotMaxOffset.value || 0.18),
     controllerMaxStepM: Number(robotMaxStep.value || 0.015)
@@ -4215,9 +4214,10 @@ function renderRobotStatus(payload) {
     return;
   }
   const robot = payload.robot || {};
+  const controllerMotion = Boolean(payload.config?.controllerMotionEnabled);
   const lines = [
     `robot: ${robot.connected ? 'connected' : 'not connected'} ${robot.robotSn || ''}`.trim(),
-    `motion: ${robot.motionArmed ? 'ARMED' : 'disarmed'}`,
+    `motion: ${robot.motionArmed ? 'ARMED' : 'disarmed'} / controller ${controllerMotion ? 'on' : 'off'}`,
     `pose: ${robot.poseField || 'n/a'}`,
     `rdk iface: ${(payload.config?.networkInterfaces || []).join(', ') || 'default'}`,
     `camera: ${payload.config?.cameraSerial || 'n/a'}`,
