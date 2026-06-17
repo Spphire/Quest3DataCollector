@@ -644,6 +644,28 @@ class LiveTelemetryVisualizer:
             return {"ok": False, "enabled": False, "reason": "disabled", "cameras": []}
         return self.robot_manager.list_cameras()
 
+    def robot_board_check_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.robot_manager is None:
+            return {"ok": False, "enabled": False, "reason": "disabled"}
+        self.robot_manager.configure(payload)
+        try:
+            result = self.robot_manager.check_end_camera_board(WORKSPACE_ROOT / "board_checks")
+            for key in ("imagePath", "overlayPath"):
+                path_text = result.get(key)
+                if isinstance(path_text, str) and path_text:
+                    result[key[:-4] + "Url"] = "/artifact?path=" + quote_path(str(resolve_artifact_path(path_text)))
+            self.publish_event({"type": "robot_status", "stage": "board_check", "boardCheck": result})
+            return result
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "enabled": True,
+                "error": str(exc),
+                "message": "end-camera checkerboard check failed",
+            }
+            self.publish_event({"type": "robot_status", "stage": "board_check_failed", "boardCheck": result})
+            return result
+
     def robot_diagnostics_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.robot_manager is None:
             return {"ok": False, "enabled": False, "reason": "disabled"}
@@ -776,6 +798,9 @@ class LiveTelemetryVisualizer:
                         return
                     if parsed.path == "/robot/diagnostics":
                         self._send_json(visualizer.robot_diagnostics_payload(payload))
+                        return
+                    if parsed.path == "/robot/board-check":
+                        self._send_json(visualizer.robot_board_check_payload(payload))
                         return
                     if parsed.path == "/robot/disconnect":
                         self._send_json(visualizer.disconnect_robot_payload())
@@ -3562,6 +3587,15 @@ label {
   padding: 8px;
   background: #0e1216;
 }
+.robot-board-preview img {
+  display: block;
+  width: 100%;
+  max-height: 180px;
+  object-fit: contain;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0e1216;
+}
 #status {
   white-space: pre-wrap;
   color: var(--muted);
@@ -3658,6 +3692,7 @@ label {
       </label>
       <div class="robot-actions">
         <button id="robotRefresh">Refresh Cameras</button>
+        <button id="robotBoardCheck">Check Board</button>
         <button id="robotDiagnostics">Diagnostics</button>
         <button id="robotConnect">Connect Robot</button>
         <button id="robotArmMotion">Arm Motion</button>
@@ -3665,6 +3700,7 @@ label {
         <button id="robotDisconnect">Disconnect</button>
       </div>
       <div id="robotStatus" class="robot-status">disabled or loading</div>
+      <div id="robotBoardPreview" class="robot-board-preview"></div>
     </div>
     <div id="status"></div>
   </aside>
@@ -3699,12 +3735,14 @@ const robotMotionScale = document.getElementById('robotMotionScale');
 const robotMaxOffset = document.getElementById('robotMaxOffset');
 const robotMaxStep = document.getElementById('robotMaxStep');
 const robotRefresh = document.getElementById('robotRefresh');
+const robotBoardCheck = document.getElementById('robotBoardCheck');
 const robotDiagnostics = document.getElementById('robotDiagnostics');
 const robotConnect = document.getElementById('robotConnect');
 const robotArmMotion = document.getElementById('robotArmMotion');
 const robotDisarmMotion = document.getElementById('robotDisarmMotion');
 const robotDisconnect = document.getElementById('robotDisconnect');
 const robotStatus = document.getElementById('robotStatus');
+const robotBoardPreview = document.getElementById('robotBoardPreview');
 
 const state = {
   frames: [],
@@ -3722,6 +3760,7 @@ const state = {
   robotSample: null,
   robotMotion: null,
   robotDiagnostics: null,
+  robotBoardCheck: null,
   robotWorldBase: null,
   robotModel: null,
   robotCalibration: null
@@ -3913,6 +3952,50 @@ async function runRobotDiagnostics() {
   } finally {
     robotDiagnostics.disabled = false;
   }
+}
+
+async function checkRobotBoard() {
+  await configureRobot();
+  robotBoardCheck.disabled = true;
+  robotStatus.textContent = 'checking end camera board...';
+  try {
+    const response = await fetch('/robot/board-check', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(robotPayloadFromControls())
+    });
+    const payload = await response.json();
+    state.robotBoardCheck = payload;
+    renderRobotBoardCheck(payload);
+  } catch (error) {
+    robotStatus.textContent = String(error);
+  } finally {
+    robotBoardCheck.disabled = false;
+  }
+}
+
+function renderRobotBoardCheck(payload) {
+  const lines = [
+    `board check: ${payload?.ok ? 'detected' : 'not detected'}`,
+    `camera: ${payload?.camera?.serial || robotCamera.value || 'n/a'}`,
+    `corners: ${payload?.detectedCorners ?? 0}`,
+  ];
+  if (Number.isFinite(payload?.bestReprojectionRmsePx)) {
+    lines.push(`reproj: ${payload.bestReprojectionRmsePx.toFixed(2)} px`);
+  }
+  if (Number.isFinite(payload?.brightness?.mean) && Number.isFinite(payload?.brightness?.p95)) {
+    lines.push(`brightness: mean ${payload.brightness.mean.toFixed(1)}, p95 ${payload.brightness.p95.toFixed(1)}`);
+  }
+  if (payload?.method) lines.push(`method: ${payload.method}`);
+  if (payload?.message) lines.push(payload.message);
+  if (payload?.overlayUrl) lines.push(`overlay: ${payload.overlayUrl}`);
+  else if (payload?.imageUrl) lines.push(`image: ${payload.imageUrl}`);
+  if (payload?.error) lines.push(`error: ${payload.error}`);
+  robotStatus.textContent = lines.join('\n');
+  const url = payload?.overlayUrl || payload?.imageUrl;
+  robotBoardPreview.innerHTML = url
+    ? `<a href="${escapeHtml(url)}" target="_blank"><img src="${escapeHtml(url)}" alt="end camera board check"></a>`
+    : '';
 }
 
 async function disconnectRobot() {
@@ -4638,6 +4721,7 @@ clearButton.addEventListener('click', () => {
   state.frames = state.frames.slice(-1);
 });
 robotRefresh.addEventListener('click', refreshCameras);
+robotBoardCheck.addEventListener('click', checkRobotBoard);
 robotDiagnostics.addEventListener('click', runRobotDiagnostics);
 robotConnect.addEventListener('click', connectRobot);
 robotArmMotion.addEventListener('click', armRobotMotion);

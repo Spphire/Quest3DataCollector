@@ -620,6 +620,81 @@ class FlexivRealSenseManager:
         except Exception as exc:  # pragma: no cover - hardware path
             return {"ok": False, "error": str(exc), "cameras": []}
 
+    def check_end_camera_board(self, output_root: Path) -> dict[str, Any]:
+        camera = RealSenseColorCamera()
+        output_dir = output_root.resolve() / "end_camera"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            metadata = camera.start(
+                self.config.camera_serial,
+                self.config.width,
+                self.config.height,
+                self.config.fps,
+            )
+            rgb = camera.capture_rgb(self.config.warmup_frames)
+        finally:
+            camera.stop()
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        brightness = {
+            "mean": float(np.mean(gray)),
+            "median": float(np.median(gray)),
+            "p95": float(np.percentile(gray, 95)),
+        }
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        image_path = output_dir / f"end_camera_board_check_{stamp}.jpg"
+        save_rgb_jpeg(rgb, image_path)
+        overlay_dir = output_dir / "overlays"
+        overlay_dir.mkdir(parents=True, exist_ok=True)
+        sample = {
+            "sample_index": 0,
+            "quest_sample_index": None,
+            "quest_recording_timestamp_seconds": None,
+        }
+        observation = detect_end_observation(
+            image_path=image_path,
+            sample=sample,
+            t_base_ee=np.eye(4, dtype=float),
+            camera=metadata,
+            cols=self.config.pattern_cols,
+            rows=self.config.pattern_rows,
+            square_size_m=self.config.square_size_m,
+            overlay_dir=overlay_dir,
+        )
+        result = {
+            "ok": observation is not None,
+            "createdAtUtc": datetime.now(timezone.utc).isoformat(),
+            "camera": metadata,
+            "pattern": {
+                "cols": self.config.pattern_cols,
+                "rows": self.config.pattern_rows,
+                "squareSizeM": self.config.square_size_m,
+            },
+            "brightness": brightness,
+            "imagePath": str(image_path),
+            "detectedCorners": self.config.pattern_cols * self.config.pattern_rows if observation is not None else 0,
+            "method": observation.get("method") if observation is not None else None,
+            "bestReprojectionRmsePx": None,
+            "bestReprojectionMedianPx": None,
+            "overlayPath": None,
+            "message": (
+                "checkerboard detected"
+                if observation is not None
+                else (
+                    "checkerboard not detected; image is very dark"
+                    if brightness["p95"] < 20.0
+                    else "checkerboard not detected"
+                )
+            ),
+        }
+        if observation is not None:
+            candidates = observation.get("candidates") or []
+            best = min(candidates, key=lambda row: float(row.get("reprojection_rmse_px") or float("inf"))) if candidates else {}
+            result["bestReprojectionRmsePx"] = best.get("reprojection_rmse_px")
+            result["bestReprojectionMedianPx"] = best.get("reprojection_median_px")
+            result["overlayPath"] = observation.get("overlay")
+        write_json(result, output_dir / "latest_board_check.json")
+        return result
+
     def start_session(
         self,
         parent_directory: Path,

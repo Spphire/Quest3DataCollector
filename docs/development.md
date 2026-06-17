@@ -213,11 +213,12 @@ Then:
 1. Select the end-mounted RealSense camera in the `Flexiv / RealSense` panel.
 2. Enter the Flexiv robot SN.
 3. Click `Connect Robot`.
-4. Optional: click `Arm Motion` if the right controller should drive bounded TCP offsets.
-5. Press Quest B once to start PC calibration capture.
-6. Move the Quest for Quest/checkerboard pose diversity.
-7. Move the robot/end camera for robot/checkerboard pose diversity while keeping the checkerboard visible to the end-mounted RealSense in at least six captured samples.
-8. Press Quest B again to stop. Stopping also disarms controller motion.
+4. Click `Check Board` before recording. It captures one end-camera frame, checks for the 11x8 checkerboard, saves the frame/overlay under `board_checks/end_camera/`, and reports brightness. If it says the image is very dark, fix lighting/camera aim before recording.
+5. Optional: click `Arm Motion` if the right controller should drive bounded TCP offsets.
+6. Press Quest B once to start PC calibration capture.
+7. Move the Quest for Quest/checkerboard pose diversity.
+8. Move the robot/end camera for robot/checkerboard pose diversity while keeping the checkerboard visible to the end-mounted RealSense in at least six captured samples.
+9. Press Quest B again to stop. Stopping also disarms controller motion.
 
 The PC receiver writes:
 
