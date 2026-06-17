@@ -668,12 +668,14 @@ class LiveTelemetryVisualizer:
 
     def preflight_status_payload(self) -> dict[str, Any]:
         with self.lock:
-            last_sample = next((event for event in reversed(self.history) if event.get("type") == "sample"), None)
+            recent_samples = [event for event in self.history if event.get("type") == "sample"]
+            last_sample = recent_samples[-1] if recent_samples else None
+            controller_window = recent_controller_status(recent_samples)
         robot_status = self.robot_status_payload()
         camera_status = self.camera_list_payload()
         board_status = self.latest_robot_board_check_payload()
         model_status = rizon4_model_payload()
-        return build_preflight_status(last_sample, robot_status, camera_status, board_status, model_status)
+        return build_preflight_status(last_sample, controller_window, robot_status, camera_status, board_status, model_status)
 
     def robot_board_check_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.robot_manager is None:
@@ -3902,8 +3904,83 @@ def rizon4_model_payload() -> dict[str, Any]:
     }
 
 
+def recent_controller_status(samples: list[dict[str, Any]], window_seconds: float = 5.0) -> dict[str, Any]:
+    now = time.time()
+    rows: list[dict[str, Any]] = []
+    for sample in reversed(samples):
+        if not isinstance(sample, dict):
+            continue
+        timestamp = sample.get("pcReceiveUnixSeconds")
+        if not is_number(timestamp):
+            continue
+        age = max(0.0, now - float(timestamp))
+        if age > window_seconds:
+            break
+        rows.append(sample)
+
+    def summarize(key: str) -> dict[str, Any]:
+        valid = 0
+        missing: dict[str, int] = {}
+        sources: dict[str, int] = {}
+        latest: dict[str, Any] = {}
+        latest_age = None
+        latest_valid_age = None
+        latest_valid_source = None
+        for row in rows:
+            controller = row.get(key)
+            if not isinstance(controller, dict):
+                continue
+            if not latest:
+                latest = controller
+                row_timestamp = row.get("pcReceiveUnixSeconds")
+                if is_number(row_timestamp):
+                    latest_age = max(0.0, now - float(row_timestamp))
+            source = str(controller.get("source") or "missing")
+            sources[source] = sources.get(source, 0) + 1
+            if controller.get("ok"):
+                valid += 1
+                if latest_valid_age is None:
+                    row_timestamp = row.get("pcReceiveUnixSeconds")
+                    latest_valid_age = max(0.0, now - float(row_timestamp)) if is_number(row_timestamp) else None
+                    latest_valid_source = source
+            else:
+                missing[source] = missing.get(source, 0) + 1
+
+        return {
+            "samples": len(rows),
+            "validSamples": valid,
+            "latestAgeSeconds": latest_age,
+            "latestValidAgeSeconds": latest_valid_age,
+            "latestValidSource": latest_valid_source,
+            "latest": latest,
+            "sources": sources,
+            "missing": missing,
+        }
+
+    return {
+        "windowSeconds": window_seconds,
+        "sampleCount": len(rows),
+        "left": summarize("left"),
+        "right": summarize("right"),
+    }
+
+
+def controller_preflight_detail(latest: dict[str, Any], recent: dict[str, Any], prefix: str) -> str:
+    latest_ok = bool(latest.get("ok")) if isinstance(latest, dict) else False
+    latest_source = str(latest.get("source") or "n/a") if isinstance(latest, dict) else "n/a"
+    valid = int(recent.get("validSamples") or 0) if isinstance(recent, dict) else 0
+    samples = int(recent.get("samples") or 0) if isinstance(recent, dict) else 0
+    window = float(recent.get("windowSeconds", 5.0)) if isinstance(recent, dict) else 5.0
+    text = f"{prefix}latest={latest_ok} ({latest_source}); {valid}/{samples} valid in last {window:.0f}s"
+    latest_valid_age = recent.get("latestValidAgeSeconds") if isinstance(recent, dict) else None
+    if is_number(latest_valid_age):
+        text += f", last valid {float(latest_valid_age):.2f}s ago"
+    return text
+
+
 def build_preflight_status(
     last_sample: dict[str, Any] | None,
+    controller_window: dict[str, Any],
     robot_status: dict[str, Any],
     camera_status: dict[str, Any],
     board_status: dict[str, Any],
@@ -3916,9 +3993,16 @@ def build_preflight_status(
     quest_live = isinstance(last_sample, dict) and sample_age is not None and sample_age <= 3.0
     head_ok = bool(last_sample.get("head", {}).get("ok")) if isinstance(last_sample, dict) else False
     gaze_ok = bool(last_sample.get("gaze", {}).get("ok")) if isinstance(last_sample, dict) else False
+    left_controller = last_sample.get("left", {}) if isinstance(last_sample, dict) else {}
     right_controller = last_sample.get("right", {}) if isinstance(last_sample, dict) else {}
     right_controller_ok = bool(right_controller.get("ok")) if isinstance(right_controller, dict) else False
     right_controller_source = str(right_controller.get("source") or "n/a") if isinstance(right_controller, dict) else "n/a"
+    left_recent = controller_window.get("left", {}) if isinstance(controller_window, dict) else {}
+    right_recent = controller_window.get("right", {}) if isinstance(controller_window, dict) else {}
+    if isinstance(left_recent, dict):
+        left_recent["windowSeconds"] = controller_window.get("windowSeconds", 5.0)
+    if isinstance(right_recent, dict):
+        right_recent["windowSeconds"] = controller_window.get("windowSeconds", 5.0)
 
     robot = robot_status.get("robot") if isinstance(robot_status, dict) else {}
     robot_config = robot_status.get("config") if isinstance(robot_status, dict) else {}
@@ -3984,6 +4068,17 @@ def build_preflight_status(
             else str(model_status.get("reason") or "missing model"),
         },
         {
+            "id": "controllerTelemetry",
+            "label": "Quest controller telemetry",
+            "ok": right_controller_ok,
+            "required": motion_required,
+            "detail": (
+                controller_preflight_detail(left_controller, left_recent, "left: ")
+                + " | "
+                + controller_preflight_detail(right_controller, right_recent, "right: ")
+            ),
+        },
+        {
             "id": "robotMotion",
             "label": "Right controller robot motion",
             "ok": bool(motion_armed and motion_enabled and right_controller_ok),
@@ -4000,6 +4095,7 @@ def build_preflight_status(
         "ready": ok,
         "timestampUnixSeconds": now,
         "sampleAgeSeconds": sample_age,
+        "controllerWindow": controller_window,
         "checks": checks,
         "summary": "ready for B-button calibration" if ok else "check required items before B-button calibration",
     }
