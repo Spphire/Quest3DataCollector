@@ -2507,6 +2507,7 @@ def recording_replay_list(recording_root: Path) -> dict[str, Any]:
         if is_number(summary.get("samples")):
             sample_count = int(summary["samples"])
         has_calibration = isinstance(snapshot, dict) and bool(snapshot.get("T_world_board"))
+        robot_summary = robot_realsense_record_summary(directory)
         record = {
             "recordId": directory.name,
             "path": str(directory),
@@ -2516,12 +2517,59 @@ def recording_replay_list(recording_root: Path) -> dict[str, Any]:
             "calibrationRecordId": snapshot.get("recordId") if isinstance(snapshot, dict) else None,
             "startUtc": summary.get("startUtc"),
             "closedReason": summary.get("closedReason"),
+            "robotSummary": robot_summary,
         }
         sort_samples = sample_count if sample_count is not None else 0
         sortable_records.append(((1 if has_calibration else 0, sort_samples, directory.stat().st_mtime), record))
     sortable_records.sort(key=lambda item: item[0], reverse=True)
     records = [record for _, record in sortable_records]
     return {"ok": True, "root": str(root), "records": records}
+
+
+def robot_realsense_record_summary(session_dir: Path) -> dict[str, Any] | None:
+    robot_dir = session_dir / "robot_realsense"
+    if not robot_dir.exists():
+        return None
+    session = read_json_if_exists(robot_dir / "session_summary.json")
+    config = read_json_if_exists(robot_dir / "capture_config.json")
+    result = read_json_if_exists(robot_dir / "robot_hand_eye_result.json")
+    failure = read_json_if_exists(robot_dir / "robot_hand_eye_failure.json")
+    if not isinstance(session, dict):
+        session = {}
+    if not isinstance(config, dict):
+        config = {}
+    status = "pending"
+    if isinstance(result, dict) and result.get("ok"):
+        status = "ok"
+    elif isinstance(failure, dict):
+        status = "failed"
+    elif session:
+        status = "recorded"
+    counts = result.get("counts") if isinstance(result, dict) else {}
+    diversity = result.get("diversity") if isinstance(result, dict) else session.get("poseDiversity")
+    residual = None
+    if isinstance(result, dict):
+        residual = (
+            result.get("end_camera", {})
+            .get("residuals", {})
+            .get("translation_mm", {})
+            if isinstance(result.get("end_camera"), dict)
+            else None
+        )
+    return {
+        "status": status,
+        "samples": session.get("samples"),
+        "images": session.get("images"),
+        "motionCommands": session.get("motionCommands"),
+        "motionSkips": session.get("motionSkips"),
+        "motionErrors": session.get("motionErrors"),
+        "detections": counts.get("detections") if isinstance(counts, dict) else None,
+        "requiredDetections": config.get("minHandEyeDetections"),
+        "translationSpanM": diversity.get("eeTranslationSpanM") if isinstance(diversity, dict) else None,
+        "rotationSpanDeg": diversity.get("eeRotationSpanDeg") if isinstance(diversity, dict) else None,
+        "residualMedianMm": residual.get("median") if isinstance(residual, dict) else None,
+        "failureReason": failure.get("error") if isinstance(failure, dict) else None,
+    }
 
 
 def build_recording_replay_payload(recording_root: Path, record_id: str) -> dict[str, Any]:
@@ -5666,10 +5714,38 @@ function renderRecordList() {
     button.className = 'record-item' + (record.recordId === state.selected ? ' active' : '');
     const samples = record.samples ?? 'n/a';
     const calib = record.hasCalibrationSnapshot ? `calib ${record.calibrationRecordId || 'yes'}` : 'no calib';
-    button.innerHTML = `<span class="record-title">${escapeHtml(record.recordId)}</span><span class="record-meta">${samples} samples · ${escapeHtml(calib)}</span><span class="record-meta">${escapeHtml(record.closedReason || '')}</span>`;
+    const robot = robotRecordSummaryText(record.robotSummary);
+    button.innerHTML = `<span class="record-title">${escapeHtml(record.recordId)}</span><span class="record-meta">${samples} samples | ${escapeHtml(calib)}</span><span class="record-meta">${escapeHtml(robot)}</span><span class="record-meta">${escapeHtml(record.closedReason || '')}</span>`;
     button.onclick = () => loadRecord(record.recordId);
     recordList.appendChild(button);
   }
+}
+
+function robotRecordSummaryText(summary) {
+  if (!summary) return 'no robot';
+  const parts = [];
+  const status = summary.status || 'recorded';
+  parts.push(`robot ${status}`);
+  if (summary.samples !== undefined || summary.images !== undefined) {
+    const samples = summary.samples ?? 'n/a';
+    const images = summary.images ?? 'n/a';
+    parts.push(`${samples} sample, ${images} img`);
+  }
+  if (summary.detections !== undefined || summary.requiredDetections !== undefined) {
+    const detected = summary.detections ?? 'n/a';
+    const required = summary.requiredDetections ?? '?';
+    parts.push(`det ${detected}/${required}`);
+  }
+  if (summary.motionCommands !== undefined) {
+    parts.push(`motion ${summary.motionCommands}`);
+  }
+  if (Number.isFinite(Number(summary.residualMedianMm))) {
+    parts.push(`res ${Number(summary.residualMedianMm).toFixed(1)}mm`);
+  }
+  if (summary.status === 'failed' && summary.failureReason) {
+    parts.push(String(summary.failureReason).slice(0, 80));
+  }
+  return parts.join(' | ');
 }
 
 async function loadRecord(recordId) {
