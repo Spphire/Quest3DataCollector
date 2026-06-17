@@ -2622,6 +2622,7 @@ def robot_realsense_record_summary(session_dir: Path) -> dict[str, Any] | None:
     else:
         counts = {}
         diversity = session.get("poseDiversity")
+    last_motion = session.get("lastMotion") if isinstance(session.get("lastMotion"), dict) else {}
     residual = None
     if isinstance(result, dict):
         residual = (
@@ -2638,6 +2639,7 @@ def robot_realsense_record_summary(session_dir: Path) -> dict[str, Any] | None:
         "motionCommands": session.get("motionCommands"),
         "motionSkips": session.get("motionSkips"),
         "motionErrors": session.get("motionErrors"),
+        "lastMotionReason": last_motion.get("reason") or last_motion.get("error"),
         "detections": counts.get("detections") if isinstance(counts, dict) else None,
         "requiredDetections": config.get("minHandEyeDetections"),
         "translationSpanM": diversity.get("eeTranslationSpanM") if isinstance(diversity, dict) else None,
@@ -2919,6 +2921,7 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
     samples_path = robot_dir / "samples.jsonl"
     if not samples_path.exists():
         return None
+    session = read_json_if_exists(robot_dir / "session_summary.json")
     result = read_json_if_exists(robot_dir / "robot_hand_eye_result.json")
     failure = read_json_if_exists(robot_dir / "robot_hand_eye_failure.json")
     alignment = result.get("questAlignment") if isinstance(result, dict) else None
@@ -2960,6 +2963,7 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
             )
     return {
         "directory": str(robot_dir),
+        "session": session if isinstance(session, dict) else None,
         "samples": rows,
         "displayFrame": "quest_world_axes_translated_to_board_origin" if t_world_base is not None else "unaligned_robot_base",
         "poseDiversity": ee_pose_diversity(ee_poses),
@@ -3368,6 +3372,7 @@ def visualizer_event_from_sample(message: dict[str, Any], wrapper: dict[str, Any
         "isRecording": bool(message.get("isRecording", True)),
         "telemetryMode": message.get("telemetryMode"),
         "recordingTimestampSeconds": message.get("recordingTimestampSeconds"),
+        "pcReceiveUnixSeconds": wrapper.get("pcReceiveUnixSeconds"),
         "pcReceivePerfCounterSeconds": wrapper.get("pcReceivePerfCounterSeconds"),
         "pcReceiveUtc": wrapper.get("pcReceiveUtc"),
         "head": head,
@@ -3812,13 +3817,17 @@ def build_preflight_status(
     quest_live = isinstance(last_sample, dict) and sample_age is not None and sample_age <= 3.0
     head_ok = bool(last_sample.get("head", {}).get("ok")) if isinstance(last_sample, dict) else False
     gaze_ok = bool(last_sample.get("gaze", {}).get("ok")) if isinstance(last_sample, dict) else False
-    right_controller_ok = bool(last_sample.get("right", {}).get("ok")) if isinstance(last_sample, dict) else False
+    right_controller = last_sample.get("right", {}) if isinstance(last_sample, dict) else {}
+    right_controller_ok = bool(right_controller.get("ok")) if isinstance(right_controller, dict) else False
+    right_controller_source = str(right_controller.get("source") or "n/a") if isinstance(right_controller, dict) else "n/a"
 
     robot = robot_status.get("robot") if isinstance(robot_status, dict) else {}
     robot_config = robot_status.get("config") if isinstance(robot_status, dict) else {}
     robot_connected = bool(isinstance(robot, dict) and robot.get("connected"))
     motion_armed = bool(isinstance(robot, dict) and robot.get("motionArmed"))
     motion_enabled = bool(isinstance(robot_config, dict) and robot_config.get("controllerMotionEnabled"))
+    hand_eye_enabled = bool(isinstance(robot_config, dict) and robot_config.get("runHandEye", True))
+    motion_required = bool(robot_connected and hand_eye_enabled)
     camera_serial = str(robot_config.get("cameraSerial") or "") if isinstance(robot_config, dict) else ""
     cameras = camera_status.get("cameras") if isinstance(camera_status, dict) else []
     camera_serials = {
@@ -3879,10 +3888,10 @@ def build_preflight_status(
             "id": "robotMotion",
             "label": "Right controller robot motion",
             "ok": bool(motion_armed and motion_enabled and right_controller_ok),
-            "required": False,
+            "required": motion_required,
             "detail": (
-                f"armed={motion_armed}, controllerMotion={motion_enabled}, rightPose={right_controller_ok}; "
-                "OK only needed when the right controller should drive robot motion"
+                f"required={motion_required}, armed={motion_armed}, controllerMotion={motion_enabled}, "
+                f"rightPose={right_controller_ok}, right={right_controller_source}"
             ),
         },
     ]
@@ -5021,6 +5030,7 @@ function renderRobotStatus(payload) {
   }
   const robot = payload.robot || {};
   const controllerMotion = Boolean(payload.config?.controllerMotionEnabled);
+  const active = payload.activeSession || {};
   const lines = [
     `robot: ${robot.connected ? 'connected' : 'not connected'} ${robot.robotSn || ''}`.trim(),
     `motion: ${robot.motionArmed ? 'ARMED' : 'disarmed'} / controller ${controllerMotion ? 'on' : 'off'}`,
@@ -5028,7 +5038,7 @@ function renderRobotStatus(payload) {
     `rdk iface: ${(payload.config?.networkInterfaces || []).join(', ') || 'default'}`,
     `camera: ${payload.config?.cameraSerial || 'n/a'}`,
     `exposure: ${payload.config?.realsenseAutoExposure === false ? 'manual' : 'auto'}${Number.isFinite(payload.config?.realsenseExposure) ? ` ${payload.config.realsenseExposure}` : ''}${Number.isFinite(payload.config?.realsenseGain) ? ` gain ${payload.config.realsenseGain}` : ''}`,
-    `session: ${payload.activeSession ? `${payload.activeSession.samples || 0} samples, ${payload.activeSession.images || 0} images` : 'idle'}`
+    `session: ${payload.activeSession ? `${active.samples || 0} samples, ${active.images || 0} images` : 'idle'}`
   ];
   lines.push(`model: ${robotModelStatusText()}`);
   if (state.robotSample) {
@@ -5036,8 +5046,14 @@ function renderRobotStatus(payload) {
     const fkError = robotFkErrorMm(state.robotSample, null);
     if (Number.isFinite(fkError)) lines.push(`URDF FK vs flange: ${fkError.toFixed(1)}mm`);
     lines.push(`hand-eye motion: ${poseDiversityText(state.robotSample.poseDiversity)}`);
-  } else if (payload.activeSession?.poseDiversity) {
-    lines.push(`hand-eye motion: ${poseDiversityText(payload.activeSession.poseDiversity)}`);
+  } else if (active.poseDiversity) {
+    lines.push(`hand-eye motion: ${poseDiversityText(active.poseDiversity)}`);
+  }
+  if (payload.activeSession) {
+    lines.push(`motion counts: cmd ${active.motionCommands ?? 0}, skip ${active.motionSkips ?? 0}, err ${active.motionErrors ?? 0}`);
+    if (active.lastMotion) {
+      lines.push(`last motion: ${robotMotionSummaryText(active.lastMotion)}`);
+    }
   }
   if (state.robotMotion) {
     const offset = Array.isArray(state.robotMotion.offsetM) ? state.robotMotion.offsetM.map(v => Number(v).toFixed(3)).join(', ') : (state.robotMotion.reason || state.robotMotion.error || 'n/a');
@@ -5054,6 +5070,20 @@ function renderRobotStatus(payload) {
   }
   if (robot.lastError || payload.lastError) lines.push(`error: ${robot.lastError || payload.lastError}`);
   robotStatus.textContent = lines.join('\n');
+}
+
+function robotMotionSummaryText(event) {
+  if (!event) return 'n/a';
+  if (event.ok) {
+    const offset = Array.isArray(event.offsetM)
+      ? event.offsetM.map(v => Number(v).toFixed(3)).join(', ')
+      : 'sent';
+    const step = Array.isArray(event.stepOffsetM)
+      ? ` step ${event.stepOffsetM.map(v => Number(v).toFixed(3)).join(', ')}`
+      : '';
+    return `sent offset ${offset}${step}`;
+  }
+  return event.reason || event.error || 'skipped';
 }
 
 function robotModelStatusText() {
@@ -6034,7 +6064,10 @@ function robotRecordSummaryText(summary) {
     parts.push(`det ${detected}/${required}`);
   }
   if (summary.motionCommands !== undefined) {
-    parts.push(`motion ${summary.motionCommands}`);
+    const skips = summary.motionSkips ?? 0;
+    const errors = summary.motionErrors ?? 0;
+    parts.push(`motion ${summary.motionCommands}/${skips}/${errors}`);
+    if (summary.lastMotionReason) parts.push(String(summary.lastMotionReason).slice(0, 48));
   }
   if (summary.residualMedianMm !== null && summary.residualMedianMm !== undefined && Number.isFinite(Number(summary.residualMedianMm))) {
     parts.push(`res ${Number(summary.residualMedianMm).toFixed(1)}mm`);
@@ -6217,6 +6250,7 @@ function updateRobotInfo() {
   }
   const result = rr.result || {};
   const failure = rr.failure || {};
+  const session = rr.session || {};
   const counts = result.counts || failure.counts || {};
   const residual = result.end_camera?.residuals?.translation_mm || {};
   const align = result.questAlignment || {};
@@ -6233,12 +6267,23 @@ function updateRobotInfo() {
     ['model', replayRobotModelStatusText()],
     ['URDF FK', Number.isFinite(fkError) ? `${fkError.toFixed(1)}mm vs flange` : 'n/a'],
     ['ee motion', replayPoseDiversityText(diversity)],
+    ['motion', replayMotionSummaryText(session)],
     ['hand-eye', result.ok ? 'ok' : (rr.failure ? 'failed' : 'pending')],
     ['failure', rr.failure?.error || 'n/a'],
     ['residual', Number.isFinite(residual.median) ? `med ${residual.median.toFixed(1)}mm p95 ${Number(residual.p95 || 0).toFixed(1)}mm` : 'n/a'],
     ['quest-base', align.ok ? 'T_world_base ready' : (align.reason || 'n/a')]
   ];
   robotKv.innerHTML = kv.map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
+}
+
+function replayMotionSummaryText(session) {
+  if (!session) return 'n/a';
+  const commands = session.motionCommands ?? 'n/a';
+  const skips = session.motionSkips ?? 0;
+  const errors = session.motionErrors ?? 0;
+  const last = session.lastMotion || {};
+  const reason = last.reason || last.error || '';
+  return `cmd ${commands}, skip ${skips}, err ${errors}${reason ? `, last ${reason}` : ''}`;
 }
 
 function replayRobotModelStatusText() {

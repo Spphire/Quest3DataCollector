@@ -346,6 +346,7 @@ class RobotRealsenseSession:
         self.motion_command_count = 0
         self.motion_skip_count = 0
         self.motion_error_count = 0
+        self.last_motion_event: dict[str, Any] | None = None
         self.ee_pose_history: list[np.ndarray] = []
 
     def start(self) -> dict[str, Any]:
@@ -390,6 +391,7 @@ class RobotRealsenseSession:
                 "error": str(exc),
             }
         with self.lock:
+            self.last_motion_event = event
             if self.motion_handle is not None:
                 self.motion_handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
                 self.motion_handle.flush()
@@ -469,6 +471,7 @@ class RobotRealsenseSession:
             "motionCommands": self.motion_command_count,
             "motionSkips": self.motion_skip_count,
             "motionErrors": self.motion_error_count,
+            "lastMotion": self.last_motion_event,
             "poseDiversity": ee_pose_diversity(self.ee_pose_history),
             "lastError": self.last_error,
         }
