@@ -263,7 +263,7 @@ This unifies Quest world, checkerboard, and robot base in the live/replay visual
 - The board is fixed at 11x8 inner corners, 25 mm square size.
 - Hand-eye calibration solves `T_ee_realsense` and `T_base_board` from repeated end-camera observations of the fixed board.
 - Replay keeps Quest axes and translates the view near the board origin; robot EE samples are drawn as white points with local RGB axes.
-- A Flexiv Rizon4 URDF asset is stored at `pc/offline_calibration/assets/urdf/flexiv_Rizon4_kinematics.urdf` and served by the live viewer at `/robot/urdf` for future model rendering.
+- A Flexiv Rizon4 URDF asset is stored at `pc/offline_calibration/assets/urdf/flexiv_Rizon4_kinematics.urdf` and served by the live viewer at `/robot/urdf`. The live and replay viewers parse the URDF joint chain, draw the robot as a line skeleton from recorded `jointpose`, and report the URDF FK-vs-`flange_pose` translation error when a robot sample is available.
 
 ### 2026-06-18 smoke result
 

@@ -4163,10 +4163,12 @@ async function loadRobotModel() {
   try {
     const response = await fetch('/robot/model', {cache: 'no-store'});
     const payload = await response.json();
-    if (payload.ok) state.robotModel = payload;
+    state.robotModel = payload;
   } catch (_) {
     state.robotModel = null;
   }
+  if (state.robotBoardCheck) renderRobotBoardCheck(state.robotBoardCheck);
+  else if (state.robot) renderRobotStatus(state.robot);
 }
 
 async function loadQuestAdbStatus() {
@@ -4347,6 +4349,7 @@ function renderRobotBoardCheck(payload) {
     `board check: ${detected ? 'detected' : 'not detected'}`,
     `camera: ${payload?.camera?.serial || robotCamera.value || 'n/a'}`,
     `corners: ${payload?.detectedCorners ?? 0}`,
+    `model: ${robotModelStatusText()}`,
   ];
   if (Number.isFinite(payload?.bestReprojectionRmsePx)) {
     lines.push(`reproj: ${payload.bestReprojectionRmsePx.toFixed(2)} px`);
@@ -4493,8 +4496,11 @@ function renderRobotStatus(payload) {
     `exposure: ${payload.config?.realsenseAutoExposure === false ? 'manual' : 'auto'}${Number.isFinite(payload.config?.realsenseExposure) ? ` ${payload.config.realsenseExposure}` : ''}${Number.isFinite(payload.config?.realsenseGain) ? ` gain ${payload.config.realsenseGain}` : ''}`,
     `session: ${payload.activeSession ? `${payload.activeSession.samples || 0} samples, ${payload.activeSession.images || 0} images` : 'idle'}`
   ];
+  lines.push(`model: ${robotModelStatusText()}`);
   if (state.robotSample) {
     lines.push(`last sample: ${state.robotSample.sampleIndex} quest ${state.robotSample.questSampleIndex}`);
+    const fkError = robotFkErrorMm(state.robotSample, null);
+    if (Number.isFinite(fkError)) lines.push(`URDF FK vs flange: ${fkError.toFixed(1)}mm`);
     lines.push(`hand-eye motion: ${poseDiversityText(state.robotSample.poseDiversity)}`);
   } else if (payload.activeSession?.poseDiversity) {
     lines.push(`hand-eye motion: ${poseDiversityText(payload.activeSession.poseDiversity)}`);
@@ -4510,6 +4516,29 @@ function renderRobotStatus(payload) {
   }
   if (robot.lastError || payload.lastError) lines.push(`error: ${robot.lastError || payload.lastError}`);
   robotStatus.textContent = lines.join('\n');
+}
+
+function robotModelStatusText() {
+  const model = state.robotModel;
+  if (!model) return 'loading';
+  if (!model.ok) return `unavailable ${model.reason || ''}`.trim();
+  const active = Array.isArray(model.activeJointNames) ? model.activeJointNames.length : 0;
+  return `${model.name || 'Rizon4'} URDF, ${active} active joints`;
+}
+
+function robotFkErrorMm(robotSample, baseMatrix) {
+  const model = state.robotModel;
+  const jointpose = robotSample?.jointpose;
+  const measured = robotSample?.T_base_ee?.matrix_4x4;
+  if (!model?.ok || !Array.isArray(jointpose) || jointpose.length < 7 || !measured) return NaN;
+  const base = baseMatrix || identityMatrix4();
+  const frames = robotFrames(model, jointpose, base);
+  const fk = frames.length ? frames[frames.length - 1] : null;
+  const measuredInBase = baseMatrix ? multiplyMatrix4(baseMatrix, measured) : measured;
+  const fkP = matrixTranslation(fk);
+  const measuredP = matrixTranslation(measuredInBase);
+  if (!fkP || !measuredP) return NaN;
+  return length(sub(fkP, measuredP)) * 1000;
 }
 
 function poseDiversityText(diversity) {
@@ -5403,10 +5432,12 @@ async function loadRobotModel() {
   try {
     const response = await fetch('/robot/model', {cache: 'no-store'});
     const payload = await response.json();
-    if (payload.ok) state.robotModel = payload;
+    state.robotModel = payload;
   } catch (_) {
     state.robotModel = null;
   }
+  updateRobotInfo();
+  render();
 }
 
 function renderRecordList() {
@@ -5524,15 +5555,41 @@ function updateRobotInfo() {
   const residual = result.end_camera?.residuals?.translation_mm || {};
   const align = result.questAlignment || {};
   const diversity = result.diversity || rr.poseDiversity;
+  const sample = state.data?.samples?.[state.idx] || {};
+  const robot = nearestRobotSample(sample.recordingTimestampSeconds);
+  const fkError = replayRobotFkErrorMm(robot);
   const kv = [
     ['samples', String(rr.samples?.length || 0)],
     ['detections', counts.detections ?? 'n/a'],
+    ['model', replayRobotModelStatusText()],
+    ['URDF FK', Number.isFinite(fkError) ? `${fkError.toFixed(1)}mm vs flange` : 'n/a'],
     ['ee motion', replayPoseDiversityText(diversity)],
     ['hand-eye', result.ok ? 'ok' : (rr.failure ? 'failed' : 'pending')],
     ['residual', Number.isFinite(residual.median) ? `med ${residual.median.toFixed(1)}mm p95 ${Number(residual.p95 || 0).toFixed(1)}mm` : 'n/a'],
     ['quest-base', align.ok ? 'T_world_base ready' : (align.reason || 'n/a')]
   ];
   robotKv.innerHTML = kv.map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
+}
+
+function replayRobotModelStatusText() {
+  const model = state.robotModel;
+  if (!model) return 'loading';
+  if (!model.ok) return `unavailable ${model.reason || ''}`.trim();
+  const active = Array.isArray(model.activeJointNames) ? model.activeJointNames.length : 0;
+  return `${model.name || 'Rizon4'} URDF, ${active} active joints`;
+}
+
+function replayRobotFkErrorMm(robot) {
+  const model = state.robotModel;
+  const jointpose = robot?.jointpose;
+  const measured = robot?.T_base_ee?.matrix_4x4;
+  if (!model?.ok || !Array.isArray(jointpose) || jointpose.length < 7 || !measured) return NaN;
+  const frames = robotFrames(model, jointpose, identityMatrix4());
+  const fk = frames.length ? frames[frames.length - 1] : null;
+  const fkP = matrixTranslation(fk);
+  const measuredP = matrixTranslation(measured);
+  if (!fkP || !measuredP) return NaN;
+  return length(sub(fkP, measuredP)) * 1000;
 }
 
 function replayPoseDiversityText(diversity) {
@@ -5874,6 +5931,10 @@ function multiplyMatrix4(a, b) {
     }
   }
   return out;
+}
+
+function identityMatrix4() {
+  return [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]];
 }
 
 function robotFrames(model, jointpose, baseMatrix) {
