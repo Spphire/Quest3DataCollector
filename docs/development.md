@@ -91,8 +91,8 @@ Expected:
 
 RealSense devices detected on the remote PC:
 
-- `244222073667`: Intel RealSense D435I, intended default for the end-mounted camera.
-- `750612070265`: Intel RealSense D435, previously used as a fixed/third-view camera.
+- `750612070265`: Intel RealSense D435, current default end/checkerboard camera. It detected the full 11x8 board in the June 18 smoke check.
+- `244222073667`: Intel RealSense D435I. In the same setup it saw only a cropped/occluded part of the board, so do not use it for hand-eye capture unless the mounting/aim is changed.
 
 Robot serial candidates tested:
 
@@ -176,7 +176,7 @@ from pc.offline_calibration.scripts.flexiv_realsense_bridge import FlexivRealSen
 manager = FlexivRealSenseManager(FlexivRealSenseConfig(
     robot_sn="Rizon4-062713",
     flexiv_network_interfaces=["192.168.2.108"],
-    camera_serial="244222073667",
+    camera_serial="750612070265",
     capture_interval_seconds=0.0,
 ))
 print(manager.connect_robot({"waitSeconds": 0.2})["ok"])
