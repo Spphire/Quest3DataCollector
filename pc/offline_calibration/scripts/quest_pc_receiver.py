@@ -1438,6 +1438,40 @@ class PcCalibrationHttpReceiver:
         with self.lock:
             return self.sessions.get(record_id)
 
+    def preflight_status(self) -> dict[str, Any]:
+        if self.visualizer is None:
+            return {
+                "ok": True,
+                "ready": True,
+                "summary": "preflight unavailable because live visualizer is disabled",
+                "checks": [],
+            }
+        return self.visualizer.preflight_status_payload()
+
+    def publish_calibration_rejected(self, record_id: str, preflight: dict[str, Any]) -> None:
+        if self.visualizer is None:
+            return
+        failed = [
+            check
+            for check in preflight.get("checks", [])
+            if isinstance(check, dict) and check.get("required", True) and not check.get("ok")
+        ]
+        detail = "; ".join(
+            f"{check.get('label') or check.get('id')}: {check.get('detail') or 'not ready'}"
+            for check in failed
+        )
+        self.visualizer.publish_event(
+            {
+                "type": "calibration_status",
+                "recordId": record_id,
+                "stage": "rejected",
+                "progress": 0.0,
+                "message": "B calibration start rejected: preflight is not ready",
+                "preflight": preflight,
+                "detail": detail,
+            }
+        )
+
     def _make_server(self) -> ThreadingHTTPServer:
         receiver = self
 
@@ -1474,6 +1508,22 @@ class PcCalibrationHttpReceiver:
             def _handle_start(self, body: bytes) -> None:
                 message = json.loads(body.decode("utf-8"))
                 record_id = sanitize_name(str(message.get("recordId") or f"record_pc_calib_{datetime.now():%Y%m%d_%H%M%S}"))
+                allow_unready = bool(
+                    message.get("allowUnready")
+                    or message.get("startAnyway")
+                    or message.get("ignorePreflight")
+                )
+                preflight = receiver.preflight_status()
+                if not allow_unready and not bool(preflight.get("ready")):
+                    payload = {
+                        "ok": False,
+                        "error": "preflight_not_ready",
+                        "recordId": record_id,
+                        "preflight": preflight,
+                    }
+                    receiver.publish_calibration_rejected(record_id, preflight)
+                    self._json_response(payload, status=409)
+                    return
                 with receiver.lock:
                     existing = receiver.sessions.pop(record_id, None)
                     if existing is not None:
@@ -1489,7 +1539,13 @@ class PcCalibrationHttpReceiver:
                     )
                     receiver.sessions[record_id] = session
                 print(f"Started PC calibration raw record: {session.directory}", flush=True)
-                self._json_response({"ok": True, "recordId": record_id, "rawRecordDirectory": str(session.directory)})
+                self._json_response({
+                    "ok": True,
+                    "recordId": record_id,
+                    "rawRecordDirectory": str(session.directory),
+                    "preflight": preflight,
+                    "allowUnready": allow_unready,
+                })
 
             def _handle_frame(self, parsed: Any, body: bytes) -> None:
                 query = parse_qs(parsed.query)
@@ -1526,9 +1582,9 @@ class PcCalibrationHttpReceiver:
                 print(f"Stopped PC calibration raw record: {summary}", flush=True)
                 self._json_response({"ok": True, "summary": summary})
 
-            def _json_response(self, payload: dict[str, Any]) -> None:
+            def _json_response(self, payload: dict[str, Any], status: int = 200) -> None:
                 data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-                self.send_response(200)
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
@@ -5235,6 +5291,10 @@ function updateCalibrationStatus(event) {
     ...(state.calibration || {}),
     status: event
   };
+  if (event.stage === 'rejected') {
+    renderCalibrationRejected(event);
+    return;
+  }
   if (event.robotStartStatus) {
     state.calibration.robotStartStatus = event.robotStartStatus;
     renderCalibrationStatusDetails(event);
@@ -5249,6 +5309,28 @@ function updateCalibrationStatus(event) {
       failurePath: event.failurePath
     });
   }
+}
+
+function renderCalibrationRejected(event) {
+  const checks = Array.isArray(event.preflight?.checks) ? event.preflight.checks : [];
+  const failed = checks.filter(check => (check.required !== false) && !check.ok);
+  const rows = failed.length ? failed : checks.filter(check => !check.ok);
+  const list = rows.map(check =>
+    `<div class="preflight-row">
+      <div class="preflight-badge">CHECK</div>
+      <div>
+        <div>${escapeHtml(check.label || check.id || '')}</div>
+        <div class="preflight-detail">${escapeHtml(check.detail || '')}</div>
+      </div>
+    </div>`
+  ).join('');
+  calibrationDetails.innerHTML = `
+    <div class="calibration-alert">${escapeHtml(event.message || 'B calibration rejected')}</div>
+    <div class="calibration-kv">
+      <span>record</span><span>${escapeHtml(event.recordId || 'n/a')}</span>
+      <span>summary</span><span>${escapeHtml(event.preflight?.summary || event.detail || 'preflight not ready')}</span>
+    </div>
+    <div class="preflight-list">${list}</div>`;
 }
 
 function renderCalibrationStatusDetails(event) {
