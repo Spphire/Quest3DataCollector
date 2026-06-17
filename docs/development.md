@@ -97,6 +97,8 @@ Robot serial candidates tested:
 
 With RDK v1.7 loaded, both still stopped at robot discovery (`Searching for [...]`). At that point the remaining likely causes are Flexiv Remote mode/Ethernet not enabled, wrong serial string, firewall, or network path. The receiver UI keeps the robot SN editable so the operator can retry without changing code.
 
+Network diagnostics on 2026-06-17 showed a wired interface `enx6c1ff75afb1f` at `192.168.2.108/24` and a reachable peer at `192.168.2.100` with port `8000` open. If RDK still searches by SN and fails, verify Flexiv Remote mode/Ethernet is enabled for the arm/control box and that the robot SN expected by RDK is `Rizon4-H6uDOq`.
+
 ### Receiver command
 
 ```bash
@@ -122,6 +124,15 @@ Useful options:
 - `--controller-motion-scale 1.0` scales right-controller displacement into TCP displacement.
 - `--controller-motion-max-offset 0.18` limits the TCP offset from the arm anchor.
 - `--controller-motion-max-step 0.015` limits each target update step.
+
+Read-only hardware diagnostics:
+
+```bash
+/ssd1/shenyibo/Quest3DataCollector/.venv312/bin/python \
+  /ssd1/shenyibo/Quest3DataCollector/pc/offline_calibration/scripts/flexiv_realsense_diagnostics.py
+```
+
+This prints the active `flexivrdk` package, detected RealSense cameras, Elements serial/version info, network interfaces, routes, neighbors, and ping/port probes for likely robot hosts such as `192.168.2.100`.
 
 ### Web workflow
 
