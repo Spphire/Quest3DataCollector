@@ -29,6 +29,13 @@ MIN_HAND_EYE_EE_ROTATION_SPAN_DEG = 2.0
 DEFAULT_CONTROLLER_TRANSLATION_SCALE = 1.0
 DEFAULT_CONTROLLER_MAX_OFFSET_M = 0.18
 DEFAULT_CONTROLLER_MAX_STEP_M = 0.015
+DEFAULT_GRIPPER_DEVICE = "gripper"
+DEFAULT_GRIPPER_OPEN_WIDTH_M = 0.08
+DEFAULT_GRIPPER_CLOSE_WIDTH_M = 0.0
+DEFAULT_GRIPPER_SPEED_MPS = 0.04
+DEFAULT_GRIPPER_FORCE_N = 20.0
+DEFAULT_GRIPPER_TRIGGER_CLOSE_THRESHOLD = 0.65
+DEFAULT_GRIPPER_TRIGGER_OPEN_THRESHOLD = 0.25
 
 
 class RobotHandEyeCalibrationError(RuntimeError):
@@ -53,6 +60,7 @@ class FlexivRealSenseConfig:
     flexiv_rdk: Path | None = DEFAULT_FLEXIV_RDK_ROOT
     flexiv_network_interfaces: list[str] | None = None
     camera_serial: str = DEFAULT_END_CAMERA_SERIAL
+    third_camera_serial: str = ""
     width: int = DEFAULT_REALSENSE_WIDTH
     height: int = DEFAULT_REALSENSE_HEIGHT
     fps: int = DEFAULT_REALSENSE_FPS
@@ -71,6 +79,14 @@ class FlexivRealSenseConfig:
     controller_translation_scale: float = DEFAULT_CONTROLLER_TRANSLATION_SCALE
     controller_max_offset_m: float = DEFAULT_CONTROLLER_MAX_OFFSET_M
     controller_max_step_m: float = DEFAULT_CONTROLLER_MAX_STEP_M
+    gripper_enabled: bool = False
+    gripper_device: str = DEFAULT_GRIPPER_DEVICE
+    gripper_open_width_m: float = DEFAULT_GRIPPER_OPEN_WIDTH_M
+    gripper_close_width_m: float = DEFAULT_GRIPPER_CLOSE_WIDTH_M
+    gripper_speed_mps: float = DEFAULT_GRIPPER_SPEED_MPS
+    gripper_force_n: float = DEFAULT_GRIPPER_FORCE_N
+    gripper_trigger_close_threshold: float = DEFAULT_GRIPPER_TRIGGER_CLOSE_THRESHOLD
+    gripper_trigger_open_threshold: float = DEFAULT_GRIPPER_TRIGGER_OPEN_THRESHOLD
 
 
 class FlexivRobotClient:
@@ -82,6 +98,10 @@ class FlexivRobotClient:
         self.last_error: str | None = None
         self.motion_armed = False
         self.motion_last_target_pose: list[float] | None = None
+        self.gripper: Any | None = None
+        self.gripper_enabled = False
+        self.gripper_device: str | None = None
+        self.gripper_last_error: str | None = None
 
     def connect(
         self,
@@ -114,6 +134,7 @@ class FlexivRobotClient:
 
     def disconnect(self) -> None:
         self.disarm_motion_locked()
+        self.disable_gripper_locked()
         self.robot = None
         self.robot_sn = None
 
@@ -126,6 +147,7 @@ class FlexivRobotClient:
                 "poseField": self.pose_field,
                 "lastError": self.last_error,
                 "motionArmed": self.motion_armed,
+                "gripper": self.gripper_status_locked(),
             }
             if connected:
                 try:
@@ -226,6 +248,7 @@ class FlexivRobotClient:
             "poseField": self.pose_field,
             "lastError": self.last_error,
             "motionArmed": self.motion_armed,
+            "gripper": self.gripper_status_locked(),
         }
         if connected:
             try:
@@ -246,6 +269,91 @@ class FlexivRobotClient:
             target = [float(v) for v in target_pose_wxyz[:7]]
             self.robot.SendCartesianMotionForce(target)
             self.motion_last_target_pose = target
+
+    def enable_gripper(self, device_name: str) -> dict[str, Any]:
+        with self.lock:
+            return self.enable_gripper_locked(device_name)
+
+    def enable_gripper_locked(self, device_name: str) -> dict[str, Any]:
+        if self.robot is None:
+            raise RuntimeError("Flexiv robot is not connected")
+        flexivrdk = sys.modules.get("flexivrdk") or import_flexivrdk(None)
+        device = str(device_name or DEFAULT_GRIPPER_DEVICE).strip() or DEFAULT_GRIPPER_DEVICE
+        self.gripper = flexivrdk.Gripper(self.robot)
+        self.gripper.Enable(device)
+        try:
+            self.gripper.Init()
+        except Exception:
+            # Some gripper configurations are already initialized after Enable.
+            pass
+        self.gripper_enabled = True
+        self.gripper_device = device
+        self.gripper_last_error = None
+        return self.gripper_status_locked()
+
+    def disable_gripper_locked(self) -> None:
+        if self.gripper is not None:
+            try:
+                self.gripper.Stop()
+            except Exception:
+                pass
+            try:
+                self.gripper.Disable()
+            except Exception:
+                pass
+        self.gripper = None
+        self.gripper_enabled = False
+        self.gripper_device = None
+
+    def gripper_status_locked(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "enabled": self.gripper_enabled,
+            "device": self.gripper_device,
+            "lastError": self.gripper_last_error,
+        }
+        if self.gripper is not None:
+            try:
+                states = self.gripper.states()
+                payload["states"] = {
+                    "width": safe_float(getattr(states, "width", None)),
+                    "force": safe_float(getattr(states, "force", None)),
+                    "isMoving": bool(getattr(states, "is_moving", False)),
+                }
+            except Exception as exc:
+                self.gripper_last_error = str(exc)
+                payload["lastError"] = self.gripper_last_error
+            try:
+                params = self.gripper.params()
+                payload["params"] = {
+                    "name": str(getattr(params, "name", "")),
+                    "minWidth": safe_float(getattr(params, "min_width", None)),
+                    "maxWidth": safe_float(getattr(params, "max_width", None)),
+                    "minVel": safe_float(getattr(params, "min_vel", None)),
+                    "maxVel": safe_float(getattr(params, "max_vel", None)),
+                    "minForce": safe_float(getattr(params, "min_force", None)),
+                    "maxForce": safe_float(getattr(params, "max_force", None)),
+                }
+            except Exception:
+                pass
+        return payload
+
+    def gripper_status(self) -> dict[str, Any]:
+        with self.lock:
+            return self.gripper_status_locked()
+
+    def move_gripper(self, width_m: float, speed_mps: float, force_n: float) -> dict[str, Any]:
+        with self.lock:
+            if self.robot is None:
+                raise RuntimeError("Flexiv robot is not connected")
+            if self.gripper is None:
+                self.enable_gripper_locked(str(self.gripper_device or DEFAULT_GRIPPER_DEVICE))
+            assert self.gripper is not None
+            width = float(width_m)
+            speed = float(speed_mps)
+            force = float(force_n)
+            self.gripper.Move(width, speed, force)
+            self.gripper_last_error = None
+            return self.gripper_status_locked()
 
 
 class RealSenseColorCamera:
@@ -319,6 +427,8 @@ class RobotRealsenseSession:
         config: FlexivRealSenseConfig,
         robot: FlexivRobotClient,
         publish_event: Callable[[dict[str, Any]], None] | None = None,
+        robot_alignment_result: dict[str, Any] | None = None,
+        require_controller_alignment: bool = False,
     ) -> None:
         self.root = root.resolve()
         self.record_id = record_id
@@ -329,10 +439,14 @@ class RobotRealsenseSession:
         self.image_dir = self.directory / "images"
         self.samples_path = self.directory / "samples.jsonl"
         self.motion_path = self.directory / "controller_motion.jsonl"
+        self.gripper_path = self.directory / "gripper_commands.jsonl"
         self.summary_path = self.directory / "session_summary.json"
-        self.camera = RealSenseColorCamera()
+        self.cameras: dict[str, RealSenseColorCamera] = {"end": RealSenseColorCamera()}
+        if self.config.third_camera_serial:
+            self.cameras["third"] = RealSenseColorCamera()
         self.samples_handle: Any | None = None
         self.motion_handle: Any | None = None
+        self.gripper_handle: Any | None = None
         self.lock = threading.Lock()
         self.next_capture_perf = 0.0
         self.sample_count = 0
@@ -340,27 +454,39 @@ class RobotRealsenseSession:
         self.error_count = 0
         self.closed = False
         self.last_error: str | None = None
-        self.camera_metadata: dict[str, Any] | None = None
+        self.camera_metadata: dict[str, dict[str, Any]] = {}
         self.controller_anchor_world: np.ndarray | None = None
         self.robot_anchor_tcp_pose: list[float] | None = None
         self.motion_command_count = 0
         self.motion_skip_count = 0
         self.motion_error_count = 0
         self.last_motion_event: dict[str, Any] | None = None
+        self.gripper_command_count = 0
+        self.gripper_skip_count = 0
+        self.gripper_error_count = 0
+        self.last_gripper_event: dict[str, Any] | None = None
+        self.last_gripper_closed: bool | None = None
         self.ee_pose_history: list[np.ndarray] = []
+        self.robot_alignment_result = robot_alignment_result if isinstance(robot_alignment_result, dict) else None
+        self.require_controller_alignment = require_controller_alignment
+        self.t_ee_end_camera = self._alignment_transform("end_camera", "T_ee_realsense")
+        self.t_base_world = self._alignment_transform("questAlignment", "T_base_world")
 
     def start(self) -> dict[str, Any]:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.image_dir.mkdir(parents=True, exist_ok=True)
         self.samples_handle = self.samples_path.open("a", encoding="utf-8", newline="\n")
         self.motion_handle = self.motion_path.open("a", encoding="utf-8", newline="\n")
+        self.gripper_handle = self.gripper_path.open("a", encoding="utf-8", newline="\n")
         config_payload = config_to_json(self.config)
         config_payload["recordId"] = self.record_id
         config_payload["startedAtUtc"] = datetime.now(timezone.utc).isoformat()
         write_json(config_payload, self.directory / "capture_config.json")
-        if self.config.camera_serial:
-            self.camera_metadata = self.camera.start(
-                self.config.camera_serial,
+        for role, serial in self.camera_serials().items():
+            if not serial:
+                continue
+            metadata = self.cameras[role].start(
+                serial,
                 self.config.width,
                 self.config.height,
                 self.config.fps,
@@ -368,7 +494,13 @@ class RobotRealsenseSession:
                 self.config.realsense_exposure,
                 self.config.realsense_gain,
             )
-            write_json({"end": self.camera_metadata}, self.directory / "cameras.json")
+            metadata["role"] = role
+            self.camera_metadata[role] = metadata
+        write_json(self.camera_metadata, self.directory / "cameras.json")
+        if self.robot_alignment_result is not None:
+            write_json(self.robot_alignment_result, self.directory / "robot_hand_eye_result.json")
+        if self.config.gripper_enabled:
+            self._try_initialize_gripper()
         summary = self.summary("recording")
         self._publish({"type": "robot_status", "stage": "robot_realsense_recording", **summary})
         return summary
@@ -402,6 +534,35 @@ class RobotRealsenseSession:
         self._publish(robot_motion_event(event))
         return event
 
+    def update_gripper(self, quest_sample: dict[str, Any]) -> dict[str, Any] | None:
+        if not self.config.gripper_enabled:
+            return None
+        with self.lock:
+            if self.closed:
+                return None
+        try:
+            event = self._update_gripper_unlocked(quest_sample)
+        except Exception as exc:  # pragma: no cover - hardware path
+            self.gripper_error_count += 1
+            event = {
+                "ok": False,
+                "record_id": self.record_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "quest_sample_index": quest_sample.get("sampleIndex"),
+                "error": str(exc),
+            }
+        with self.lock:
+            self.last_gripper_event = event
+            if self.gripper_handle is not None:
+                self.gripper_handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+                self.gripper_handle.flush()
+        if event.get("ok") and event.get("commandSent"):
+            self.gripper_command_count += 1
+        else:
+            self.gripper_skip_count += 1
+        self._publish(robot_gripper_event(event))
+        return event
+
     def record_sample(self, quest_sample: dict[str, Any]) -> dict[str, Any] | None:
         now_perf = time.perf_counter()
         if now_perf < self.next_capture_perf:
@@ -433,7 +594,8 @@ class RobotRealsenseSession:
             self.samples_handle.flush()
             self.sample_count += 1
             if row.get("ok"):
-                self.image_count += 1
+                images = row.get("images") if isinstance(row.get("images"), dict) else {}
+                self.image_count += len(images)
                 t_base_ee = transform_from_json(row.get("T_base_ee"))
                 if t_base_ee is not None:
                     self.ee_pose_history.append(t_base_ee)
@@ -446,13 +608,17 @@ class RobotRealsenseSession:
             if self.closed:
                 return self.summary("already_closed")
             self.closed = True
-            self.camera.stop()
             if self.samples_handle is not None:
                 self.samples_handle.close()
                 self.samples_handle = None
             if self.motion_handle is not None:
                 self.motion_handle.close()
                 self.motion_handle = None
+            if self.gripper_handle is not None:
+                self.gripper_handle.close()
+                self.gripper_handle = None
+            for camera in self.cameras.values():
+                camera.stop()
             summary = self.summary("closed")
             write_json(summary, self.summary_path)
             self._publish({"type": "robot_status", "stage": "robot_realsense_closed", **summary})
@@ -465,6 +631,8 @@ class RobotRealsenseSession:
             "stage": stage,
             "directory": str(self.directory),
             "cameraSerial": self.config.camera_serial,
+            "thirdCameraSerial": self.config.third_camera_serial,
+            "cameraRoles": sorted(self.camera_metadata.keys()),
             "samples": self.sample_count,
             "images": self.image_count,
             "errors": self.error_count,
@@ -472,6 +640,13 @@ class RobotRealsenseSession:
             "motionSkips": self.motion_skip_count,
             "motionErrors": self.motion_error_count,
             "lastMotion": self.last_motion_event,
+            "controllerAlignmentRequired": self.require_controller_alignment,
+            "controllerAlignmentAvailable": self.t_base_world is not None,
+            "gripperEnabled": self.config.gripper_enabled,
+            "gripperCommands": self.gripper_command_count,
+            "gripperSkips": self.gripper_skip_count,
+            "gripperErrors": self.gripper_error_count,
+            "lastGripper": self.last_gripper_event,
             "poseDiversity": ee_pose_diversity(self.ee_pose_history),
             "lastError": self.last_error,
         }
@@ -479,12 +654,19 @@ class RobotRealsenseSession:
     def _capture_row(self, quest_sample: dict[str, Any]) -> dict[str, Any]:
         sample_index = self.sample_count
         robot_state = self.robot.read_state()
-        image_rel: str | None = None
-        if self.camera.pipeline is not None:
-            rgb = self.camera.capture_rgb(self.config.warmup_frames)
-            image_rel_path = Path("images") / f"sample_{sample_index:06d}_end_{self.config.camera_serial}.jpg"
+        images: dict[str, str] = {}
+        for role, camera in self.cameras.items():
+            if camera.pipeline is None:
+                continue
+            rgb = camera.capture_rgb(self.config.warmup_frames)
+            serial = camera.serial or self.camera_serials().get(role) or role
+            image_rel_path = Path("images") / f"sample_{sample_index:06d}_{role}_{safe_filename(serial)}.jpg"
             save_rgb_jpeg(rgb, self.directory / image_rel_path)
-            image_rel = str(image_rel_path).replace("\\", "/")
+            images[role] = str(image_rel_path).replace("\\", "/")
+        t_base_ee = transform_from_json(robot_state.get("endEffectorPose"))
+        t_base_end_camera_payload = None
+        if t_base_ee is not None and self.t_ee_end_camera is not None:
+            t_base_end_camera_payload = transform_to_json(t_base_ee @ self.t_ee_end_camera)
         return {
             "sample_index": sample_index,
             "record_id": self.record_id,
@@ -496,13 +678,42 @@ class RobotRealsenseSession:
             "quest_pc_receive_perf_counter_seconds": quest_sample.get("pcReceivePerfCounterSeconds"),
             "robot_state": robot_state,
             "T_base_ee": robot_state.get("endEffectorPose"),
+            "T_base_end_camera": t_base_end_camera_payload,
             "jointpose": robot_state.get("jointPose"),
-            "images": {"end": image_rel} if image_rel else {},
+            "images": images,
+            "gripper": self.robot.gripper_status(),
         }
 
     def _publish(self, event: dict[str, Any]) -> None:
         if self.publish_event is not None:
             self.publish_event(event)
+
+    def _try_initialize_gripper(self) -> None:
+        try:
+            status = self.robot.enable_gripper(self.config.gripper_device)
+            event = {
+                "ok": True,
+                "commandSent": False,
+                "record_id": self.record_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "action": "initialize",
+                "status": status,
+            }
+        except Exception as exc:  # pragma: no cover - hardware path
+            self.gripper_error_count += 1
+            event = {
+                "ok": False,
+                "commandSent": False,
+                "record_id": self.record_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "action": "initialize",
+                "error": str(exc),
+            }
+        self.last_gripper_event = event
+        if self.gripper_handle is not None:
+            self.gripper_handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+            self.gripper_handle.flush()
+        self._publish(robot_gripper_event(event))
 
     def _update_controller_motion_unlocked(self, quest_sample: dict[str, Any]) -> dict[str, Any]:
         if not self.robot.motion_armed:
@@ -534,11 +745,23 @@ class RobotRealsenseSession:
                 "quest_sample_index": quest_sample.get("sampleIndex"),
                 "anchored": self.controller_anchor_world is not None and self.robot_anchor_tcp_pose is not None,
             }
+        if self.require_controller_alignment and self.t_base_world is None:
+            return {
+                "ok": False,
+                "reason": "missing_quest_robot_alignment",
+                "record_id": self.record_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "quest_sample_index": quest_sample.get("sampleIndex"),
+                "anchored": self.controller_anchor_world is not None and self.robot_anchor_tcp_pose is not None,
+            }
         created_anchor = self.controller_anchor_world is None or self.robot_anchor_tcp_pose is None
         if created_anchor:
             self.controller_anchor_world = position
             self.robot_anchor_tcp_pose = self.robot.read_tcp_pose()
-        raw_offset = (position - self.controller_anchor_world) * float(self.config.controller_translation_scale)
+        raw_offset_world = (position - self.controller_anchor_world) * float(self.config.controller_translation_scale)
+        raw_offset = raw_offset_world
+        if self.t_base_world is not None:
+            raw_offset = self.t_base_world[:3, :3] @ raw_offset_world
         offset = clamp_vector_norm(raw_offset, float(self.config.controller_max_offset_m))
         target = list(self.robot_anchor_tcp_pose)
         target[:3] = [float(target[i] + offset[i]) for i in range(3)]
@@ -561,6 +784,8 @@ class RobotRealsenseSession:
             "robot_anchor_tcp_pose_wxyz": [float(v) for v in self.robot_anchor_tcp_pose],
             "anchored": True,
             "created_anchor": created_anchor,
+            "quest_alignment_used": self.t_base_world is not None,
+            "raw_offset_world_m": [float(v) for v in raw_offset_world],
             "raw_offset_m": [float(v) for v in raw_offset],
             "offset_m": [float(v) for v in offset],
             "step_offset_m": [float(v) for v in step_offset],
@@ -571,6 +796,86 @@ class RobotRealsenseSession:
                 "maxStepM": self.config.controller_max_step_m,
             },
         }
+
+    def _update_gripper_unlocked(self, quest_sample: dict[str, Any]) -> dict[str, Any]:
+        controller = quest_sample.get("rightController")
+        if not isinstance(controller, dict):
+            return self._gripper_skip_event(quest_sample, "missing_right_controller")
+        trigger = controller_trigger_value(controller)
+        if trigger is None:
+            return self._gripper_skip_event(quest_sample, "missing_trigger")
+        close_threshold = float(self.config.gripper_trigger_close_threshold)
+        open_threshold = float(self.config.gripper_trigger_open_threshold)
+        desired_closed: bool | None = None
+        if trigger >= close_threshold:
+            desired_closed = True
+        elif trigger <= open_threshold:
+            desired_closed = False
+        if desired_closed is None:
+            return self._gripper_skip_event(quest_sample, "trigger_hysteresis", trigger)
+        if self.last_gripper_closed is desired_closed:
+            return self._gripper_skip_event(quest_sample, "unchanged", trigger)
+        target_width = (
+            float(self.config.gripper_close_width_m)
+            if desired_closed
+            else float(self.config.gripper_open_width_m)
+        )
+        try:
+            status = self.robot.move_gripper(
+                target_width,
+                float(self.config.gripper_speed_mps),
+                float(self.config.gripper_force_n),
+            )
+            self.last_gripper_closed = desired_closed
+            return {
+                "ok": True,
+                "commandSent": True,
+                "record_id": self.record_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "quest_sample_index": quest_sample.get("sampleIndex"),
+                "quest_recording_timestamp_seconds": quest_sample.get("recordingTimestampSeconds"),
+                "trigger": trigger,
+                "action": "close" if desired_closed else "open",
+                "target_width_m": target_width,
+                "speed_mps": float(self.config.gripper_speed_mps),
+                "force_n": float(self.config.gripper_force_n),
+                "status": status,
+            }
+        except Exception as exc:
+            self.robot.gripper_last_error = str(exc)
+            raise
+
+    def _gripper_skip_event(
+        self,
+        quest_sample: dict[str, Any],
+        reason: str,
+        trigger: float | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "commandSent": False,
+            "record_id": self.record_id,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "quest_sample_index": quest_sample.get("sampleIndex"),
+            "quest_recording_timestamp_seconds": quest_sample.get("recordingTimestampSeconds"),
+            "trigger": trigger,
+            "reason": reason,
+            "status": self.robot.gripper_status(),
+        }
+
+    def camera_serials(self) -> dict[str, str]:
+        return {
+            "end": str(self.config.camera_serial or "").strip(),
+            "third": str(self.config.third_camera_serial or "").strip(),
+        }
+
+    def _alignment_transform(self, group: str, key: str) -> np.ndarray | None:
+        if not isinstance(self.robot_alignment_result, dict):
+            return None
+        payload = self.robot_alignment_result.get(group)
+        if not isinstance(payload, dict):
+            return None
+        return transform_from_json(payload.get(key))
 
 
 class FlexivRealSenseManager:
@@ -603,6 +908,8 @@ class FlexivRealSenseManager:
                 self.config.robot_pose_field = str(payload["poseField"])
             if "cameraSerial" in payload:
                 self.config.camera_serial = str(payload.get("cameraSerial") or "").strip()
+            if "thirdCameraSerial" in payload:
+                self.config.third_camera_serial = str(payload.get("thirdCameraSerial") or "").strip()
             if "networkInterfaces" in payload:
                 self.config.flexiv_network_interfaces = normalize_network_interfaces(payload.get("networkInterfaces"))
             for key, attr in (
@@ -638,6 +945,20 @@ class FlexivRealSenseManager:
                 self.config.controller_max_offset_m = float(payload["controllerMaxOffsetM"])
             if "controllerMaxStepM" in payload and is_number(payload["controllerMaxStepM"]):
                 self.config.controller_max_step_m = float(payload["controllerMaxStepM"])
+            if "gripperEnabled" in payload:
+                self.config.gripper_enabled = bool(payload["gripperEnabled"])
+            if "gripperDevice" in payload:
+                self.config.gripper_device = str(payload.get("gripperDevice") or DEFAULT_GRIPPER_DEVICE).strip() or DEFAULT_GRIPPER_DEVICE
+            for key, attr in (
+                ("gripperOpenWidthM", "gripper_open_width_m"),
+                ("gripperCloseWidthM", "gripper_close_width_m"),
+                ("gripperSpeedMps", "gripper_speed_mps"),
+                ("gripperForceN", "gripper_force_n"),
+                ("gripperTriggerCloseThreshold", "gripper_trigger_close_threshold"),
+                ("gripperTriggerOpenThreshold", "gripper_trigger_open_threshold"),
+            ):
+                if key in payload and is_number(payload[key]):
+                    setattr(self.config, attr, float(payload[key]))
         return self.status()
 
     def connect_robot(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -762,6 +1083,8 @@ class FlexivRealSenseManager:
         parent_directory: Path,
         record_id: str,
         publish_event: Callable[[dict[str, Any]], None] | None,
+        robot_alignment_result: dict[str, Any] | None = None,
+        require_controller_alignment: bool = False,
     ) -> RobotRealsenseSession | None:
         with self.lock:
             if self.active_session is not None:
@@ -777,7 +1100,15 @@ class FlexivRealSenseManager:
                 if publish_event is not None:
                     publish_event({"type": "robot_status", "ok": False, "stage": "no_camera", "error": self.last_error})
                 return None
-            session = RobotRealsenseSession(parent_directory, record_id, self.config, self.robot, publish_event)
+            session = RobotRealsenseSession(
+                parent_directory,
+                record_id,
+                self.config,
+                self.robot,
+                publish_event,
+                robot_alignment_result=robot_alignment_result,
+                require_controller_alignment=require_controller_alignment,
+            )
             try:
                 session.start()
             except Exception as exc:  # pragma: no cover - hardware path
@@ -1302,7 +1633,10 @@ def robot_sample_event(row: dict[str, Any]) -> dict[str, Any]:
         "questSampleIndex": row.get("quest_sample_index"),
         "capturedAt": row.get("captured_at"),
         "T_base_ee": row.get("T_base_ee"),
+        "T_base_end_camera": row.get("T_base_end_camera"),
         "jointpose": row.get("jointpose"),
+        "images": row.get("images"),
+        "gripper": row.get("gripper"),
         "poseDiversity": row.get("poseDiversity"),
         "poseField": state.get("poseField"),
         "robotSn": state.get("robotSn"),
@@ -1321,9 +1655,48 @@ def robot_motion_event(row: dict[str, Any]) -> dict[str, Any]:
         "stepOffsetM": row.get("step_offset_m"),
         "anchored": row.get("anchored"),
         "createdAnchor": row.get("created_anchor"),
+        "questAlignmentUsed": row.get("quest_alignment_used"),
         "reason": row.get("reason"),
         "error": row.get("error"),
     }
+
+
+def robot_gripper_event(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "robot_gripper",
+        "ok": bool(row.get("ok")),
+        "recordId": row.get("record_id"),
+        "questSampleIndex": row.get("quest_sample_index"),
+        "capturedAt": row.get("captured_at"),
+        "commandSent": bool(row.get("commandSent")),
+        "action": row.get("action"),
+        "trigger": row.get("trigger"),
+        "targetWidthM": row.get("target_width_m"),
+        "status": row.get("status"),
+        "reason": row.get("reason"),
+        "error": row.get("error"),
+    }
+
+
+def controller_trigger_value(controller: dict[str, Any]) -> float | None:
+    for key in (
+        "indexTrigger",
+        "rightIndexTrigger",
+        "trigger",
+        "primaryIndexTrigger",
+        "primaryTrigger",
+        "gripTrigger",
+    ):
+        value = controller.get(key)
+        if is_number(value):
+            return max(0.0, min(1.0, float(value)))
+    buttons = controller.get("buttons")
+    if isinstance(buttons, dict):
+        for key in ("indexTrigger", "trigger", "primaryIndexTrigger"):
+            value = buttons.get(key)
+            if is_number(value):
+                return max(0.0, min(1.0, float(value)))
+    return None
 
 
 def flexiv_pose_to_transform(pose: np.ndarray) -> np.ndarray:
@@ -1568,6 +1941,7 @@ def config_to_json(config: FlexivRealSenseConfig) -> dict[str, Any]:
         "flexivRdk": str(config.flexiv_rdk) if config.flexiv_rdk is not None else None,
         "networkInterfaces": normalize_network_interfaces(config.flexiv_network_interfaces),
         "cameraSerial": config.camera_serial,
+        "thirdCameraSerial": config.third_camera_serial,
         "width": config.width,
         "height": config.height,
         "fps": config.fps,
@@ -1585,6 +1959,14 @@ def config_to_json(config: FlexivRealSenseConfig) -> dict[str, Any]:
         "controllerTranslationScale": config.controller_translation_scale,
         "controllerMaxOffsetM": config.controller_max_offset_m,
         "controllerMaxStepM": config.controller_max_step_m,
+        "gripperEnabled": config.gripper_enabled,
+        "gripperDevice": config.gripper_device,
+        "gripperOpenWidthM": config.gripper_open_width_m,
+        "gripperCloseWidthM": config.gripper_close_width_m,
+        "gripperSpeedMps": config.gripper_speed_mps,
+        "gripperForceN": config.gripper_force_n,
+        "gripperTriggerCloseThreshold": config.gripper_trigger_close_threshold,
+        "gripperTriggerOpenThreshold": config.gripper_trigger_open_threshold,
     }
 
 
@@ -1597,6 +1979,14 @@ def normalize_quaternion(value: list[float]) -> list[float]:
 
 def is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def safe_float(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
 
 
 def normalize_network_interfaces(value: Any) -> list[str]:

@@ -27,6 +27,13 @@ from flexiv_realsense_bridge import (
     DEFAULT_END_CAMERA_SERIAL,
     DEFAULT_FLEXIV_RDK_ROOT,
     DEFAULT_FLEXIV_ROBOT_SN,
+    DEFAULT_GRIPPER_CLOSE_WIDTH_M,
+    DEFAULT_GRIPPER_DEVICE,
+    DEFAULT_GRIPPER_FORCE_N,
+    DEFAULT_GRIPPER_OPEN_WIDTH_M,
+    DEFAULT_GRIPPER_SPEED_MPS,
+    DEFAULT_GRIPPER_TRIGGER_CLOSE_THRESHOLD,
+    DEFAULT_GRIPPER_TRIGGER_OPEN_THRESHOLD,
     FlexivRealSenseConfig,
     FlexivRealSenseManager,
     RobotRealsenseSession,
@@ -239,6 +246,11 @@ def main() -> int:
         default=DEFAULT_END_CAMERA_SERIAL,
         help=f"Default end-mounted RealSense serial. Default: {DEFAULT_END_CAMERA_SERIAL}",
     )
+    receive_parser.add_argument(
+        "--third-realsense-serial",
+        default="",
+        help="Optional third/static RealSense serial recorded alongside the end-mounted camera.",
+    )
     receive_parser.add_argument("--realsense-width", type=int, default=1280, help="RealSense color width. Default: 1280")
     receive_parser.add_argument("--realsense-height", type=int, default=720, help="RealSense color height. Default: 720")
     receive_parser.add_argument("--realsense-fps", type=int, default=30, help="RealSense color FPS. Default: 30")
@@ -273,6 +285,30 @@ def main() -> int:
         type=float,
         default=0.015,
         help="Maximum TCP target position change per received sample, in meters. Default: 0.015",
+    )
+    receive_parser.add_argument(
+        "--enable-gripper",
+        action="store_true",
+        help="Enable Flexiv gripper trigger control during synchronized robot sessions.",
+    )
+    receive_parser.add_argument(
+        "--gripper-device",
+        default=DEFAULT_GRIPPER_DEVICE,
+        help=f"Flexiv gripper device name passed to Gripper.Enable(). Default: {DEFAULT_GRIPPER_DEVICE}",
+    )
+    receive_parser.add_argument("--gripper-open-width", type=float, default=DEFAULT_GRIPPER_OPEN_WIDTH_M)
+    receive_parser.add_argument("--gripper-close-width", type=float, default=DEFAULT_GRIPPER_CLOSE_WIDTH_M)
+    receive_parser.add_argument("--gripper-speed", type=float, default=DEFAULT_GRIPPER_SPEED_MPS)
+    receive_parser.add_argument("--gripper-force", type=float, default=DEFAULT_GRIPPER_FORCE_N)
+    receive_parser.add_argument(
+        "--gripper-trigger-close-threshold",
+        type=float,
+        default=DEFAULT_GRIPPER_TRIGGER_CLOSE_THRESHOLD,
+    )
+    receive_parser.add_argument(
+        "--gripper-trigger-open-threshold",
+        type=float,
+        default=DEFAULT_GRIPPER_TRIGGER_OPEN_THRESHOLD,
     )
     receive_parser.set_defaults(func=receive)
 
@@ -344,6 +380,9 @@ class SessionWriter:
         pc_receive_perf_counter_seconds: float,
         flush_every: int,
         calibration_output_root: Path | None = None,
+        calibration_raw_root: Path | None = None,
+        robot_manager: FlexivRealSenseManager | None = None,
+        visualizer: "LiveTelemetryVisualizer | None" = None,
     ) -> None:
         safe_record_id = sanitize_name(record_id or "unknown_record")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -377,6 +416,10 @@ class SessionWriter:
                 "missingReason",
                 "positionTracked",
                 "rotationTracked",
+                "indexTrigger",
+                "handTrigger",
+                "indexTriggerPressed",
+                "handTriggerPressed",
                 "x",
                 "y",
                 "z",
@@ -397,8 +440,14 @@ class SessionWriter:
         self.start_message = first_message
         self.flush_every = max(1, flush_every)
         self.calibration_output_root = calibration_output_root
+        self.calibration_raw_root = calibration_raw_root
         self.calibration_snapshot_start = recording_calibration_snapshot(calibration_output_root)
         self.calibration_snapshot_end: dict[str, Any] | None = None
+        self.robot_manager = robot_manager
+        self.visualizer = visualizer
+        self.robot_session: RobotRealsenseSession | None = None
+        self.robot_realsense_directory: Path | None = None
+        self.robot_start_status: dict[str, Any] | None = None
 
         self.messages = 0
         self.samples = 0
@@ -411,6 +460,21 @@ class SessionWriter:
         self.right_missing_reasons: dict[str, int] = {}
         self.last_sample_index: int | None = None
         self.closed = False
+        self.robot_start_status = self._robot_start_status("not_started")
+        if self.robot_manager is not None:
+            robot_alignment = latest_robot_hand_eye_result(calibration_raw_root, calibration_output_root)
+            self.robot_session = self.robot_manager.start_session(
+                self.directory,
+                self.record_id,
+                self.visualizer.publish_event if self.visualizer is not None else None,
+                robot_alignment_result=robot_alignment,
+                require_controller_alignment=True,
+            )
+            if self.robot_session is not None:
+                self.robot_realsense_directory = self.robot_session.directory
+            self.robot_start_status = self._robot_start_status(
+                "recording" if self.robot_session is not None else "not_recording"
+            )
 
     def write(self, wrapper: dict[str, Any]) -> None:
         if self.closed:
@@ -433,6 +497,7 @@ class SessionWriter:
             if is_number(sample_index):
                 self.last_sample_index = int(sample_index)
             self._write_sample(wrapper, message)
+            self._write_robot_sample(wrapper, message)
 
         if self.messages % self.flush_every == 0:
             self.flush()
@@ -472,6 +537,16 @@ class SessionWriter:
         self.samples_file.write(json_line(compact))
         self._write_controller_csv_row(wrapper, message, "left")
         self._write_controller_csv_row(wrapper, message, "right")
+
+    def _write_robot_sample(self, wrapper: dict[str, Any], message: dict[str, Any]) -> None:
+        robot_session = self.robot_session
+        if robot_session is None:
+            return
+        robot_sample = dict(message)
+        robot_sample["pcReceivePerfCounterSeconds"] = wrapper.get("pcReceivePerfCounterSeconds")
+        robot_session.update_controller_motion(robot_sample)
+        robot_session.update_gripper(robot_sample)
+        robot_session.record_sample(robot_sample)
 
     def _write_controller_csv_row(
         self,
@@ -515,6 +590,10 @@ class SessionWriter:
                 "missingReason": controller.get("missingReason"),
                 "positionTracked": controller.get("positionTracked"),
                 "rotationTracked": controller.get("rotationTracked"),
+                "indexTrigger": controller.get("indexTrigger"),
+                "handTrigger": controller.get("handTrigger"),
+                "indexTriggerPressed": controller.get("indexTriggerPressed"),
+                "handTriggerPressed": controller.get("handTriggerPressed"),
                 "x": x,
                 "y": y,
                 "z": z,
@@ -545,7 +624,16 @@ class SessionWriter:
         self.raw_file.close()
         self.samples_file.close()
         self.controllers_file.close()
+        robot_session = self.robot_session
+        self.robot_session = None
+        robot_summary = None
+        if self.robot_manager is not None and robot_session is not None:
+            if robot_session is not None:
+                self.robot_realsense_directory = robot_session.directory
+            robot_summary = self.robot_manager.stop_session(robot_session)
         summary = self.summary(reason)
+        if robot_summary is not None:
+            summary["robotRealSense"] = robot_summary
         self.summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
         self.closed = True
         return summary
@@ -572,6 +660,8 @@ class SessionWriter:
             "rawJsonl": str(self.raw_path),
             "samplesJsonl": str(self.samples_path),
             "controllersCsv": str(self.controllers_csv_path),
+            "robotRealSenseDirectory": str(self.robot_realsense_directory) if self.robot_realsense_directory is not None else None,
+            "robotStartStatus": self.robot_start_status,
         }
         if self.calibration_snapshot_start is not None:
             summary["calibrationSnapshotAtStart"] = self.calibration_snapshot_start
@@ -582,6 +672,38 @@ class SessionWriter:
             summary["calibrationSnapshot"] = preferred_snapshot
             summary["calibrationSnapshotJson"] = str(self.calibration_snapshot_path)
         return summary
+
+    def _robot_start_status(self, stage: str) -> dict[str, Any]:
+        if self.robot_manager is None:
+            return {"enabled": False, "stage": stage, "recording": False, "reason": "robot manager disabled"}
+        status = self.robot_manager.status()
+        robot = status.get("robot") if isinstance(status, dict) else {}
+        config = status.get("config") if isinstance(status, dict) else {}
+        active = status.get("activeSession") if isinstance(status, dict) else None
+        connected = bool(isinstance(robot, dict) and robot.get("connected"))
+        recording = bool(self.robot_session is not None)
+        reason = "recording"
+        if not connected:
+            reason = "Flexiv robot is not connected"
+        elif not isinstance(config, dict) or not config.get("cameraSerial"):
+            reason = "RealSense camera serial is empty"
+        elif not recording:
+            reason = self.robot_manager.last_error or "robot RealSense session did not start"
+        return {
+            "enabled": True,
+            "stage": stage,
+            "recording": recording,
+            "reason": reason,
+            "robotConnected": connected,
+            "robotSn": robot.get("robotSn") if isinstance(robot, dict) else None,
+            "poseField": robot.get("poseField") if isinstance(robot, dict) else None,
+            "cameraSerial": config.get("cameraSerial") if isinstance(config, dict) else None,
+            "thirdCameraSerial": config.get("thirdCameraSerial") if isinstance(config, dict) else None,
+            "motionArmed": bool(isinstance(robot, dict) and robot.get("motionArmed")),
+            "controllerMotionEnabled": bool(isinstance(config, dict) and config.get("controllerMotionEnabled")),
+            "gripperEnabled": bool(isinstance(config, dict) and config.get("gripperEnabled")),
+            "activeSession": active,
+        }
 
     def preferred_calibration_snapshot(self) -> dict[str, Any] | None:
         if is_successful_calibration_snapshot(self.calibration_snapshot_start):
@@ -1269,6 +1391,7 @@ class PcCalibrationSession:
         robot_sn = robot.get("robotSn") or config.get("robotSn") if isinstance(robot, dict) and isinstance(config, dict) else None
         pose_field = robot.get("poseField") or config.get("poseField") if isinstance(robot, dict) and isinstance(config, dict) else None
         camera_serial = config.get("cameraSerial") if isinstance(config, dict) else None
+        third_camera_serial = config.get("thirdCameraSerial") if isinstance(config, dict) else None
         recording = bool(self.robot_session is not None)
         reason = "recording"
         if not connected:
@@ -1288,8 +1411,10 @@ class PcCalibrationSession:
             "robotSn": robot_sn,
             "poseField": pose_field,
             "cameraSerial": camera_serial,
+            "thirdCameraSerial": third_camera_serial,
             "motionArmed": motion_armed,
             "controllerMotionEnabled": controller_motion,
+            "gripperEnabled": bool(isinstance(config, dict) and config.get("gripperEnabled")),
             "activeSession": active,
         }
 
@@ -1409,10 +1534,21 @@ class PcCalibrationSession:
             quest_calibration_event,
             self.visualizer.publish_event if self.visualizer is not None else None,
         )
+        self._copy_robot_calibration_artifacts()
         if result.get("ok"):
             self.publish_status("robot_done", 1.0, "Flexiv/RealSense hand-eye calibration complete")
         else:
             self.publish_status("robot_failed", 1.0, result.get("error") or "Flexiv/RealSense hand-eye calibration failed")
+
+    def _copy_robot_calibration_artifacts(self) -> None:
+        if self.robot_realsense_directory is None:
+            return
+        destination = self.output_directory / "robot_realsense"
+        destination.mkdir(parents=True, exist_ok=True)
+        for filename in ("robot_hand_eye_result.json", "robot_hand_eye_failure.json", "session_summary.json", "capture_config.json"):
+            source = self.robot_realsense_directory / filename
+            if source.exists():
+                (destination / filename).write_bytes(source.read_bytes())
 
 
 class PcCalibrationHttpReceiver:
@@ -1625,6 +1761,7 @@ def receive(args: argparse.Namespace) -> int:
                 flexiv_rdk=args.flexiv_rdk,
                 flexiv_network_interfaces=args.flexiv_network_interfaces,
                 camera_serial=args.realsense_serial,
+                third_camera_serial=args.third_realsense_serial,
                 width=args.realsense_width,
                 height=args.realsense_height,
                 fps=args.realsense_fps,
@@ -1636,6 +1773,14 @@ def receive(args: argparse.Namespace) -> int:
                 controller_translation_scale=args.controller_motion_scale,
                 controller_max_offset_m=args.controller_motion_max_offset,
                 controller_max_step_m=args.controller_motion_max_step,
+                gripper_enabled=args.enable_gripper,
+                gripper_device=args.gripper_device,
+                gripper_open_width_m=args.gripper_open_width,
+                gripper_close_width_m=args.gripper_close_width,
+                gripper_speed_mps=args.gripper_speed,
+                gripper_force_n=args.gripper_force,
+                gripper_trigger_close_threshold=args.gripper_trigger_close_threshold,
+                gripper_trigger_open_threshold=args.gripper_trigger_open_threshold,
             )
         )
     visualizer = None
@@ -1777,6 +1922,9 @@ def receive(args: argparse.Namespace) -> int:
                     pc_receive_perf_counter_seconds,
                     args.flush_every,
                     args.calibration_output_root.resolve() if not args.no_calibration_http else None,
+                    args.calibration_raw_root.resolve() if not args.no_calibration_http else None,
+                    robot_manager,
+                    visualizer,
                 )
                 print(f"Started PC session: {active.directory}", flush=True)
 
@@ -3044,6 +3192,11 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
     failure = read_json_if_exists(robot_dir / "robot_hand_eye_failure.json")
     alignment = result.get("questAlignment") if isinstance(result, dict) else None
     t_world_base = transform_from_json(alignment.get("T_world_base")) if isinstance(alignment, dict) else None
+    t_ee_end_camera = None
+    if isinstance(result, dict):
+        end_camera_result = result.get("end_camera")
+        if isinstance(end_camera_result, dict):
+            t_ee_end_camera = transform_from_json(end_camera_result.get("T_ee_realsense"))
     rows: list[dict[str, Any]] = []
     ee_poses: list[np.ndarray] = []
     with samples_path.open("r", encoding="utf-8") as handle:
@@ -3055,16 +3208,28 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
                 continue
             pose = row.get("T_base_ee") if isinstance(row.get("T_base_ee"), dict) else None
             pose_matrix = transform_from_json(pose)
+            end_camera_pose = row.get("T_base_end_camera") if isinstance(row.get("T_base_end_camera"), dict) else None
+            end_camera_matrix = transform_from_json(end_camera_pose)
             world_pose = None
             display_pose = None
+            world_end_camera_pose = None
+            display_end_camera_pose = None
             display_frame = "unaligned_robot_base"
             if pose_matrix is not None:
                 ee_poses.append(pose_matrix)
+                if end_camera_matrix is None and t_ee_end_camera is not None:
+                    end_camera_matrix = pose_matrix @ t_ee_end_camera
+                    end_camera_pose = transform_payload_from_matrix(end_camera_matrix)
                 if t_world_base is not None:
                     world_matrix = t_world_base @ pose_matrix
                     world_pose = transform_payload_from_matrix(world_matrix)
                     display_pose = translate_transform_payload(world_pose, origin)
+                    if end_camera_matrix is not None:
+                        world_end_camera_matrix = t_world_base @ end_camera_matrix
+                        world_end_camera_pose = transform_payload_from_matrix(world_end_camera_matrix)
+                        display_end_camera_pose = translate_transform_payload(world_end_camera_pose, origin)
                     display_frame = "quest_world_axes_translated_to_board_origin"
+            images = row.get("images") if isinstance(row.get("images"), dict) else {}
             rows.append(
                 {
                     "sampleIndex": row.get("sample_index"),
@@ -3074,20 +3239,71 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
                     "T_base_ee": pose,
                     "T_world_ee": world_pose,
                     "T_display_ee": display_pose,
+                    "T_base_end_camera": end_camera_pose,
+                    "T_world_end_camera": world_end_camera_pose,
+                    "T_display_end_camera": display_end_camera_pose,
                     "displayFrame": display_frame,
                     "jointpose": row.get("jointpose"),
+                    "images": robot_image_artifacts(robot_dir, images),
+                    "gripper": row.get("gripper"),
                     "error": row.get("error"),
                 }
             )
+    gripper_rows = read_robot_gripper_rows(robot_dir)
     return {
         "directory": str(robot_dir),
         "session": session if isinstance(session, dict) else None,
         "samples": rows,
+        "gripper": gripper_rows,
         "displayFrame": "quest_world_axes_translated_to_board_origin" if t_world_base is not None else "unaligned_robot_base",
         "poseDiversity": ee_pose_diversity(ee_poses),
         "result": result if isinstance(result, dict) else None,
         "failure": failure if isinstance(failure, dict) else None,
     }
+
+
+def robot_image_artifacts(robot_dir: Path, images: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for role, rel_path in images.items():
+        if not isinstance(rel_path, str) or not rel_path:
+            continue
+        path = (robot_dir / rel_path).resolve()
+        if path.exists():
+            payload[role] = artifact_payload(path, f"{role} camera")
+        else:
+            payload[role] = {"label": f"{role} camera", "path": str(path), "url": None, "error": "missing image"}
+    return payload
+
+
+def read_robot_gripper_rows(robot_dir: Path) -> list[dict[str, Any]]:
+    path = robot_dir / "gripper_commands.jsonl"
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(
+                    {
+                        "ok": bool(row.get("ok")),
+                        "commandSent": bool(row.get("commandSent")),
+                        "action": row.get("action"),
+                        "questSampleIndex": row.get("quest_sample_index"),
+                        "recordingTimestampSeconds": row.get("quest_recording_timestamp_seconds"),
+                        "trigger": row.get("trigger"),
+                        "targetWidthM": row.get("target_width_m"),
+                        "reason": row.get("reason"),
+                        "error": row.get("error"),
+                        "status": row.get("status"),
+                    }
+                )
+    return rows
 
 
 def transform_payload_from_matrix(matrix: np.ndarray) -> dict[str, Any]:
@@ -3772,6 +3988,39 @@ def recording_calibration_snapshot(output_root: Path | None) -> dict[str, Any] |
         compact["reason"] = event.get("reason")
         compact["reasonCode"] = event.get("reasonCode")
     return compact
+
+
+def latest_robot_hand_eye_result(
+    calibration_raw_root: Path | None,
+    calibration_output_root: Path | None,
+) -> dict[str, Any] | None:
+    candidates: list[Path] = []
+    for root in (calibration_raw_root, calibration_output_root):
+        if root is None:
+            continue
+        resolved = root.resolve()
+        if not resolved.exists():
+            continue
+        candidates.extend(resolved.glob("record_pc_calib*/robot_realsense/robot_hand_eye_result.json"))
+    valid: list[Path] = []
+    for path in candidates:
+        if not path.exists() or path.stat().st_size <= 0:
+            continue
+        payload = read_json_if_exists(path)
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            continue
+        alignment = payload.get("questAlignment")
+        if not isinstance(alignment, dict) or not alignment.get("ok"):
+            continue
+        valid.append(path)
+    if not valid:
+        return None
+    latest = max(valid, key=lambda path: path.stat().st_mtime)
+    payload = read_json_if_exists(latest)
+    if isinstance(payload, dict):
+        payload.setdefault("sourcePath", str(latest))
+        return payload
+    return None
 
 
 def is_successful_calibration_snapshot(snapshot: dict[str, Any] | None) -> bool:
@@ -4644,6 +4893,9 @@ label {
       <label>End RealSense
         <select id="robotCamera"></select>
       </label>
+      <label>Third RealSense
+        <select id="robotThirdCamera"></select>
+      </label>
       <div class="robot-grid">
         <label>Robot SN
           <input id="robotSn" spellcheck="false">
@@ -4697,6 +4949,33 @@ label {
       <label>Max step m
         <input id="robotMaxStep" type="number" min="0" step="0.005">
       </label>
+      <div class="robot-grid">
+        <label>Gripper
+          <select id="robotGripperEnabled">
+            <option value="false">off</option>
+            <option value="true">trigger</option>
+          </select>
+        </label>
+        <label>Device
+          <input id="robotGripperDevice" spellcheck="false">
+        </label>
+      </div>
+      <div class="robot-grid">
+        <label>Open width m
+          <input id="robotGripperOpen" type="number" min="0" step="0.005">
+        </label>
+        <label>Close width m
+          <input id="robotGripperClose" type="number" min="0" step="0.005">
+        </label>
+      </div>
+      <div class="robot-grid">
+        <label>Grip speed
+          <input id="robotGripperSpeed" type="number" min="0" step="0.005">
+        </label>
+        <label>Grip force
+          <input id="robotGripperForce" type="number" min="0" step="1">
+        </label>
+      </div>
       <div class="robot-actions">
         <button id="robotRefresh">Refresh Cameras</button>
         <button id="robotBoardCheck">Check Board</button>
@@ -4747,6 +5026,7 @@ const recordingBanner = document.getElementById('recordingBanner');
 const recordingLabel = document.getElementById('recordingLabel');
 const recordingDetail = document.getElementById('recordingDetail');
 const robotCamera = document.getElementById('robotCamera');
+const robotThirdCamera = document.getElementById('robotThirdCamera');
 const robotSn = document.getElementById('robotSn');
 const robotPoseField = document.getElementById('robotPoseField');
 const robotNetworkInterfaces = document.getElementById('robotNetworkInterfaces');
@@ -4759,6 +5039,12 @@ const robotBoardWarmup = document.getElementById('robotBoardWarmup');
 const robotMotionScale = document.getElementById('robotMotionScale');
 const robotMaxOffset = document.getElementById('robotMaxOffset');
 const robotMaxStep = document.getElementById('robotMaxStep');
+const robotGripperEnabled = document.getElementById('robotGripperEnabled');
+const robotGripperDevice = document.getElementById('robotGripperDevice');
+const robotGripperOpen = document.getElementById('robotGripperOpen');
+const robotGripperClose = document.getElementById('robotGripperClose');
+const robotGripperSpeed = document.getElementById('robotGripperSpeed');
+const robotGripperForce = document.getElementById('robotGripperForce');
 const robotRefresh = document.getElementById('robotRefresh');
 const robotBoardCheck = document.getElementById('robotBoardCheck');
 const robotDiagnostics = document.getElementById('robotDiagnostics');
@@ -4789,6 +5075,7 @@ const state = {
   robot: null,
   robotSample: null,
   robotMotion: null,
+  robotGripper: null,
   robotDiagnostics: null,
   robotBoardCheck: null,
   robotWorldBase: null,
@@ -4866,6 +5153,8 @@ function connect() {
       updateRobotSample(sample);
     } else if (sample.type === 'robot_motion') {
       updateRobotMotion(sample);
+    } else if (sample.type === 'robot_gripper') {
+      updateRobotGripper(sample);
     } else if (sample.type === 'robot_calibration_result' || sample.type === 'robot_calibration_failure') {
       updateRobotCalibration(sample);
     } else if (sample.type === 'quest_adb_status') {
@@ -5010,15 +5299,21 @@ async function refreshCameras() {
     const response = await fetch('/cameras/list', {cache: 'no-store'});
     const payload = await response.json();
     const current = robotCamera.value;
+    const currentThird = robotThirdCamera.value;
     robotCamera.innerHTML = '';
+    robotThirdCamera.innerHTML = '<option value="">off</option>';
     for (const camera of payload.cameras || []) {
       const option = document.createElement('option');
       option.value = camera.serial || '';
       option.textContent = `${camera.serial || 'unknown'} ${camera.name || ''}`;
       robotCamera.appendChild(option);
+      const thirdOption = option.cloneNode(true);
+      robotThirdCamera.appendChild(thirdOption);
     }
     if (current) robotCamera.value = current;
+    if (currentThird) robotThirdCamera.value = currentThird;
     if (!robotCamera.value && state.robot?.config?.cameraSerial) robotCamera.value = state.robot.config.cameraSerial;
+    if (!robotThirdCamera.value && state.robot?.config?.thirdCameraSerial) robotThirdCamera.value = state.robot.config.thirdCameraSerial;
     if (!payload.ok) robotStatus.textContent = payload.error || payload.reason || 'camera list unavailable';
   } catch (error) {
     robotStatus.textContent = String(error);
@@ -5031,6 +5326,7 @@ function robotPayloadFromControls() {
     poseField: robotPoseField.value,
     networkInterfaces: robotNetworkInterfaces.value.split(/[,\s;]+/).map(v => v.trim()).filter(Boolean),
     cameraSerial: robotCamera.value,
+    thirdCameraSerial: robotThirdCamera.value,
     captureIntervalSeconds: Number(robotInterval.value || 0.35),
     realsenseAutoExposure: robotExposureMode.value !== 'manual',
     realsenseExposure: robotExposure.value ? Number(robotExposure.value) : null,
@@ -5039,7 +5335,13 @@ function robotPayloadFromControls() {
     runHandEye: robotHandEye.value === 'true',
     controllerTranslationScale: Number(robotMotionScale.value || 1.0),
     controllerMaxOffsetM: Number(robotMaxOffset.value || 0.18),
-    controllerMaxStepM: Number(robotMaxStep.value || 0.015)
+    controllerMaxStepM: Number(robotMaxStep.value || 0.015),
+    gripperEnabled: robotGripperEnabled.value === 'true',
+    gripperDevice: robotGripperDevice.value.trim(),
+    gripperOpenWidthM: Number(robotGripperOpen.value || 0.08),
+    gripperCloseWidthM: Number(robotGripperClose.value || 0.0),
+    gripperSpeedMps: Number(robotGripperSpeed.value || 0.04),
+    gripperForceN: Number(robotGripperForce.value || 20.0)
   };
 }
 
@@ -5210,6 +5512,11 @@ function updateRobotMotion(event) {
   renderRobotStatus(state.robot);
 }
 
+function updateRobotGripper(event) {
+  state.robotGripper = event;
+  renderRobotStatus(state.robot);
+}
+
 function updateRobotCalibration(event) {
   state.robotCalibration = event;
   if (event.T_world_base?.matrix_4x4) state.robotWorldBase = event.T_world_base.matrix_4x4;
@@ -5234,6 +5541,16 @@ function applyRobotStatus(payload) {
     }
     robotCamera.value = config.cameraSerial;
   }
+  if (config.thirdCameraSerial && !robotThirdCamera.value) {
+    const existing = Array.from(robotThirdCamera.options).some(option => option.value === config.thirdCameraSerial);
+    if (!existing) {
+      const option = document.createElement('option');
+      option.value = config.thirdCameraSerial;
+      option.textContent = `${config.thirdCameraSerial} configured`;
+      robotThirdCamera.appendChild(option);
+    }
+    robotThirdCamera.value = config.thirdCameraSerial;
+  }
   if (Number.isFinite(config.captureIntervalSeconds)) robotInterval.value = config.captureIntervalSeconds;
   if (typeof config.realsenseAutoExposure === 'boolean') robotExposureMode.value = config.realsenseAutoExposure ? 'auto' : 'manual';
   if (Number.isFinite(config.realsenseExposure)) robotExposure.value = config.realsenseExposure;
@@ -5243,6 +5560,12 @@ function applyRobotStatus(payload) {
   if (Number.isFinite(config.controllerTranslationScale)) robotMotionScale.value = config.controllerTranslationScale;
   if (Number.isFinite(config.controllerMaxOffsetM)) robotMaxOffset.value = config.controllerMaxOffsetM;
   if (Number.isFinite(config.controllerMaxStepM)) robotMaxStep.value = config.controllerMaxStepM;
+  if (typeof config.gripperEnabled === 'boolean') robotGripperEnabled.value = config.gripperEnabled ? 'true' : 'false';
+  if (config.gripperDevice && !robotGripperDevice.value) robotGripperDevice.value = config.gripperDevice;
+  if (Number.isFinite(config.gripperOpenWidthM)) robotGripperOpen.value = config.gripperOpenWidthM;
+  if (Number.isFinite(config.gripperCloseWidthM)) robotGripperClose.value = config.gripperCloseWidthM;
+  if (Number.isFinite(config.gripperSpeedMps)) robotGripperSpeed.value = config.gripperSpeedMps;
+  if (Number.isFinite(config.gripperForceN)) robotGripperForce.value = config.gripperForceN;
   renderRobotStatus(payload);
 }
 
@@ -5264,6 +5587,7 @@ function renderRobotStatus(payload) {
     `pose: ${robot.poseField || 'n/a'}`,
     `rdk iface: ${(payload.config?.networkInterfaces || []).join(', ') || 'default'}`,
     `camera: ${payload.config?.cameraSerial || 'n/a'}`,
+    `third camera: ${payload.config?.thirdCameraSerial || 'off'}`,
     `exposure: ${payload.config?.realsenseAutoExposure === false ? 'manual' : 'auto'}${Number.isFinite(payload.config?.realsenseExposure) ? ` ${payload.config.realsenseExposure}` : ''}${Number.isFinite(payload.config?.realsenseGain) ? ` gain ${payload.config.realsenseGain}` : ''}`,
     `session: ${payload.activeSession ? `${active.samples || 0} samples, ${active.images || 0} images` : 'idle'}`
   ];
@@ -5278,8 +5602,12 @@ function renderRobotStatus(payload) {
   }
   if (payload.activeSession) {
     lines.push(`motion counts: cmd ${active.motionCommands ?? 0}, skip ${active.motionSkips ?? 0}, err ${active.motionErrors ?? 0}`);
+    lines.push(`gripper counts: cmd ${active.gripperCommands ?? 0}, skip ${active.gripperSkips ?? 0}, err ${active.gripperErrors ?? 0}`);
     if (active.lastMotion) {
       lines.push(`last motion: ${robotMotionSummaryText(active.lastMotion)}`);
+    }
+    if (active.lastGripper) {
+      lines.push(`last gripper: ${robotGripperSummaryText(active.lastGripper)}`);
     }
   }
   if (state.robotMotion) {
@@ -5289,6 +5617,9 @@ function renderRobotStatus(payload) {
       const step = Array.isArray(state.robotMotion.stepOffsetM) ? state.robotMotion.stepOffsetM.map(v => Number(v).toFixed(3)).join(', ') : 'n/a';
       lines.push(`motion anchor: ${state.robotMotion.anchored ? 'set' : 'waiting'}${state.robotMotion.createdAnchor ? ' (new)' : ''}, step ${step}`);
     }
+  }
+  if (state.robotGripper) {
+    lines.push(`gripper: ${robotGripperSummaryText(state.robotGripper)}`);
   }
   if (state.robotCalibration) {
     lines.push(state.robotCalibration.type === 'robot_calibration_result' ? 'hand-eye: done' : `hand-eye: failed ${state.robotCalibration.error || ''}`);
@@ -5311,6 +5642,14 @@ function robotMotionSummaryText(event) {
     return `sent offset ${offset}${step}`;
   }
   return event.reason || event.error || 'skipped';
+}
+
+function robotGripperSummaryText(event) {
+  if (!event) return 'n/a';
+  const trigger = Number.isFinite(event.trigger) ? ` trig ${Number(event.trigger).toFixed(2)}` : '';
+  const width = Number.isFinite(event.targetWidthM) ? ` width ${(Number(event.targetWidthM) * 1000).toFixed(1)}mm` : '';
+  if (event.ok && event.commandSent) return `${event.action || 'move'}${trigger}${width}`;
+  return `${event.reason || event.error || event.action || 'skip'}${trigger}`;
 }
 
 function robotModelStatusText() {
@@ -6158,6 +6497,27 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
   color: #8492a1;
   overflow-wrap: anywhere;
 }
+.camera-strip {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 8px;
+}
+.camera-strip a {
+  display: grid;
+  gap: 4px;
+  color: #a8d8ff;
+  text-decoration: none;
+  font-size: 12px;
+}
+.camera-strip img {
+  width: 100%;
+  max-height: 120px;
+  object-fit: contain;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #080a0c;
+}
 .ok { color: #9df09d; font-weight: 700; }
 .warn { color: #ffd18a; font-weight: 700; }
 .rec { color: #ff8c96; font-weight: 700; }
@@ -6230,6 +6590,7 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
     <div class="section">
       <div class="ok">Sample</div>
       <div class="kv" id="sampleKv"></div>
+      <div class="camera-strip" id="cameraStrip"></div>
     </div>
   </aside>
 </div>
@@ -6256,6 +6617,7 @@ const artifactList = document.getElementById('artifactList');
 const depthKv = document.getElementById('depthKv');
 const robotKv = document.getElementById('robotKv');
 const sampleKv = document.getElementById('sampleKv');
+const cameraStrip = document.getElementById('cameraStrip');
 
 const state = {
   records: [],
@@ -6540,6 +6902,8 @@ function updateRobotInfo() {
   const sample = state.data?.samples?.[state.idx] || {};
   const robot = nearestRobotSample(sample.recordingTimestampSeconds);
   const fkError = replayRobotFkErrorMm(robot);
+  const cameraRoles = Array.isArray(session.cameraRoles) ? session.cameraRoles.join(', ') : 'n/a';
+  const gripperEvents = Array.isArray(rr.gripper) ? rr.gripper.filter(row => row.commandSent).length : 0;
   const detections = counts.requiredDetections !== undefined
     ? `${counts.detections ?? 'n/a'} / ${counts.requiredDetections}`
     : (counts.detections ?? 'n/a');
@@ -6549,7 +6913,9 @@ function updateRobotInfo() {
     ['model', replayRobotModelStatusText()],
     ['URDF FK', Number.isFinite(fkError) ? `${fkError.toFixed(1)}mm vs flange` : 'n/a'],
     ['ee motion', replayPoseDiversityText(diversity)],
+    ['cameras', cameraRoles],
     ['motion', replayMotionSummaryText(session)],
+    ['gripper', `cmd ${session.gripperCommands ?? gripperEvents}, err ${session.gripperErrors ?? 0}`],
     ['hand-eye', result.ok ? 'ok' : (rr.failure ? 'failed' : 'pending')],
     ['failure', rr.failure?.error || 'n/a'],
     ['residual', Number.isFinite(residual.median) ? `med ${residual.median.toFixed(1)}mm p95 ${Number(residual.p95 || 0).toFixed(1)}mm` : 'n/a'],
@@ -6618,12 +6984,16 @@ function updateLabels() {
     timeLabel.textContent = '0.000s';
     sampleLabel.textContent = 'sample 0';
     sampleKv.innerHTML = '';
+    cameraStrip.innerHTML = '';
     return;
   }
   timeLabel.textContent = `${Number(s.recordingTimestampSeconds || 0).toFixed(3)}s`;
   sampleLabel.textContent = `sample ${s.sampleIndex ?? state.idx}`;
   recordingLabel.textContent = s.isRecording ? 'REC' : 'LIVE';
   recordingLabel.className = s.isRecording ? 'rec' : 'ok';
+  const robot = nearestRobotSample(s.recordingTimestampSeconds);
+  const imageRoles = robot?.images ? Object.keys(robot.images).filter(role => robot.images[role]?.url) : [];
+  const gripper = nearestGripperEvent(s.recordingTimestampSeconds);
   const kv = [
     ['gaze3D', s.gaze?.ok ? (s.gaze.source || 'ok') : 'missing'],
     ['depth raw', Number.isFinite(s.gazeDepth?.rawDepthM) ? (s.gazeDepth.rawDepthM * 1000).toFixed(1) + ' mm' : 'n/a'],
@@ -6632,9 +7002,49 @@ function updateLabels() {
     ['hit', s.gazeHit?.ok ? 'present' : 'missing'],
     ['left', s.left?.ok ? (s.left.source || 'ok') : (s.left?.source || 'missing')],
     ['right', s.right?.ok ? (s.right.source || 'ok') : (s.right?.source || 'missing')],
-    ['head', s.head?.ok ? (s.head.source || 'ok') : 'missing']
+    ['head', s.head?.ok ? (s.head.source || 'ok') : 'missing'],
+    ['robot sample', robot ? `${robot.sampleIndex ?? 'n/a'} / q${robot.questSampleIndex ?? 'n/a'}` : 'n/a'],
+    ['images', imageRoles.join(', ') || 'n/a'],
+    ['gripper', gripper ? replayGripperText(gripper) : 'n/a']
   ];
   sampleKv.innerHTML = kv.map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
+  renderCameraStrip(robot);
+}
+
+function renderCameraStrip(robot) {
+  const images = robot?.images || {};
+  const entries = Object.entries(images).filter(([, item]) => item?.url);
+  if (!entries.length) {
+    cameraStrip.innerHTML = '';
+    return;
+  }
+  cameraStrip.innerHTML = entries.map(([role, item]) => `
+    <a href="${escapeHtml(item.url)}" target="_blank">
+      <img src="${escapeHtml(item.url)}" alt="${escapeHtml(role)} camera">
+      <span>${escapeHtml(role)}</span>
+    </a>`).join('');
+}
+
+function nearestGripperEvent(t) {
+  const rows = state.data?.robotRealSense?.gripper || [];
+  if (!rows.length || !Number.isFinite(t)) return rows[rows.length - 1] || null;
+  let best = null, bestDt = Infinity;
+  for (const row of rows) {
+    const rt = Number(row.recordingTimestampSeconds);
+    if (!Number.isFinite(rt)) continue;
+    const dt = Math.abs(rt - t);
+    if (dt < bestDt) {
+      best = row;
+      bestDt = dt;
+    }
+  }
+  return best;
+}
+
+function replayGripperText(row) {
+  const trig = Number.isFinite(row.trigger) ? ` trig ${Number(row.trigger).toFixed(2)}` : '';
+  if (row.commandSent) return `${row.action || 'move'}${trig}`;
+  return `${row.reason || row.error || row.action || 'skip'}${trig}`;
 }
 
 function boardSize() {
@@ -6823,6 +7233,15 @@ function drawRobotForSample(sample) {
   drawLine(p, matrixPoint(matrix, 0.08, 0, 0), '#ff4545', 2.3);
   drawLine(p, matrixPoint(matrix, 0, 0.08, 0), '#42e875', 2.3);
   drawLine(p, matrixPoint(matrix, 0, 0, 0.08), '#4b7cff', 2.3);
+  const camMatrix = robot?.T_display_end_camera?.matrix_4x4;
+  const cp = matrixTranslation(camMatrix);
+  if (cp) {
+    drawPoint(cp, '#82adff', 5, 'end cam');
+    drawLine(cp, matrixPoint(camMatrix, 0.06, 0, 0), '#ff4545', 1.9);
+    drawLine(cp, matrixPoint(camMatrix, 0, 0.06, 0), '#42e875', 1.9);
+    drawLine(cp, matrixPoint(camMatrix, 0, 0, 0.06), '#4b7cff', 1.9);
+    drawLine(p, cp, 'rgba(130,173,255,.42)', 1.2);
+  }
 }
 
 function drawRobotSkeleton(robot) {
