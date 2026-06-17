@@ -759,6 +759,18 @@ class LiveTelemetryVisualizer:
     def arm_robot_motion_payload(self) -> dict[str, Any]:
         if self.robot_manager is None:
             return {"ok": False, "enabled": False, "reason": "disabled"}
+        controller_window = self.controller_window_payload()
+        right_recent = controller_window.get("right", {}) if isinstance(controller_window, dict) else {}
+        if int(right_recent.get("validSamples") or 0) <= 0:
+            result = {
+                "ok": False,
+                "enabled": True,
+                "error": "right_controller_pose_missing",
+                "message": "Right Touch controller pose is required before arming robot motion.",
+                "controllerWindow": controller_window,
+            }
+            self.publish_event({"type": "robot_status", "stage": "arm_motion_rejected", **result})
+            return result
         result = self.robot_manager.arm_motion()
         self.publish_event({"type": "robot_status", "stage": "arm_motion", **result})
         return result
@@ -769,6 +781,11 @@ class LiveTelemetryVisualizer:
         result = self.robot_manager.disarm_motion()
         self.publish_event({"type": "robot_status", "stage": "disarm_motion", **result})
         return result
+
+    def controller_window_payload(self) -> dict[str, Any]:
+        with self.lock:
+            recent_samples = [event for event in self.history if event.get("type") == "sample"]
+        return recent_controller_status(recent_samples)
 
     def quest_adb_status_payload(self) -> dict[str, Any]:
         return quest_adb_status(self.adb_path)
