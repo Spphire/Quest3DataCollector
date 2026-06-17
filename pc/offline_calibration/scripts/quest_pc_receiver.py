@@ -3616,11 +3616,39 @@ label {
 .robot-board-preview img {
   display: block;
   width: 100%;
-  max-height: 180px;
+  max-height: 260px;
   object-fit: contain;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: #0e1216;
+}
+.robot-board-card {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+  background: #0e1216;
+  display: grid;
+  gap: 8px;
+}
+.robot-board-card.ok {
+  border-color: rgba(156, 209, 104, 0.46);
+}
+.robot-board-card.fail {
+  border-color: rgba(255, 93, 112, 0.48);
+}
+.robot-board-title {
+  font-weight: 650;
+  color: var(--text);
+}
+.robot-board-hint {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+.robot-board-link {
+  color: #a8d8ff;
+  font-size: 12px;
+  text-decoration: none;
 }
 #status {
   white-space: pre-wrap;
@@ -4039,8 +4067,9 @@ async function checkRobotBoard() {
 }
 
 function renderRobotBoardCheck(payload) {
+  const detected = Boolean(payload?.ok);
   const lines = [
-    `board check: ${payload?.ok ? 'detected' : 'not detected'}`,
+    `board check: ${detected ? 'detected' : 'not detected'}`,
     `camera: ${payload?.camera?.serial || robotCamera.value || 'n/a'}`,
     `corners: ${payload?.detectedCorners ?? 0}`,
   ];
@@ -4061,9 +4090,24 @@ function renderRobotBoardCheck(payload) {
   if (payload?.error) lines.push(`error: ${payload.error}`);
   robotStatus.textContent = lines.join('\n');
   const url = payload?.overlayUrl || payload?.imageUrl;
-  robotBoardPreview.innerHTML = url
-    ? `<a href="${escapeHtml(url)}" target="_blank"><img src="${escapeHtml(url)}" alt="end camera board check"></a>`
-    : '';
+  if (!url) {
+    robotBoardPreview.innerHTML = '';
+    return;
+  }
+  const title = detected ? 'End camera sees the board' : 'End camera board not detected';
+  const brightness = Number.isFinite(payload?.brightness?.p95)
+    ? `brightness p95 ${payload.brightness.p95.toFixed(1)}`
+    : 'brightness n/a';
+  const hint = detected
+    ? `Detected ${payload?.detectedCorners ?? 0} corners. This frame is usable for hand-eye calibration.`
+    : 'Move the arm/camera or clear occlusion until the full 11x8 inner-corner board is inside the image.';
+  robotBoardPreview.innerHTML = `
+    <div class="robot-board-card ${detected ? 'ok' : 'fail'}">
+      <div class="robot-board-title">${escapeHtml(title)}</div>
+      <a href="${escapeHtml(url)}" target="_blank"><img src="${escapeHtml(url)}" alt="end camera board check"></a>
+      <div class="robot-board-hint">${escapeHtml(hint)} ${escapeHtml(brightness)}.</div>
+      <a class="robot-board-link" href="${escapeHtml(url)}" target="_blank">open full image</a>
+    </div>`;
 }
 
 async function disconnectRobot() {
