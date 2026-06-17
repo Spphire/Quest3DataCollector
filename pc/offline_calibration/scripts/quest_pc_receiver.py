@@ -35,6 +35,7 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = WORKSPACE_ROOT / "pc_recordings"
 DEFAULT_QUEST_LOCAL_ROOT = WORKSPACE_ROOT / "raw"
 DEFAULT_CALIBRATION_OUTPUT_ROOT = WORKSPACE_ROOT / "outputs" / "pc_live_calibration"
+DEFAULT_RIZON4_URDF = WORKSPACE_ROOT / "assets" / "urdf" / "flexiv_Rizon4_kinematics.urdf"
 LATE_RECORDING_SAMPLE_GRACE_SECONDS = 5.0
 MAX_CALIBRATION_HTTP_BODY_BYTES = 8 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
@@ -218,6 +219,24 @@ def main() -> int:
         "--no-robot-hand-eye",
         action="store_true",
         help="Record robot/RealSense samples but skip automatic robot hand-eye calibration after B-button stop.",
+    )
+    receive_parser.add_argument(
+        "--controller-motion-scale",
+        type=float,
+        default=1.0,
+        help="Scale from right-controller displacement to robot TCP displacement. Default: 1.0",
+    )
+    receive_parser.add_argument(
+        "--controller-motion-max-offset",
+        type=float,
+        default=0.18,
+        help="Maximum robot TCP offset commanded from the controller anchor, in meters. Default: 0.18",
+    )
+    receive_parser.add_argument(
+        "--controller-motion-max-step",
+        type=float,
+        default=0.015,
+        help="Maximum TCP target position change per received sample, in meters. Default: 0.015",
     )
     receive_parser.set_defaults(func=receive)
 
@@ -626,6 +645,20 @@ class LiveTelemetryVisualizer:
         self.publish_event({"type": "robot_status", "stage": "disconnect", "status": status})
         return status
 
+    def arm_robot_motion_payload(self) -> dict[str, Any]:
+        if self.robot_manager is None:
+            return {"ok": False, "enabled": False, "reason": "disabled"}
+        result = self.robot_manager.arm_motion()
+        self.publish_event({"type": "robot_status", "stage": "arm_motion", **result})
+        return result
+
+    def disarm_robot_motion_payload(self) -> dict[str, Any]:
+        if self.robot_manager is None:
+            return {"ok": False, "enabled": False, "reason": "disabled"}
+        result = self.robot_manager.disarm_motion()
+        self.publish_event({"type": "robot_status", "stage": "disarm_motion", **result})
+        return result
+
     def _make_server(self) -> ThreadingHTTPServer:
         visualizer = self
 
@@ -660,6 +693,9 @@ class LiveTelemetryVisualizer:
                 if parsed.path == "/cameras/list":
                     self._send_json(visualizer.camera_list_payload())
                     return
+                if parsed.path == "/robot/urdf":
+                    self._send_urdf()
+                    return
                 if parsed.path == "/artifact":
                     self._send_artifact(parsed)
                     return
@@ -688,6 +724,12 @@ class LiveTelemetryVisualizer:
                         return
                     if parsed.path == "/robot/disconnect":
                         self._send_json(visualizer.disconnect_robot_payload())
+                        return
+                    if parsed.path == "/robot/arm-motion":
+                        self._send_json(visualizer.arm_robot_motion_payload())
+                        return
+                    if parsed.path == "/robot/disarm-motion":
+                        self._send_json(visualizer.disarm_robot_motion_payload())
                         return
                     self.send_error(404)
                 except Exception as exc:
@@ -775,6 +817,18 @@ class LiveTelemetryVisualizer:
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(size))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _send_urdf(self) -> None:
+                if not DEFAULT_RIZON4_URDF.exists():
+                    self.send_error(404, "Rizon4 URDF asset not found")
+                    return
+                data = DEFAULT_RIZON4_URDF.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/xml; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(data)
@@ -929,6 +983,7 @@ class PcCalibrationSession:
         if robot_session is not None:
             robot_sample = dict(sample)
             robot_sample["pcReceivePerfCounterSeconds"] = message.get("pcReceivePerfCounterSeconds")
+            robot_session.update_controller_motion(robot_sample)
             robot_session.record_sample(robot_sample)
 
     def close(self, stop_message: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1278,6 +1333,9 @@ def receive(args: argparse.Namespace) -> int:
                 fps=args.realsense_fps,
                 capture_interval_seconds=args.robot_capture_interval,
                 run_hand_eye=not args.no_robot_hand_eye,
+                controller_translation_scale=args.controller_motion_scale,
+                controller_max_offset_m=args.controller_motion_max_offset,
+                controller_max_step_m=args.controller_motion_max_step,
             )
         )
     visualizer = None
@@ -3462,9 +3520,22 @@ label {
           </select>
         </label>
       </div>
+      <div class="robot-grid">
+        <label>Motion scale
+          <input id="robotMotionScale" type="number" min="0" step="0.1">
+        </label>
+        <label>Max offset m
+          <input id="robotMaxOffset" type="number" min="0" step="0.01">
+        </label>
+      </div>
+      <label>Max step m
+        <input id="robotMaxStep" type="number" min="0" step="0.005">
+      </label>
       <div class="robot-actions">
         <button id="robotRefresh">Refresh Cameras</button>
         <button id="robotConnect">Connect Robot</button>
+        <button id="robotArmMotion">Arm Motion</button>
+        <button id="robotDisarmMotion">Disarm</button>
         <button id="robotDisconnect">Disconnect</button>
       </div>
       <div id="robotStatus" class="robot-status">disabled or loading</div>
@@ -3497,8 +3568,13 @@ const robotSn = document.getElementById('robotSn');
 const robotPoseField = document.getElementById('robotPoseField');
 const robotInterval = document.getElementById('robotInterval');
 const robotHandEye = document.getElementById('robotHandEye');
+const robotMotionScale = document.getElementById('robotMotionScale');
+const robotMaxOffset = document.getElementById('robotMaxOffset');
+const robotMaxStep = document.getElementById('robotMaxStep');
 const robotRefresh = document.getElementById('robotRefresh');
 const robotConnect = document.getElementById('robotConnect');
+const robotArmMotion = document.getElementById('robotArmMotion');
+const robotDisarmMotion = document.getElementById('robotDisarmMotion');
 const robotDisconnect = document.getElementById('robotDisconnect');
 const robotStatus = document.getElementById('robotStatus');
 
@@ -3516,6 +3592,8 @@ const state = {
   calibration: null,
   robot: null,
   robotSample: null,
+  robotMotion: null,
+  robotWorldBase: null,
   robotCalibration: null
 };
 
@@ -3584,6 +3662,8 @@ function connect() {
       updateRobotEvent(sample);
     } else if (sample.type === 'robot_sample') {
       updateRobotSample(sample);
+    } else if (sample.type === 'robot_motion') {
+      updateRobotMotion(sample);
     } else if (sample.type === 'robot_calibration_result' || sample.type === 'robot_calibration_failure') {
       updateRobotCalibration(sample);
     }
@@ -3638,7 +3718,11 @@ function robotPayloadFromControls() {
     poseField: robotPoseField.value,
     cameraSerial: robotCamera.value,
     captureIntervalSeconds: Number(robotInterval.value || 0.35),
-    runHandEye: robotHandEye.value === 'true'
+    runHandEye: robotHandEye.value === 'true',
+    controllerMotionEnabled: false,
+    controllerTranslationScale: Number(robotMotionScale.value || 1.0),
+    controllerMaxOffsetM: Number(robotMaxOffset.value || 0.18),
+    controllerMaxStepM: Number(robotMaxStep.value || 0.015)
   };
 }
 
@@ -3675,6 +3759,28 @@ async function disconnectRobot() {
   applyRobotStatus(await response.json());
 }
 
+async function armRobotMotion() {
+  await configureRobot();
+  robotArmMotion.disabled = true;
+  robotStatus.textContent = 'arming motion...';
+  try {
+    const response = await fetch('/robot/arm-motion', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+    const payload = await response.json();
+    applyRobotStatus(payload.status || payload);
+    if (!payload.ok) robotStatus.textContent += `\nerror: ${payload.error || 'arm failed'}`;
+  } catch (error) {
+    robotStatus.textContent = String(error);
+  } finally {
+    robotArmMotion.disabled = false;
+  }
+}
+
+async function disarmRobotMotion() {
+  const response = await fetch('/robot/disarm-motion', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+  const payload = await response.json();
+  applyRobotStatus(payload.status || payload);
+}
+
 function updateRobotEvent(event) {
   if (event.status) applyRobotStatus(event.status);
   else renderRobotStatus(event);
@@ -3685,8 +3791,14 @@ function updateRobotSample(event) {
   renderRobotStatus(state.robot);
 }
 
+function updateRobotMotion(event) {
+  state.robotMotion = event;
+  renderRobotStatus(state.robot);
+}
+
 function updateRobotCalibration(event) {
   state.robotCalibration = event;
+  if (event.T_world_base?.matrix_4x4) state.robotWorldBase = event.T_world_base.matrix_4x4;
   renderRobotStatus(state.robot);
 }
 
@@ -3707,6 +3819,9 @@ function applyRobotStatus(payload) {
   }
   if (Number.isFinite(config.captureIntervalSeconds)) robotInterval.value = config.captureIntervalSeconds;
   if (typeof config.runHandEye === 'boolean') robotHandEye.value = config.runHandEye ? 'true' : 'false';
+  if (Number.isFinite(config.controllerTranslationScale)) robotMotionScale.value = config.controllerTranslationScale;
+  if (Number.isFinite(config.controllerMaxOffsetM)) robotMaxOffset.value = config.controllerMaxOffsetM;
+  if (Number.isFinite(config.controllerMaxStepM)) robotMaxStep.value = config.controllerMaxStepM;
   renderRobotStatus(payload);
 }
 
@@ -3722,12 +3837,17 @@ function renderRobotStatus(payload) {
   const robot = payload.robot || {};
   const lines = [
     `robot: ${robot.connected ? 'connected' : 'not connected'} ${robot.robotSn || ''}`.trim(),
+    `motion: ${robot.motionArmed ? 'ARMED' : 'disarmed'}`,
     `pose: ${robot.poseField || 'n/a'}`,
     `camera: ${payload.config?.cameraSerial || 'n/a'}`,
     `session: ${payload.activeSession ? `${payload.activeSession.samples || 0} samples, ${payload.activeSession.images || 0} images` : 'idle'}`
   ];
   if (state.robotSample) {
     lines.push(`last sample: ${state.robotSample.sampleIndex} quest ${state.robotSample.questSampleIndex}`);
+  }
+  if (state.robotMotion) {
+    const offset = Array.isArray(state.robotMotion.offsetM) ? state.robotMotion.offsetM.map(v => Number(v).toFixed(3)).join(', ') : (state.robotMotion.reason || state.robotMotion.error || 'n/a');
+    lines.push(`motion: ${state.robotMotion.ok ? 'sent' : 'skip'} ${offset}`);
   }
   if (state.robotCalibration) {
     lines.push(state.robotCalibration.type === 'robot_calibration_result' ? 'hand-eye: done' : `hand-eye: failed ${state.robotCalibration.error || ''}`);
@@ -3931,6 +4051,7 @@ function draw() {
   const frame = state.frames[state.frames.length - 1];
   if (frame) {
     if (showGaze.checked) drawGaze(frame);
+    drawRobotLive();
     drawPose(frame.leftEye, '#a8ff9a', 'leftEye', 0.045);
     drawPose(frame.rightEye, '#a8ff9a', 'rightEye', 0.045);
     drawPose(frame.head, '#f1ecd0', 'head', 0.070);
@@ -3942,6 +4063,19 @@ function draw() {
     statusEl.textContent = 'Waiting for UDP telemetry...';
   }
   requestAnimationFrame(draw);
+}
+
+function drawRobotLive() {
+  const pose = state.robotSample?.T_base_ee;
+  const matrix = pose?.matrix_4x4;
+  if (!matrix) return;
+  const worldMatrix = state.robotWorldBase ? multiplyMatrix4(state.robotWorldBase, matrix) : matrix;
+  const p = relPoint(matrixTranslation(worldMatrix));
+  if (!p) return;
+  drawPoint(p, '#ffffff', 6, 'EE');
+  drawLine(p, relPoint(matrixPoint(worldMatrix, 0.08, 0, 0)), '#ff4545', 2.3);
+  drawLine(p, relPoint(matrixPoint(worldMatrix, 0, 0.08, 0)), '#42e875', 2.3);
+  drawLine(p, relPoint(matrixPoint(worldMatrix, 0, 0, 0.08)), '#4b7cff', 2.3);
 }
 
 function updateStatus(frame) {
@@ -4185,6 +4319,30 @@ function boardPoint(m, x, y, z) {
   ];
 }
 
+function matrixPoint(m, x, y, z) {
+  return [
+    m[0][0] * x + m[0][1] * y + m[0][2] * z + m[0][3],
+    m[1][0] * x + m[1][1] * y + m[1][2] * z + m[1][3],
+    m[2][0] * x + m[2][1] * y + m[2][2] * z + m[2][3]
+  ];
+}
+
+function matrixTranslation(m) {
+  if (!Array.isArray(m) || m.length < 3) return null;
+  return [Number(m[0]?.[3]), Number(m[1]?.[3]), Number(m[2]?.[3])];
+}
+
+function multiplyMatrix4(a, b) {
+  const out = Array.from({length: 4}, () => [0, 0, 0, 0]);
+  for (let r = 0; r < 4; r++) {
+    for (let c = 0; c < 4; c++) {
+      out[r][c] = 0;
+      for (let k = 0; k < 4; k++) out[r][c] += Number(a[r]?.[k] || 0) * Number(b[k]?.[c] || 0);
+    }
+  }
+  return out;
+}
+
 function add(a, b) { return [a[0]+b[0], a[1]+b[1], a[2]+b[2]]; }
 function sub(a, b) { return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
 function length(a) { return Math.hypot(a[0], a[1], a[2]); }
@@ -4226,8 +4384,10 @@ clearButton.addEventListener('click', () => {
 });
 robotRefresh.addEventListener('click', refreshCameras);
 robotConnect.addEventListener('click', connectRobot);
+robotArmMotion.addEventListener('click', armRobotMotion);
+robotDisarmMotion.addEventListener('click', disarmRobotMotion);
 robotDisconnect.addEventListener('click', disconnectRobot);
-for (const input of [robotCamera, robotSn, robotPoseField, robotInterval, robotHandEye]) {
+for (const input of [robotCamera, robotSn, robotPoseField, robotInterval, robotHandEye, robotMotionScale, robotMaxOffset, robotMaxStep]) {
   input.addEventListener('change', configureRobot);
 }
 document.getElementById('records').addEventListener('click', () => {

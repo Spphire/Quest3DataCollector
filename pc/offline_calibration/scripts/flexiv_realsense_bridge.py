@@ -24,6 +24,9 @@ DEFAULT_CAPTURE_INTERVAL_SECONDS = 0.35
 DEFAULT_FLEXIV_RDK_ROOT: Path | None = None
 DEFAULT_FLEXIV_ROBOT_SN = "Rizon4-H6uDOq"
 DEFAULT_END_CAMERA_SERIAL = "244222073667"
+DEFAULT_CONTROLLER_TRANSLATION_SCALE = 1.0
+DEFAULT_CONTROLLER_MAX_OFFSET_M = 0.18
+DEFAULT_CONTROLLER_MAX_STEP_M = 0.015
 
 
 @dataclass
@@ -42,6 +45,10 @@ class FlexivRealSenseConfig:
     square_size_m: float = DEFAULT_SQUARE_SIZE_M
     run_hand_eye: bool = True
     min_hand_eye_detections: int = 6
+    controller_motion_enabled: bool = False
+    controller_translation_scale: float = DEFAULT_CONTROLLER_TRANSLATION_SCALE
+    controller_max_offset_m: float = DEFAULT_CONTROLLER_MAX_OFFSET_M
+    controller_max_step_m: float = DEFAULT_CONTROLLER_MAX_STEP_M
 
 
 class FlexivRobotClient:
@@ -51,6 +58,8 @@ class FlexivRobotClient:
         self.pose_field = "flange_pose"
         self.lock = threading.Lock()
         self.last_error: str | None = None
+        self.motion_armed = False
+        self.motion_last_target_pose: list[float] | None = None
 
     def connect(
         self,
@@ -77,6 +86,7 @@ class FlexivRobotClient:
             return self.read_state_locked()
 
     def disconnect(self) -> None:
+        self.disarm_motion_locked()
         self.robot = None
         self.robot_sn = None
 
@@ -88,6 +98,7 @@ class FlexivRobotClient:
                 "robotSn": self.robot_sn,
                 "poseField": self.pose_field,
                 "lastError": self.last_error,
+                "motionArmed": self.motion_armed,
             }
             if connected:
                 try:
@@ -139,6 +150,75 @@ class FlexivRobotClient:
             except Exception:
                 pass
         return payload
+
+    def read_tcp_pose(self) -> list[float]:
+        with self.lock:
+            if self.robot is None:
+                raise RuntimeError("Flexiv robot is not connected")
+            return [float(v) for v in self.robot.states().tcp_pose]
+
+    def arm_motion(self) -> dict[str, Any]:
+        with self.lock:
+            if self.robot is None:
+                raise RuntimeError("Flexiv robot is not connected")
+            flexivrdk = sys.modules.get("flexivrdk") or import_flexivrdk(None)
+            robot = self.robot
+            if robot.fault():
+                raise RuntimeError("Flexiv robot has fault; clear it before arming controller motion")
+            robot.Enable()
+            start = time.time()
+            while not robot.operational():
+                if time.time() - start > 5.0:
+                    raise RuntimeError("Timed out waiting for Flexiv robot to become operational")
+                time.sleep(0.05)
+            robot.SwitchMode(flexivrdk.Mode.NRT_CARTESIAN_MOTION_FORCE)
+            robot.SetForceControlAxis([False, False, False, False, False, False])
+            self.motion_armed = True
+            self.motion_last_target_pose = [float(v) for v in robot.states().tcp_pose]
+            return self.read_state_locked()
+
+    def disarm_motion(self) -> dict[str, Any]:
+        with self.lock:
+            self.disarm_motion_locked()
+            return self.status_unlocked()
+
+    def disarm_motion_locked(self) -> None:
+        if self.robot is not None and self.motion_armed:
+            try:
+                self.robot.Stop()
+            except Exception:
+                pass
+        self.motion_armed = False
+        self.motion_last_target_pose = None
+
+    def status_unlocked(self) -> dict[str, Any]:
+        connected = self.robot is not None
+        payload: dict[str, Any] = {
+            "connected": connected,
+            "robotSn": self.robot_sn,
+            "poseField": self.pose_field,
+            "lastError": self.last_error,
+            "motionArmed": self.motion_armed,
+        }
+        if connected:
+            try:
+                payload["state"] = self.read_state_locked()
+            except Exception as exc:
+                self.last_error = str(exc)
+                payload["lastError"] = self.last_error
+        return payload
+
+    def send_cartesian_target(self, target_pose_wxyz: list[float]) -> None:
+        with self.lock:
+            if self.robot is None:
+                raise RuntimeError("Flexiv robot is not connected")
+            if not self.motion_armed:
+                return
+            if len(target_pose_wxyz) < 7:
+                raise ValueError("target pose must be [x,y,z,qw,qx,qy,qz]")
+            target = [float(v) for v in target_pose_wxyz[:7]]
+            self.robot.SendCartesianMotionForce(target)
+            self.motion_last_target_pose = target
 
 
 class RealSenseColorCamera:
@@ -210,9 +290,11 @@ class RobotRealsenseSession:
         self.directory = self.root / "robot_realsense"
         self.image_dir = self.directory / "images"
         self.samples_path = self.directory / "samples.jsonl"
+        self.motion_path = self.directory / "controller_motion.jsonl"
         self.summary_path = self.directory / "session_summary.json"
         self.camera = RealSenseColorCamera()
         self.samples_handle: Any | None = None
+        self.motion_handle: Any | None = None
         self.lock = threading.Lock()
         self.next_capture_perf = 0.0
         self.sample_count = 0
@@ -221,11 +303,17 @@ class RobotRealsenseSession:
         self.closed = False
         self.last_error: str | None = None
         self.camera_metadata: dict[str, Any] | None = None
+        self.controller_anchor_world: np.ndarray | None = None
+        self.robot_anchor_tcp_pose: list[float] | None = None
+        self.motion_command_count = 0
+        self.motion_skip_count = 0
+        self.motion_error_count = 0
 
     def start(self) -> dict[str, Any]:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.image_dir.mkdir(parents=True, exist_ok=True)
         self.samples_handle = self.samples_path.open("a", encoding="utf-8", newline="\n")
+        self.motion_handle = self.motion_path.open("a", encoding="utf-8", newline="\n")
         config_payload = config_to_json(self.config)
         config_payload["recordId"] = self.record_id
         config_payload["startedAtUtc"] = datetime.now(timezone.utc).isoformat()
@@ -241,6 +329,34 @@ class RobotRealsenseSession:
         summary = self.summary("recording")
         self._publish({"type": "robot_status", "stage": "robot_realsense_recording", **summary})
         return summary
+
+    def update_controller_motion(self, quest_sample: dict[str, Any]) -> dict[str, Any] | None:
+        if not self.config.controller_motion_enabled:
+            return None
+        with self.lock:
+            if self.closed:
+                return None
+        try:
+            event = self._update_controller_motion_unlocked(quest_sample)
+        except Exception as exc:  # pragma: no cover - hardware path
+            self.motion_error_count += 1
+            event = {
+                "ok": False,
+                "record_id": self.record_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "quest_sample_index": quest_sample.get("sampleIndex"),
+                "error": str(exc),
+            }
+        with self.lock:
+            if self.motion_handle is not None:
+                self.motion_handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+                self.motion_handle.flush()
+        if event.get("ok"):
+            self.motion_command_count += 1
+        else:
+            self.motion_skip_count += 1
+        self._publish(robot_motion_event(event))
+        return event
 
     def record_sample(self, quest_sample: dict[str, Any]) -> dict[str, Any] | None:
         now_perf = time.perf_counter()
@@ -286,6 +402,9 @@ class RobotRealsenseSession:
             if self.samples_handle is not None:
                 self.samples_handle.close()
                 self.samples_handle = None
+            if self.motion_handle is not None:
+                self.motion_handle.close()
+                self.motion_handle = None
             summary = self.summary("closed")
             write_json(summary, self.summary_path)
             self._publish({"type": "robot_status", "stage": "robot_realsense_closed", **summary})
@@ -301,6 +420,9 @@ class RobotRealsenseSession:
             "samples": self.sample_count,
             "images": self.image_count,
             "errors": self.error_count,
+            "motionCommands": self.motion_command_count,
+            "motionSkips": self.motion_skip_count,
+            "motionErrors": self.motion_error_count,
             "lastError": self.last_error,
         }
 
@@ -331,6 +453,64 @@ class RobotRealsenseSession:
     def _publish(self, event: dict[str, Any]) -> None:
         if self.publish_event is not None:
             self.publish_event(event)
+
+    def _update_controller_motion_unlocked(self, quest_sample: dict[str, Any]) -> dict[str, Any]:
+        if not self.robot.motion_armed:
+            return {
+                "ok": False,
+                "reason": "motion_not_armed",
+                "record_id": self.record_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "quest_sample_index": quest_sample.get("sampleIndex"),
+            }
+        controller = quest_sample.get("rightController")
+        if not isinstance(controller, dict) or not controller.get("hasPose"):
+            return {
+                "ok": False,
+                "reason": "missing_right_controller",
+                "record_id": self.record_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "quest_sample_index": quest_sample.get("sampleIndex"),
+            }
+        position = vec3_array(controller.get("position"))
+        if position is None:
+            return {
+                "ok": False,
+                "reason": "missing_controller_position",
+                "record_id": self.record_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "quest_sample_index": quest_sample.get("sampleIndex"),
+            }
+        if self.controller_anchor_world is None or self.robot_anchor_tcp_pose is None:
+            self.controller_anchor_world = position
+            self.robot_anchor_tcp_pose = self.robot.read_tcp_pose()
+        raw_offset = (position - self.controller_anchor_world) * float(self.config.controller_translation_scale)
+        offset = clamp_vector_norm(raw_offset, float(self.config.controller_max_offset_m))
+        target = list(self.robot_anchor_tcp_pose)
+        target[:3] = [float(target[i] + offset[i]) for i in range(3)]
+        last = self.robot.motion_last_target_pose
+        if last is not None:
+            step = np.asarray(target[:3], dtype=float) - np.asarray(last[:3], dtype=float)
+            step = clamp_vector_norm(step, float(self.config.controller_max_step_m))
+            target[:3] = [float(last[i] + step[i]) for i in range(3)]
+        self.robot.send_cartesian_target(target)
+        return {
+            "ok": True,
+            "record_id": self.record_id,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "quest_sample_index": quest_sample.get("sampleIndex"),
+            "quest_recording_timestamp_seconds": quest_sample.get("recordingTimestampSeconds"),
+            "controller_position_world": [float(v) for v in position],
+            "controller_anchor_world": [float(v) for v in self.controller_anchor_world],
+            "raw_offset_m": [float(v) for v in raw_offset],
+            "offset_m": [float(v) for v in offset],
+            "target_tcp_pose_wxyz": target,
+            "limits": {
+                "scale": self.config.controller_translation_scale,
+                "maxOffsetM": self.config.controller_max_offset_m,
+                "maxStepM": self.config.controller_max_step_m,
+            },
+        }
 
 
 class FlexivRealSenseManager:
@@ -376,6 +556,14 @@ class FlexivRealSenseManager:
                 self.config.capture_interval_seconds = float(payload["captureIntervalSeconds"])
             if "runHandEye" in payload:
                 self.config.run_hand_eye = bool(payload["runHandEye"])
+            if "controllerMotionEnabled" in payload:
+                self.config.controller_motion_enabled = bool(payload["controllerMotionEnabled"])
+            if "controllerTranslationScale" in payload and is_number(payload["controllerTranslationScale"]):
+                self.config.controller_translation_scale = float(payload["controllerTranslationScale"])
+            if "controllerMaxOffsetM" in payload and is_number(payload["controllerMaxOffsetM"]):
+                self.config.controller_max_offset_m = float(payload["controllerMaxOffsetM"])
+            if "controllerMaxStepM" in payload and is_number(payload["controllerMaxStepM"]):
+                self.config.controller_max_step_m = float(payload["controllerMaxStepM"])
         return self.status()
 
     def connect_robot(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -396,6 +584,26 @@ class FlexivRealSenseManager:
     def disconnect_robot(self) -> dict[str, Any]:
         self.robot.disconnect()
         return self.status()
+
+    def arm_motion(self) -> dict[str, Any]:
+        try:
+            state = self.robot.arm_motion()
+            self.config.controller_motion_enabled = True
+            self.last_error = None
+            return {"ok": True, "state": state, "status": self.status()}
+        except Exception as exc:  # pragma: no cover - hardware path
+            self.last_error = str(exc)
+            return {"ok": False, "error": self.last_error, "status": self.status()}
+
+    def disarm_motion(self) -> dict[str, Any]:
+        try:
+            self.robot.disarm_motion()
+            self.config.controller_motion_enabled = False
+            self.last_error = None
+            return {"ok": True, "status": self.status()}
+        except Exception as exc:  # pragma: no cover - hardware path
+            self.last_error = str(exc)
+            return {"ok": False, "error": self.last_error, "status": self.status()}
 
     def list_cameras(self) -> dict[str, Any]:
         try:
@@ -440,6 +648,8 @@ class FlexivRealSenseManager:
         if session is None:
             return None
         summary = session.close()
+        self.robot.disarm_motion()
+        self.config.controller_motion_enabled = False
         with self.lock:
             if self.active_session is session:
                 self.active_session = None
@@ -812,6 +1022,19 @@ def robot_sample_event(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def robot_motion_event(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "robot_motion",
+        "ok": bool(row.get("ok")),
+        "recordId": row.get("record_id"),
+        "questSampleIndex": row.get("quest_sample_index"),
+        "targetTcpPose": row.get("target_tcp_pose_wxyz"),
+        "offsetM": row.get("offset_m"),
+        "reason": row.get("reason"),
+        "error": row.get("error"),
+    }
+
+
 def flexiv_pose_to_transform(pose: np.ndarray) -> np.ndarray:
     x, y, z, qw, qx, qy, qz = [float(v) for v in pose]
     rotation = quaternion_wxyz_to_matrix([qw, qx, qy, qz])
@@ -965,6 +1188,27 @@ def object_points(cols: int, rows: int, square_size_m: float) -> np.ndarray:
     return points
 
 
+def vec3_array(value: Any) -> np.ndarray | None:
+    if not isinstance(value, list) or len(value) < 3:
+        return None
+    try:
+        result = np.asarray([float(value[0]), float(value[1]), float(value[2])], dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if not np.all(np.isfinite(result)):
+        return None
+    return result
+
+
+def clamp_vector_norm(value: np.ndarray, max_norm: float) -> np.ndarray:
+    if max_norm <= 0:
+        return np.zeros(3, dtype=float)
+    norm = float(np.linalg.norm(value))
+    if not math.isfinite(norm) or norm <= max_norm:
+        return np.asarray(value, dtype=float)
+    return np.asarray(value, dtype=float) * (max_norm / norm)
+
+
 def observations_to_json(observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows = []
     for obs in observations:
@@ -1035,6 +1279,10 @@ def config_to_json(config: FlexivRealSenseConfig) -> dict[str, Any]:
         "squareSizeM": config.square_size_m,
         "runHandEye": config.run_hand_eye,
         "minHandEyeDetections": config.min_hand_eye_detections,
+        "controllerMotionEnabled": config.controller_motion_enabled,
+        "controllerTranslationScale": config.controller_translation_scale,
+        "controllerMaxOffsetM": config.controller_max_offset_m,
+        "controllerMaxStepM": config.controller_max_step_m,
     }
 
 

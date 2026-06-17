@@ -119,6 +119,9 @@ Useful options:
 - `--robot-capture-interval 0.35` controls how often robot/RealSense samples are taken during B-button calibration.
 - `--no-flexiv-realsense` hides/disables the robot bridge.
 - `--no-robot-hand-eye` records robot/RealSense data but skips the automatic hand-eye solve.
+- `--controller-motion-scale 1.0` scales right-controller displacement into TCP displacement.
+- `--controller-motion-max-offset 0.18` limits the TCP offset from the arm anchor.
+- `--controller-motion-max-step 0.015` limits each target update step.
 
 ### Web workflow
 
@@ -133,15 +136,17 @@ Then:
 1. Select the end-mounted RealSense camera in the `Flexiv / RealSense` panel.
 2. Enter the Flexiv robot SN.
 3. Click `Connect Robot`.
-4. Press Quest B once to start PC calibration capture.
-5. Move the Quest for Quest/checkerboard pose diversity.
-6. Move the robot/end camera for robot/checkerboard pose diversity.
-7. Press Quest B again to stop.
+4. Optional: click `Arm Motion` if the right controller should drive bounded TCP offsets.
+5. Press Quest B once to start PC calibration capture.
+6. Move the Quest for Quest/checkerboard pose diversity.
+7. Move the robot/end camera for robot/checkerboard pose diversity.
+8. Press Quest B again to stop. Stopping also disarms controller motion.
 
 The PC receiver writes:
 
 - Quest videos/frame metadata/trajectory under `raw/<recordId>/`.
 - Robot states, `jointpose`, `T_base_ee`, and RealSense images under `raw/<recordId>/robot_realsense/`.
+- Right-controller robot target commands under `raw/<recordId>/robot_realsense/controller_motion.jsonl` when `Arm Motion` is enabled.
 - Quest/checkerboard result under `outputs/pc_live_calibration/<recordId>/`.
 - Robot hand-eye result under `raw/<recordId>/robot_realsense/robot_hand_eye_result.json`.
 
@@ -157,7 +162,9 @@ This unifies Quest world, checkerboard, and robot base in the live/replay visual
 
 - `flexiv_realsense_bridge.py` is intentionally PC-only; Unity does not need to know about Flexiv or RealSense.
 - The bridge uses `flexivrdk.Robot(sn).states()` and records the configured `flange_pose` or `tcp_pose` as `[x, y, z, qw, qx, qy, qz]`.
+- Right-controller motion uses Flexiv RDK v1.7 non-real-time Cartesian motion-force mode with all force-control axes disabled. It holds TCP orientation and commands only bounded position offsets from the arm-time anchor.
 - RealSense intrinsics come from `pyrealsense2` color stream metadata.
 - The board is fixed at 11x8 inner corners, 25 mm square size.
 - Hand-eye calibration solves `T_ee_realsense` and `T_base_board` from repeated end-camera observations of the fixed board.
 - Replay keeps Quest axes and translates the view near the board origin; robot EE samples are drawn as white points with local RGB axes.
+- A Flexiv Rizon4 URDF asset is stored at `pc/offline_calibration/assets/urdf/flexiv_Rizon4_kinematics.urdf` and served by the live viewer at `/robot/urdf` for future model rendering.

@@ -28,3 +28,5 @@ Runtime artifacts are written under `pc/offline_calibration/pc_recordings/`, `pc
 The receiver includes an optional Flexiv/RealSense panel. Select the end-mounted RealSense camera, enter the robot serial number, click `Connect Robot`, then use Quest B to start/stop PC calibration capture.
 
 During B-button calibration, the PC records Quest frames/trajectory plus Flexiv robot state and RealSense images. After Quest/checkerboard calibration succeeds, it attempts the robot hand-eye solve and writes the result into the calibration record.
+
+Right-controller robot motion is opt-in. After connecting the robot, click `Arm Motion` to let right-controller displacement command bounded TCP offsets during B-button calibration. `Disarm` or stopping the calibration disables motion commands.
