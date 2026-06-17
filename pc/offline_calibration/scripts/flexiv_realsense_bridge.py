@@ -640,8 +640,9 @@ class FlexivRealSenseManager:
             "median": float(np.median(gray)),
             "p95": float(np.percentile(gray, 95)),
         }
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        image_path = output_dir / f"end_camera_board_check_{stamp}.jpg"
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        serial_name = safe_filename(self.config.camera_serial or "camera")
+        image_path = output_dir / f"end_camera_board_check_{serial_name}_{stamp}.jpg"
         save_rgb_jpeg(rgb, image_path)
         overlay_dir = output_dir / "overlays"
         overlay_dir.mkdir(parents=True, exist_ok=True)
@@ -809,6 +810,17 @@ def list_realsense_cameras() -> list[dict[str, Any]]:
             }
         )
     return cameras
+
+
+def safe_filename(value: str) -> str:
+    cleaned = []
+    for char in str(value):
+        if char.isalnum() or char in ("-", "_"):
+            cleaned.append(char)
+        else:
+            cleaned.append("_")
+    name = "".join(cleaned).strip("_")
+    return name or "camera"
 
 
 def camera_metadata_from_profile(profile: Any, serial: str) -> dict[str, Any]:
