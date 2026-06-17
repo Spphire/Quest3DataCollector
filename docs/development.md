@@ -234,6 +234,8 @@ $adb = "C:\Program Files\Unity\Hub\Editor\6000.0.60f1\Editor\Data\PlaybackEngine
 & $adb shell "printf calib_stop > /sdcard/Android/data/com.Apricity.EyeTrackingTest/files/record_command.txt"
 ```
 
+The live PC viewer also has a `Quest Trigger` panel. Its `Calib Start` / `Calib Stop` buttons are enabled only when the receiver host itself can see exactly one authorized Quest through adb. When the receiver runs on the remote Linux workstation and the Quest USB cable is attached to the Windows PC, the panel intentionally reports adb unavailable and shows the manual PowerShell commands above instead.
+
 Aliases are `calibration_start`, `start_calibration`, `calibration_stop`, `stop_calibration`, `calib_toggle`, `calibration_toggle`, and `toggle_calibration`.
 
 The PC receiver writes:

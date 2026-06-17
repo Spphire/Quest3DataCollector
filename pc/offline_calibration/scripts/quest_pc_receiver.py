@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
 import os
+import posixpath
 import queue
 import socket
 import subprocess
@@ -53,6 +54,7 @@ LATE_RECORDING_SAMPLE_GRACE_SECONDS = 5.0
 MAX_CALIBRATION_HTTP_BODY_BYTES = 8 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 ALLOWED_ARTIFACT_SUFFIXES = {".html", ".json", ".jpg", ".jpeg", ".png"}
+QUEST_RECORD_COMMAND_PATH = "/sdcard/Android/data/com.Apricity.EyeTrackingTest/files/record_command.txt"
 DEFAULT_ADB = Path(
     r"C:\Program Files\Unity\Hub\Editor\6000.0.60f1\Editor\Data\PlaybackEngines\AndroidPlayer\SDK\platform-tools\adb.exe"
 )
@@ -153,6 +155,15 @@ def main() -> int:
         "--no-open-browser",
         action="store_true",
         help="With --visualize, start the web server but do not open the browser automatically.",
+    )
+    receive_parser.add_argument(
+        "--viewer-adb",
+        type=Path,
+        default=DEFAULT_ADB if DEFAULT_ADB.exists() else Path("adb"),
+        help=(
+            "adb executable used by the live viewer debug buttons for Quest file commands. "
+            "Only works when the receiver host can see the Quest over adb."
+        ),
     )
     receive_parser.add_argument(
         "--record-live-preview",
@@ -587,12 +598,14 @@ class LiveTelemetryVisualizer:
         port: int,
         history_limit: int = 1200,
         robot_manager: FlexivRealSenseManager | None = None,
+        adb_path: Path | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.history_limit = max(1, history_limit)
         self.recording_root = DEFAULT_OUTPUT_ROOT.resolve()
         self.robot_manager = robot_manager
+        self.adb_path = adb_path
         self.history: list[dict[str, Any]] = []
         self.clients: list[queue.Queue[str | None]] = []
         self.lock = threading.Lock()
@@ -742,6 +755,28 @@ class LiveTelemetryVisualizer:
         self.publish_event({"type": "robot_status", "stage": "disarm_motion", **result})
         return result
 
+    def quest_adb_status_payload(self) -> dict[str, Any]:
+        return quest_adb_status(self.adb_path)
+
+    def quest_adb_calibration_command_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        command = str(payload.get("command") or "").strip().lower()
+        aliases = {
+            "start": "calib_start",
+            "calib_start": "calib_start",
+            "calibration_start": "calib_start",
+            "stop": "calib_stop",
+            "calib_stop": "calib_stop",
+            "calibration_stop": "calib_stop",
+            "toggle": "calib_toggle",
+            "calib_toggle": "calib_toggle",
+            "calibration_toggle": "calib_toggle",
+        }
+        if command not in aliases:
+            return {"ok": False, "error": f"unsupported calibration command: {command}"}
+        result = send_quest_record_command(self.adb_path, aliases[command])
+        self.publish_event({"type": "quest_adb_status", "stage": "calibration_command", **result})
+        return result
+
     def _make_server(self) -> ThreadingHTTPServer:
         visualizer = self
 
@@ -769,6 +804,9 @@ class LiveTelemetryVisualizer:
                     return
                 if parsed.path == "/calibration/latest":
                     self._send_json(latest_calibration_snapshot(DEFAULT_CALIBRATION_OUTPUT_ROOT))
+                    return
+                if parsed.path == "/quest/adb/status":
+                    self._send_json(visualizer.quest_adb_status_payload())
                     return
                 if parsed.path == "/robot/status":
                     self._send_json(visualizer.robot_status_payload())
@@ -828,6 +866,9 @@ class LiveTelemetryVisualizer:
                         return
                     if parsed.path == "/robot/disarm-motion":
                         self._send_json(visualizer.disarm_robot_motion_payload())
+                        return
+                    if parsed.path == "/quest/adb/calibration-command":
+                        self._send_json(visualizer.quest_adb_calibration_command_payload(payload))
                         return
                     self.send_error(404)
                 except Exception as exc:
@@ -1447,6 +1488,7 @@ def receive(args: argparse.Namespace) -> int:
             args.visualize_port,
             args.visualize_history,
             robot_manager,
+            args.viewer_adb,
         )
         visualizer.start(open_browser=not args.no_open_browser)
     calibration_receiver = None
@@ -1689,6 +1731,116 @@ def pull_quest_record(summary: dict[str, Any], args: argparse.Namespace) -> Path
         return destination
 
     return destination
+
+
+def quest_adb_status(adb_path: Path | None) -> dict[str, Any]:
+    examples = manual_quest_command_examples()
+    try:
+        adb = resolve_adb_executable(adb_path)
+    except FileNotFoundError as exc:
+        return {
+            "ok": False,
+            "ready": False,
+            "adb": str(adb_path or "adb"),
+            "error": str(exc),
+            "manualPowerShell": examples,
+            "commandPath": QUEST_RECORD_COMMAND_PATH,
+        }
+
+    result = subprocess.run([str(adb), "devices"], text=True, capture_output=True, timeout=8)
+    devices = parse_adb_devices(result.stdout)
+    ready_devices = [device for device in devices if device.get("state") == "device"]
+    ready = result.returncode == 0 and len(devices) == 1 and len(ready_devices) == 1
+    payload = {
+        "ok": ready,
+        "ready": ready,
+        "adb": str(adb),
+        "devices": devices,
+        "commandPath": QUEST_RECORD_COMMAND_PATH,
+        "manualPowerShell": examples,
+    }
+    if result.returncode != 0:
+        payload["error"] = (result.stderr or result.stdout or f"adb devices failed: {result.returncode}").strip()
+    elif not devices:
+        payload["error"] = "receiver host cannot see a Quest over adb"
+    elif devices and not ready_devices:
+        payload["error"] = "adb sees Quest but it is not authorized/online"
+    elif len(devices) > 1:
+        payload["error"] = "multiple adb devices visible; use a dedicated receiver host or manual command"
+    return payload
+
+
+def send_quest_record_command(adb_path: Path | None, command: str) -> dict[str, Any]:
+    status = quest_adb_status(adb_path)
+    if not status.get("ready"):
+        status["sent"] = False
+        return status
+    adb = Path(str(status["adb"]))
+    mkdir_cmd = f"mkdir -p {sh_quote(posixpath.dirname(QUEST_RECORD_COMMAND_PATH))}"
+    write_cmd = f"printf %s {sh_quote(command)} > {sh_quote(QUEST_RECORD_COMMAND_PATH)}"
+    result = subprocess.run(
+        [str(adb), "shell", f"{mkdir_cmd}; {write_cmd}"],
+        text=True,
+        capture_output=True,
+        timeout=8,
+    )
+    ok = result.returncode == 0
+    return {
+        **status,
+        "ok": ok,
+        "sent": ok,
+        "command": command,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+        "error": "" if ok else (result.stderr or result.stdout or f"adb shell failed: {result.returncode}").strip(),
+    }
+
+
+def resolve_adb_executable(adb_path: Path | None) -> Path:
+    candidate = adb_path or Path("adb")
+    if candidate.name != str(candidate):
+        if candidate.exists():
+            return candidate
+        raise FileNotFoundError(f"adb executable not found: {candidate}")
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        if not folder:
+            continue
+        path = Path(folder) / candidate
+        if path.exists():
+            return path
+        exe_path = Path(folder) / f"{candidate}.exe"
+        if exe_path.exists():
+            return exe_path
+    raise FileNotFoundError(f"adb executable not found on PATH: {candidate}")
+
+
+def parse_adb_devices(stdout: str) -> list[dict[str, str]]:
+    devices: list[dict[str, str]] = []
+    for line in stdout.splitlines()[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        devices.append({"serial": parts[0], "state": parts[1]})
+    return devices
+
+
+def sh_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def manual_quest_command_examples() -> dict[str, str]:
+    adb = str(DEFAULT_ADB)
+    path = QUEST_RECORD_COMMAND_PATH
+    prefix = f"& '{adb}' shell \"mkdir -p {posixpath.dirname(path)}; printf "
+    suffix = f" > {path}\""
+    return {
+        "calib_start": f"{prefix}calib_start{suffix}",
+        "calib_stop": f"{prefix}calib_stop{suffix}",
+        "calib_toggle": f"{prefix}calib_toggle{suffix}",
+    }
 
 
 def analyze(args: argparse.Namespace) -> int:
@@ -3639,6 +3791,32 @@ label {
   padding: 8px;
   background: #0e1216;
 }
+.quest-command-panel {
+  border-top: 1px solid var(--line);
+  margin-top: 12px;
+  padding-top: 12px;
+  display: grid;
+  gap: 8px;
+}
+.quest-command-status,
+.quest-command-manual {
+  white-space: pre-wrap;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+  background: #0e1216;
+}
+.quest-command-manual {
+  max-height: 170px;
+  overflow: auto;
+  color: #aeb8c1;
+}
+.quest-command-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
 .robot-board-preview img {
   display: block;
   width: 100%;
@@ -3799,6 +3977,17 @@ label {
       <div id="robotStatus" class="robot-status">disabled or loading</div>
       <div id="robotBoardPreview" class="robot-board-preview"></div>
     </div>
+    <div class="quest-command-panel">
+      <h1>Quest Trigger</h1>
+      <div class="sub">ADB file commands for calibration when Touch buttons are not available.</div>
+      <div class="quest-command-actions">
+        <button id="questAdbRefresh">Refresh ADB</button>
+        <button id="questCalibStart">Calib Start</button>
+        <button id="questCalibStop">Calib Stop</button>
+      </div>
+      <div id="questAdbStatus" class="quest-command-status">loading</div>
+      <div id="questAdbManual" class="quest-command-manual"></div>
+    </div>
     <div id="status"></div>
   </aside>
 </div>
@@ -3844,6 +4033,11 @@ const robotDisarmMotion = document.getElementById('robotDisarmMotion');
 const robotDisconnect = document.getElementById('robotDisconnect');
 const robotStatus = document.getElementById('robotStatus');
 const robotBoardPreview = document.getElementById('robotBoardPreview');
+const questAdbRefresh = document.getElementById('questAdbRefresh');
+const questCalibStart = document.getElementById('questCalibStart');
+const questCalibStop = document.getElementById('questCalibStop');
+const questAdbStatus = document.getElementById('questAdbStatus');
+const questAdbManual = document.getElementById('questAdbManual');
 
 const state = {
   frames: [],
@@ -3864,7 +4058,8 @@ const state = {
   robotBoardCheck: null,
   robotWorldBase: null,
   robotModel: null,
-  robotCalibration: null
+  robotCalibration: null,
+  questAdb: null
 };
 
 function resize() {
@@ -3936,6 +4131,8 @@ function connect() {
       updateRobotMotion(sample);
     } else if (sample.type === 'robot_calibration_result' || sample.type === 'robot_calibration_failure') {
       updateRobotCalibration(sample);
+    } else if (sample.type === 'quest_adb_status') {
+      renderQuestAdb(sample);
     }
   };
 }
@@ -3970,6 +4167,59 @@ async function loadRobotModel() {
   } catch (_) {
     state.robotModel = null;
   }
+}
+
+async function loadQuestAdbStatus() {
+  try {
+    const response = await fetch('/quest/adb/status', {cache: 'no-store'});
+    renderQuestAdb(await response.json());
+  } catch (error) {
+    renderQuestAdb({ok: false, ready: false, error: String(error)});
+  }
+}
+
+async function sendQuestCalibrationCommand(command) {
+  const button = command === 'calib_start' ? questCalibStart : questCalibStop;
+  button.disabled = true;
+  questAdbStatus.textContent = `sending ${command}...`;
+  try {
+    const response = await fetch('/quest/adb/calibration-command', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({command})
+    });
+    renderQuestAdb(await response.json());
+  } catch (error) {
+    renderQuestAdb({ok: false, ready: false, error: String(error)});
+  } finally {
+    button.disabled = !state.questAdb?.ready;
+  }
+}
+
+function renderQuestAdb(payload) {
+  state.questAdb = payload || {};
+  const devices = Array.isArray(payload?.devices) ? payload.devices : [];
+  const lines = [
+    `adb: ${payload?.ready ? 'ready' : 'unavailable'}`,
+    `host adb: ${payload?.adb || 'adb'}`,
+    `devices: ${devices.length ? devices.map(d => `${d.serial}:${d.state}`).join(', ') : 'none'}`,
+    `command file: ${payload?.commandPath || ''}`
+  ];
+  if (payload?.command) lines.push(`last command: ${payload.command} ${payload.sent ? 'sent' : 'not sent'}`);
+  if (payload?.stage) lines.push(`stage: ${payload.stage}`);
+  if (payload?.error) lines.push(`error: ${payload.error}`);
+  if (payload?.stderr) lines.push(`stderr: ${payload.stderr}`);
+  questAdbStatus.textContent = lines.join('\n');
+  const ready = Boolean(payload?.ready);
+  questCalibStart.disabled = !ready;
+  questCalibStop.disabled = !ready;
+  const manual = payload?.manualPowerShell || {};
+  const manualText = [
+    'Manual PowerShell when the Quest is connected to this Windows PC:',
+    manual.calib_start ? `START\n${manual.calib_start}` : '',
+    manual.calib_stop ? `STOP\n${manual.calib_stop}` : ''
+  ].filter(Boolean).join('\n\n');
+  questAdbManual.textContent = ready ? 'Remote receiver can see adb; buttons above are active.' : manualText;
 }
 
 async function loadLatestBoardCheck() {
@@ -4891,6 +5141,9 @@ robotConnect.addEventListener('click', connectRobot);
 robotArmMotion.addEventListener('click', armRobotMotion);
 robotDisarmMotion.addEventListener('click', disarmRobotMotion);
 robotDisconnect.addEventListener('click', disconnectRobot);
+questAdbRefresh.addEventListener('click', loadQuestAdbStatus);
+questCalibStart.addEventListener('click', () => sendQuestCalibrationCommand('calib_start'));
+questCalibStop.addEventListener('click', () => sendQuestCalibrationCommand('calib_stop'));
 for (const input of [robotCamera, robotSn, robotPoseField, robotNetworkInterfaces, robotInterval, robotHandEye, robotExposureMode, robotExposure, robotGain, robotBoardWarmup, robotMotionScale, robotMaxOffset, robotMaxStep]) {
   input.addEventListener('change', configureRobot);
 }
@@ -4905,6 +5158,7 @@ loadLatestCalibration();
 loadRobotStatus().then(refreshCameras);
 loadRobotModel();
 loadLatestBoardCheck();
+loadQuestAdbStatus();
 requestAnimationFrame(draw);
 </script>
 </body>
