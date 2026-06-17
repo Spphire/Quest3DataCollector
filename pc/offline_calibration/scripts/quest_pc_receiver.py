@@ -53,7 +53,7 @@ DEFAULT_RIZON4_URDF = WORKSPACE_ROOT / "assets" / "urdf" / "flexiv_Rizon4_kinema
 LATE_RECORDING_SAMPLE_GRACE_SECONDS = 5.0
 MAX_CALIBRATION_HTTP_BODY_BYTES = 8 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
-ALLOWED_ARTIFACT_SUFFIXES = {".html", ".json", ".jpg", ".jpeg", ".png"}
+ALLOWED_ARTIFACT_SUFFIXES = {".html", ".json", ".jsonl", ".log", ".jpg", ".jpeg", ".png"}
 QUEST_RECORD_COMMAND_PATH = "/sdcard/Android/data/com.Apricity.EyeTrackingTest/files/record_command.txt"
 DEFAULT_ADB = Path(
     r"C:\Program Files\Unity\Hub\Editor\6000.0.60f1\Editor\Data\PlaybackEngines\AndroidPlayer\SDK\platform-tools\adb.exe"
@@ -977,8 +977,10 @@ class LiveTelemetryVisualizer:
                     content_type = "image/png"
                 elif suffix == ".html":
                     content_type = "text/html; charset=utf-8"
-                elif suffix == ".json":
+                elif suffix in (".json", ".jsonl"):
                     content_type = "application/json; charset=utf-8"
+                elif suffix == ".log":
+                    content_type = "text/plain; charset=utf-8"
                 else:
                     content_type = "application/octet-stream"
                 data = path.read_bytes()
@@ -2826,6 +2828,7 @@ def build_recording_replay_payload(
     gaze_diagnostics = build_gaze_depth_diagnostics(raw_rows, snapshot)
     enrich_replay_samples_with_gaze_diagnostics(samples, gaze_diagnostics, board_origin_world)
     robot_realsense = build_robot_realsense_replay(session_dir, board_origin_world)
+    raw_artifacts = replay_raw_artifacts(session_dir, summary, resolved_source, calibration_output_root)
 
     return {
         "ok": True,
@@ -2840,8 +2843,75 @@ def build_recording_replay_payload(
         "boardMatrix": board_matrix_display,
         "gazeDepthDiagnostics": gaze_diagnostics.get("summary", {}),
         "robotRealSense": robot_realsense,
+        "rawArtifacts": raw_artifacts,
         "samples": samples,
     }
+
+
+def replay_raw_artifacts(
+    session_dir: Path,
+    summary: dict[str, Any],
+    source: str,
+    calibration_output_root: Path | None,
+) -> dict[str, Any]:
+    artifacts: dict[str, Any] = {}
+    if source == "raw":
+        for key, filename, label in (
+            ("metadata", "quest_camera_metadata.json", "Quest metadata"),
+            ("leftFrames", "left_frames.jsonl", "Left frame metadata"),
+            ("rightFrames", "right_frames.jsonl", "Right frame metadata"),
+            ("trajectory", "trajectory.jsonl", "Quest trajectory"),
+        ):
+            path = session_dir / filename
+            if path.exists():
+                artifacts[key] = artifact_payload(path, label)
+    output_dir = summary.get("outputDirectory")
+    output_paths: list[Path] = []
+    if isinstance(output_dir, str) and output_dir:
+        output_paths.append(Path(output_dir))
+    if source == "raw" and calibration_output_root is not None:
+        output_paths.append(calibration_output_root.resolve() / session_dir.name)
+    for root in output_paths:
+        if not root.exists():
+            continue
+        for key, filename in (
+            ("calibrationFailure", "calibration_failure_25mm.json"),
+            ("calibrationResult", "calibration_result_25mm.json"),
+            ("detectionSummary", "checkerboard_detection_summary_25mm.json"),
+            ("calibrationLog", "calibration_run.log"),
+        ):
+            path = root / filename
+            if path.exists() and key not in artifacts:
+                artifacts[key] = artifact_payload(path, artifact_label(key))
+    return artifacts
+
+
+def artifact_label(key: str) -> str:
+    return {
+        "calibrationFailure": "Quest calibration failure",
+        "calibrationResult": "Quest calibration result",
+        "detectionSummary": "Checkerboard detections",
+        "calibrationLog": "Calibration log",
+    }.get(key, key)
+
+
+def artifact_payload(path: Path, label: str | None = None) -> dict[str, Any]:
+    try:
+        resolved = resolve_artifact_path(str(path))
+        return {
+            "label": label or resolved.name,
+            "path": str(resolved),
+            "url": "/artifact?path=" + quote_path(str(resolved)),
+            "sizeBytes": resolved.stat().st_size,
+        }
+    except Exception as exc:
+        return {
+            "label": label or path.name,
+            "path": str(path),
+            "url": None,
+            "sizeBytes": path.stat().st_size if path.exists() else None,
+            "error": str(exc),
+        }
 
 
 def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict[str, Any] | None:
@@ -5775,6 +5845,16 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
 .scrub { width: 100%; }
 .kv { display: grid; grid-template-columns: 120px minmax(0,1fr); gap: 4px 8px; margin-top: 8px; }
 .kv span:nth-child(odd) { color: #8492a1; }
+.artifact-list { display: grid; gap: 5px; margin-top: 8px; }
+.artifact-link {
+  color: #a8d8ff;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+.artifact-missing {
+  color: #8492a1;
+  overflow-wrap: anywhere;
+}
 .ok { color: #9df09d; font-weight: 700; }
 .warn { color: #ffd18a; font-weight: 700; }
 .rec { color: #ff8c96; font-weight: 700; }
@@ -5834,6 +5914,7 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
     <div class="section">
       <div class="ok">Calibration snapshot</div>
       <div class="kv" id="snapKv"></div>
+      <div class="artifact-list" id="artifactList"></div>
     </div>
     <div class="section">
       <div class="ok">Gaze depth</div>
@@ -5868,6 +5949,7 @@ const timeLabel = document.getElementById('timeLabel');
 const sampleLabel = document.getElementById('sampleLabel');
 const recordingLabel = document.getElementById('recordingLabel');
 const snapKv = document.getElementById('snapKv');
+const artifactList = document.getElementById('artifactList');
 const depthKv = document.getElementById('depthKv');
 const robotKv = document.getElementById('robotKv');
 const sampleKv = document.getElementById('sampleKv');
@@ -6050,9 +6132,41 @@ function updateSnapshotInfo() {
     );
   }
   snapKv.innerHTML = kv.map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
+  updateArtifactLinks();
   updateDepthInfo();
   updateRobotInfo();
   recordSub.textContent = `${state.data.samples.length} samples`;
+}
+
+function updateArtifactLinks() {
+  const artifacts = state.data?.rawArtifacts || {};
+  const order = [
+    'metadata',
+    'trajectory',
+    'leftFrames',
+    'rightFrames',
+    'calibrationFailure',
+    'calibrationResult',
+    'detectionSummary',
+    'calibrationLog'
+  ];
+  const keys = order.filter(key => artifacts[key]).concat(
+    Object.keys(artifacts).filter(key => !order.includes(key)).sort()
+  );
+  if (!keys.length) {
+    artifactList.innerHTML = '<div class="artifact-missing">No raw artifacts linked.</div>';
+    return;
+  }
+  artifactList.innerHTML = keys.map(key => {
+    const item = artifacts[key] || {};
+    const label = item.label || key;
+    const size = Number.isFinite(item.sizeBytes) ? ` (${formatBytes(item.sizeBytes)})` : '';
+    if (item.url) {
+      return `<a class="artifact-link" href="${escapeHtml(item.url)}" target="_blank">${escapeHtml(label + size)}</a>`;
+    }
+    const reason = item.error ? ` - ${item.error}` : '';
+    return `<div class="artifact-missing">${escapeHtml(label + size + reason)}</div>`;
+  }).join('');
 }
 
 function calibrationDetectionText(failure) {
@@ -6066,6 +6180,14 @@ function calibrationDetectionText(failure) {
     const frames = row.video_frame_count ?? row.frame_metadata_count ?? 'n/a';
     return `${side} ${detections}/${frames}`;
   }).join(', ');
+}
+
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes)) return 'n/a';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function updateDepthInfo() {
