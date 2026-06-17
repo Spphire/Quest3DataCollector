@@ -1238,6 +1238,7 @@ def compact_robot_result(result: dict[str, Any]) -> dict[str, Any]:
         "ok": result.get("ok"),
         "recordId": result.get("record_id"),
         "counts": result.get("counts"),
+        "diversity": result.get("diversity"),
         "endCamera": result.get("end_camera"),
         "board": result.get("board"),
         "questAlignment": result.get("questAlignment"),

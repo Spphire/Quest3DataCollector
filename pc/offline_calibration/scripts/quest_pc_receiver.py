@@ -4236,6 +4236,8 @@ function renderRobotStatus(payload) {
   }
   if (state.robotCalibration) {
     lines.push(state.robotCalibration.type === 'robot_calibration_result' ? 'hand-eye: done' : `hand-eye: failed ${state.robotCalibration.error || ''}`);
+    const resultDiversity = state.robotCalibration.result?.diversity;
+    if (resultDiversity) lines.push(`hand-eye result motion: ${poseDiversityText(resultDiversity)}`);
   }
   if (robot.lastError || payload.lastError) lines.push(`error: ${robot.lastError || payload.lastError}`);
   robotStatus.textContent = lines.join('\n');
