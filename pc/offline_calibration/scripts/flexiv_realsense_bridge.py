@@ -248,6 +248,7 @@ class RealSenseColorCamera:
         config.enable_device(serial)
         config.enable_stream(rs.stream.color, int(width), int(height), rs.format.rgb8, int(fps))
         profile = pipeline.start(config)
+        configure_color_sensor(profile)
         self.pipeline = pipeline
         self.profile = profile
         self.serial = serial
@@ -631,7 +632,7 @@ class FlexivRealSenseManager:
                 self.config.height,
                 self.config.fps,
             )
-            rgb = camera.capture_rgb(self.config.warmup_frames)
+            rgb = camera.capture_rgb(max(self.config.warmup_frames, 60))
         finally:
             camera.stop()
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
@@ -810,6 +811,27 @@ def list_realsense_cameras() -> list[dict[str, Any]]:
             }
         )
     return cameras
+
+
+def configure_color_sensor(profile: Any) -> None:
+    import pyrealsense2 as rs  # type: ignore[import-not-found]
+
+    try:
+        device = profile.get_device()
+    except Exception:
+        return
+    for sensor in device.query_sensors():
+        try:
+            name = sensor.get_info(rs.camera_info.name) if sensor.supports(rs.camera_info.name) else ""
+        except Exception:
+            name = ""
+        if "RGB" not in name and "Color" not in name:
+            continue
+        if sensor.supports(rs.option.enable_auto_exposure):
+            try:
+                sensor.set_option(rs.option.enable_auto_exposure, 1)
+            except Exception:
+                pass
 
 
 def safe_filename(value: str) -> str:
