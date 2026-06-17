@@ -220,6 +220,22 @@ Then:
 8. Move the robot/end camera for robot/checkerboard pose diversity while keeping the checkerboard visible to the end-mounted RealSense in at least six captured samples.
 9. Press Quest B again to stop. Stopping also disarms controller motion.
 
+If Touch controllers are not connected and the Quest only reports hand tracking, B/A hotkeys will not fire. For hardware/debug smoke tests, the Unity `QuestCameraRecorderCommandBridge` also accepts file commands through:
+
+```text
+/sdcard/Android/data/com.Apricity.EyeTrackingTest/files/record_command.txt
+```
+
+Use adb to trigger the same PC calibration recorder without a controller button:
+
+```powershell
+$adb = "C:\Program Files\Unity\Hub\Editor\6000.0.60f1\Editor\Data\PlaybackEngines\AndroidPlayer\SDK\platform-tools\adb.exe"
+& $adb shell "printf calib_start > /sdcard/Android/data/com.Apricity.EyeTrackingTest/files/record_command.txt"
+& $adb shell "printf calib_stop > /sdcard/Android/data/com.Apricity.EyeTrackingTest/files/record_command.txt"
+```
+
+Aliases are `calibration_start`, `start_calibration`, `calibration_stop`, `stop_calibration`, `calib_toggle`, `calibration_toggle`, and `toggle_calibration`.
+
 The PC receiver writes:
 
 - Quest videos/frame metadata/trajectory under `raw/<recordId>/`.
@@ -246,3 +262,14 @@ This unifies Quest world, checkerboard, and robot base in the live/replay visual
 - Hand-eye calibration solves `T_ee_realsense` and `T_base_board` from repeated end-camera observations of the fixed board.
 - Replay keeps Quest axes and translates the view near the board origin; robot EE samples are drawn as white points with local RGB axes.
 - A Flexiv Rizon4 URDF asset is stored at `pc/offline_calibration/assets/urdf/flexiv_Rizon4_kinematics.urdf` and served by the live viewer at `/robot/urdf` for future model rendering.
+
+### 2026-06-18 smoke result
+
+The adb file-command smoke run `record_pc_calib_20260618_031939` proved the transport path:
+
+- Unity accepted `calib_start` and `calib_stop`.
+- PC raw record wrote 28 left frames, 28 right frames, and 28 trajectory samples.
+- Robot/RealSense wrote 28 Flexiv state samples and 28 end-camera images under `robot_realsense/`.
+- Flexiv stayed connected to `Rizon4-062713`; the end camera was `750612070265`.
+- Quest/checkerboard calibration failed because the Quest frames had zero checkerboard detections. This is expected for a smoke run without aiming/moving the Quest at the board, and does not indicate a receiver/Flexiv/RealSense transport failure.
+- Robot pose diversity was near zero because controller motion was not armed and the arm was not moved. A real hand-eye run must move the end camera enough to exceed the UI diversity gate.
