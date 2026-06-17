@@ -64,6 +64,7 @@ def main() -> int:
         "probe": probe_hosts(hosts, ports),
         "robotConnection": robot_connection_info(args.robot_sn, args.network_interfaces),
     }
+    result["interpretation"] = interpret_result(result)
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
@@ -233,6 +234,16 @@ def print_human(result: dict[str, Any]) -> None:
             print(f"    tcpPose={connection.get('tcpPose')}")
         else:
             print(f"    error={connection.get('error')}")
+    interpretation = result.get("interpretation") or {}
+    if interpretation:
+        print("  interpretation:")
+        for line in interpretation.get("summary") or []:
+            print(f"    {line}")
+        next_steps = interpretation.get("nextSteps") or []
+        if next_steps:
+            print("  next steps:")
+            for line in next_steps:
+                print(f"    {line}")
 
 
 def indent(text: str, prefix: str) -> str:
@@ -251,6 +262,76 @@ def normalize_network_interfaces(value: Any) -> list[str]:
     else:
         return []
     return [str(item).strip() for item in items if str(item).strip()]
+
+
+def interpret_result(result: dict[str, Any]) -> dict[str, Any]:
+    summary: list[str] = []
+    next_steps: list[str] = []
+    severity = "ok"
+
+    flexiv = result.get("flexivrdk") or {}
+    if flexiv.get("ok"):
+        version = flexiv.get("version") or "unknown"
+        summary.append(f"Flexiv RDK import OK: {version}.")
+    else:
+        severity = "error"
+        summary.append(f"Flexiv RDK import failed: {flexiv.get('error')}")
+        next_steps.append("Install the RDK package that matches Flexiv Elements robot software.")
+
+    system = (result.get("elements") or {}).get("systemVersion") or {}
+    versions = system.get("software_version") if isinstance(system, dict) else {}
+    robot_version = versions.get("RobotControlApp") if isinstance(versions, dict) else None
+    if robot_version:
+        summary.append(f"Elements RobotControlApp: {robot_version}.")
+
+    probes = result.get("probe") or []
+    reachable = [row for row in probes if row.get("ping") or row.get("openPorts")]
+    if reachable:
+        first = reachable[0]
+        summary.append(
+            f"Robot network peer reachable: {first.get('host')} open={first.get('openPorts') or []}."
+        )
+    else:
+        severity = "error"
+        summary.append("No robot network peer responded to ping or port probes.")
+        next_steps.append("Check the Ethernet cable, robot network IP, and the PC interface on the 192.168.2.0/24 network.")
+
+    connection = result.get("robotConnection")
+    if connection is not None:
+        if connection.get("ok"):
+            summary.append("RDK Robot connection OK.")
+        else:
+            severity = "error"
+            error = str(connection.get("error") or "")
+            if "All whitelist interfaces were filtered out" in error:
+                summary.append("RDK rejected the interface whitelist.")
+                next_steps.append("Use the local IPv4 address, for example 192.168.2.108, not an interface name or CIDR.")
+            else:
+                summary.append("RDK Robot connection failed at discovery.")
+                next_steps.append("In Flexiv Elements, enable Remote mode for RDK and select Ethernet.")
+                next_steps.append("Put the robot into Auto(Remote), not Manual.")
+                next_steps.append("Disable the host firewall or whitelist the RDK Python process on the robot network.")
+
+    realsense = result.get("realsense") or {}
+    if not realsense.get("ok"):
+        severity = "warning" if severity == "ok" else severity
+        summary.append(f"RealSense enumeration failed: {realsense.get('error')}")
+    elif not realsense.get("cameras"):
+        severity = "warning" if severity == "ok" else severity
+        summary.append("No RealSense cameras detected.")
+
+    return {"severity": severity, "summary": summary, "nextSteps": dedupe(next_steps)}
+
+
+def dedupe(items: list[str]) -> list[str]:
+    seen = set()
+    output = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        output.append(item)
+    return output
 
 
 if __name__ == "__main__":

@@ -30,6 +30,9 @@ from flexiv_realsense_bridge import (
     FlexivRealSenseManager,
     RobotRealsenseSession,
 )
+from flexiv_realsense_diagnostics import DEFAULT_PORTS as DEFAULT_ROBOT_DIAGNOSTIC_PORTS
+from flexiv_realsense_diagnostics import DEFAULT_ROBOT_HOSTS, elements_info, flexivrdk_info, interpret_result, network_info
+from flexiv_realsense_diagnostics import probe_hosts, realsense_info, robot_connection_info
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
@@ -634,6 +637,29 @@ class LiveTelemetryVisualizer:
             return {"ok": False, "enabled": False, "reason": "disabled", "cameras": []}
         return self.robot_manager.list_cameras()
 
+    def robot_diagnostics_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.robot_manager is None:
+            return {"ok": False, "enabled": False, "reason": "disabled"}
+        self.robot_manager.configure(payload)
+        config = self.robot_manager.config
+        robot_sn = str(payload.get("robotSn") or config.robot_sn or "").strip()
+        interfaces = config.flexiv_network_interfaces
+        result: dict[str, Any] = {
+            "ok": True,
+            "enabled": True,
+            "timestampUnixSeconds": time.time(),
+            "config": self.robot_manager.status().get("config"),
+            "flexivrdk": flexivrdk_info(),
+            "realsense": realsense_info(),
+            "network": network_info(),
+            "elements": elements_info(Path("/ssd1/mzc/FlexivElementsStudio")),
+            "probe": probe_hosts(DEFAULT_ROBOT_HOSTS, DEFAULT_ROBOT_DIAGNOSTIC_PORTS),
+            "robotConnection": robot_connection_info(robot_sn, interfaces),
+        }
+        result["interpretation"] = interpret_result(result)
+        self.publish_event({"type": "robot_status", "stage": "diagnostics", "diagnostics": result})
+        return result
+
     def configure_robot_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.robot_manager is None:
             return {"ok": False, "enabled": False, "reason": "disabled"}
@@ -700,6 +726,9 @@ class LiveTelemetryVisualizer:
                 if parsed.path == "/robot/status":
                     self._send_json(visualizer.robot_status_payload())
                     return
+                if parsed.path == "/robot/diagnostics":
+                    self._send_json(visualizer.robot_diagnostics_payload({}))
+                    return
                 if parsed.path == "/cameras/list":
                     self._send_json(visualizer.camera_list_payload())
                     return
@@ -734,6 +763,9 @@ class LiveTelemetryVisualizer:
                         return
                     if parsed.path == "/robot/connect":
                         self._send_json(visualizer.connect_robot_payload(payload))
+                        return
+                    if parsed.path == "/robot/diagnostics":
+                        self._send_json(visualizer.robot_diagnostics_payload(payload))
                         return
                     if parsed.path == "/robot/disconnect":
                         self._send_json(visualizer.disconnect_robot_payload())
@@ -3616,6 +3648,7 @@ label {
       </label>
       <div class="robot-actions">
         <button id="robotRefresh">Refresh Cameras</button>
+        <button id="robotDiagnostics">Diagnostics</button>
         <button id="robotConnect">Connect Robot</button>
         <button id="robotArmMotion">Arm Motion</button>
         <button id="robotDisarmMotion">Disarm</button>
@@ -3656,6 +3689,7 @@ const robotMotionScale = document.getElementById('robotMotionScale');
 const robotMaxOffset = document.getElementById('robotMaxOffset');
 const robotMaxStep = document.getElementById('robotMaxStep');
 const robotRefresh = document.getElementById('robotRefresh');
+const robotDiagnostics = document.getElementById('robotDiagnostics');
 const robotConnect = document.getElementById('robotConnect');
 const robotArmMotion = document.getElementById('robotArmMotion');
 const robotDisarmMotion = document.getElementById('robotDisarmMotion');
@@ -3677,6 +3711,7 @@ const state = {
   robot: null,
   robotSample: null,
   robotMotion: null,
+  robotDiagnostics: null,
   robotWorldBase: null,
   robotModel: null,
   robotCalibration: null
@@ -3850,6 +3885,26 @@ async function connectRobot() {
   }
 }
 
+async function runRobotDiagnostics() {
+  await configureRobot();
+  robotDiagnostics.disabled = true;
+  robotStatus.textContent = 'running diagnostics...';
+  try {
+    const response = await fetch('/robot/diagnostics', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(robotPayloadFromControls())
+    });
+    const payload = await response.json();
+    state.robotDiagnostics = payload;
+    renderRobotDiagnostics(payload);
+  } catch (error) {
+    robotStatus.textContent = String(error);
+  } finally {
+    robotDiagnostics.disabled = false;
+  }
+}
+
 async function disconnectRobot() {
   const response = await fetch('/robot/disconnect', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
   applyRobotStatus(await response.json());
@@ -3878,6 +3933,11 @@ async function disarmRobotMotion() {
 }
 
 function updateRobotEvent(event) {
+  if (event.diagnostics) {
+    state.robotDiagnostics = event.diagnostics;
+    renderRobotDiagnostics(event.diagnostics);
+    return;
+  }
   if (event.status) applyRobotStatus(event.status);
   else renderRobotStatus(event);
 }
@@ -3953,6 +4013,28 @@ function renderRobotStatus(payload) {
     lines.push(state.robotCalibration.type === 'robot_calibration_result' ? 'hand-eye: done' : `hand-eye: failed ${state.robotCalibration.error || ''}`);
   }
   if (robot.lastError || payload.lastError) lines.push(`error: ${robot.lastError || payload.lastError}`);
+  robotStatus.textContent = lines.join('\n');
+}
+
+function renderRobotDiagnostics(payload) {
+  const lines = ['diagnostics'];
+  const interp = payload?.interpretation || {};
+  for (const line of interp.summary || []) lines.push(`- ${line}`);
+  if (Array.isArray(interp.nextSteps) && interp.nextSteps.length) {
+    lines.push('next:');
+    for (const line of interp.nextSteps) lines.push(`- ${line}`);
+  }
+  const probes = payload?.probe || [];
+  for (const row of probes) {
+    if (row.host === '192.168.2.100' || row.ping || (row.openPorts || []).length) {
+      lines.push(`probe ${row.host}: ping=${row.ping} open=${(row.openPorts || []).join(',') || 'none'}`);
+    }
+  }
+  const conn = payload?.robotConnection;
+  if (conn) {
+    lines.push(`rdk: ${conn.ok ? 'ok' : 'failed'} sn=${conn.robotSn || ''} iface=${(conn.networkInterfaces || []).join(',') || 'default'}`);
+    if (conn.error) lines.push(`rdk error: ${conn.error}`);
+  }
   robotStatus.textContent = lines.join('\n');
 }
 
@@ -4546,6 +4628,7 @@ clearButton.addEventListener('click', () => {
   state.frames = state.frames.slice(-1);
 });
 robotRefresh.addEventListener('click', refreshCameras);
+robotDiagnostics.addEventListener('click', runRobotDiagnostics);
 robotConnect.addEventListener('click', connectRobot);
 robotArmMotion.addEventListener('click', armRobotMotion);
 robotDisarmMotion.addEventListener('click', disarmRobotMotion);
