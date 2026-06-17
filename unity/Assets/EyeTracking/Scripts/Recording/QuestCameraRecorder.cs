@@ -39,6 +39,7 @@ namespace EyeTracking.Recording
 
         [Header("Realtime Telemetry")]
         [SerializeField] private QuestRecordingTelemetrySender telemetrySender;
+        [SerializeField] private bool sendLiveTelemetryBeforeCameraReady = true;
 
         [Header("HMD Eye Pose Telemetry")]
         [SerializeField] private bool recordHmdEyePoses = true;
@@ -70,11 +71,13 @@ namespace EyeTracking.Recording
         private FrameMetadata latestRightFrame;
         private bool hasLatestLeftFrame;
         private bool hasLatestRightFrame;
+        private float nextCameraWaitLogTime;
         private StreamWriter leftFrameWriter;
         private StreamWriter rightFrameWriter;
         private StreamWriter trajectoryWriter;
         private readonly RecordMetadata metadata = new();
         private OVRCameraRig cachedCameraRig;
+        private Coroutine liveTelemetryCoroutine;
 
         public bool IsReady => isReady;
         public bool IsRecording => isRecording;
@@ -95,6 +98,14 @@ namespace EyeTracking.Recording
         public int LeftTextureHeight => leftTextureHeight;
         public int RightTextureWidth => rightTextureWidth;
         public int RightTextureHeight => rightTextureHeight;
+
+        private void OnEnable()
+        {
+            if (liveTelemetryCoroutine == null)
+            {
+                liveTelemetryCoroutine = StartCoroutine(LiveTelemetryLoop());
+            }
+        }
 
         private IEnumerator Start()
         {
@@ -226,7 +237,8 @@ namespace EyeTracking.Recording
             }
             else
             {
-                SendLiveTelemetrySample();
+                // Live telemetry is sent from LiveTelemetryLoop, which keeps running even
+                // if the camera-initialization coroutine is waiting for passthrough access.
             }
         }
 
@@ -445,7 +457,7 @@ namespace EyeTracking.Recording
             });
         }
 
-        private static IEnumerator WaitForCamera(
+        private IEnumerator WaitForCamera(
             PassthroughCameraAccess cameraAccess,
             string label,
             Action<bool> onComplete)
@@ -459,6 +471,17 @@ namespace EyeTracking.Recording
 
             while (!cameraAccess.IsPlaying)
             {
+                if (Time.unscaledTime >= nextCameraWaitLogTime)
+                {
+                    nextCameraWaitLogTime = Time.unscaledTime + 3f;
+                    Vector2Int resolution = cameraAccess.CurrentResolution;
+                    Debug.Log(
+                        $"[QuestCameraRecorder] Waiting for {label} PassthroughCameraAccess. " +
+                        $"enabled={cameraAccess.enabled} active={cameraAccess.gameObject.activeInHierarchy} " +
+                        $"isPlaying={cameraAccess.IsPlaying} resolution={resolution.x}x{resolution.y}",
+                        this);
+                }
+
                 yield return null;
             }
 
@@ -531,9 +554,14 @@ namespace EyeTracking.Recording
             return sample;
         }
 
-        private void SendLiveTelemetrySample()
+        private void SendLiveTelemetrySample(bool requireCameraReady)
         {
-            if (!isReady)
+            if (requireCameraReady && !isReady)
+            {
+                return;
+            }
+
+            if (!sendLiveTelemetryBeforeCameraReady && !isReady)
             {
                 return;
             }
@@ -549,8 +577,21 @@ namespace EyeTracking.Recording
                 liveSampleIndex++,
                 _ => 0.0,
                 false,
-                "live_preview");
+                isReady ? "live_preview" : "live_preview_waiting_camera");
             telemetrySender.SendSample(sample);
+        }
+
+        private IEnumerator LiveTelemetryLoop()
+        {
+            while (enabled)
+            {
+                if (!isRecording)
+                {
+                    SendLiveTelemetrySample(requireCameraReady: false);
+                }
+
+                yield return null;
+            }
         }
 
         private TrajectorySample BuildTrajectorySample(
@@ -570,10 +611,8 @@ namespace EyeTracking.Recording
                 eyeGazePose = FindFirstObjectByType<EyeGazePose>();
             }
 
-            bool hasLeftPose = leftCameraAccess != null;
-            Pose leftPose = hasLeftPose ? leftCameraAccess.GetCameraPose() : default;
-            bool hasRightPose = rightCameraAccess != null;
-            Pose rightPose = hasRightPose ? rightCameraAccess.GetCameraPose() : default;
+            bool hasLeftPose = TryGetCameraPose(leftCameraAccess, out Pose leftPose);
+            bool hasRightPose = TryGetCameraPose(rightCameraAccess, out Pose rightPose);
             Pose leftEyePose = default;
             Pose rightEyePose = default;
             string leftEyePoseSource = null;
@@ -668,6 +707,18 @@ namespace EyeTracking.Recording
             }
 
             return sample;
+        }
+
+        private static bool TryGetCameraPose(PassthroughCameraAccess cameraAccess, out Pose pose)
+        {
+            pose = default;
+            if (cameraAccess == null || !cameraAccess.IsPlaying)
+            {
+                return false;
+            }
+
+            pose = cameraAccess.GetCameraPose();
+            return true;
         }
 
         private void ResolveTelemetrySender()
@@ -1162,6 +1213,12 @@ namespace EyeTracking.Recording
 
         private void OnDisable()
         {
+            if (liveTelemetryCoroutine != null)
+            {
+                StopCoroutine(liveTelemetryCoroutine);
+                liveTelemetryCoroutine = null;
+            }
+
             if (isRecording)
             {
                 StopRecording();
