@@ -31,6 +31,21 @@ DEFAULT_CONTROLLER_MAX_OFFSET_M = 0.18
 DEFAULT_CONTROLLER_MAX_STEP_M = 0.015
 
 
+class RobotHandEyeCalibrationError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        counts: dict[str, Any] | None = None,
+        diversity: dict[str, Any] | None = None,
+        observations: list[dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.counts = counts or {}
+        self.diversity = diversity
+        self.observations = observations
+
+
 @dataclass
 class FlexivRealSenseConfig:
     robot_sn: str = DEFAULT_FLEXIV_ROBOT_SN
@@ -811,12 +826,18 @@ class FlexivRealSenseManager:
                 publish_event(event)
             return result
         except Exception as exc:
+            counts = exc.counts if isinstance(exc, RobotHandEyeCalibrationError) else None
+            diversity = exc.diversity if isinstance(exc, RobotHandEyeCalibrationError) else None
+            observations = exc.observations if isinstance(exc, RobotHandEyeCalibrationError) else None
             failure = {
                 "type": "robot_calibration_failure",
                 "ok": False,
                 "runDir": str(session_dir),
                 "error": str(exc),
                 "createdAtUtc": datetime.now(timezone.utc).isoformat(),
+                "counts": counts,
+                "diversity": diversity,
+                "observations": observations_to_json(observations) if observations is not None else None,
             }
             write_json(failure, session_dir / "robot_hand_eye_failure.json")
             self.last_calibration = failure
@@ -1003,11 +1024,28 @@ def calibrate_robot_realsense_run(
         if obs is not None:
             observations.append(obs)
 
+    counts = {
+        "samples": len(samples),
+        "detections": len(observations),
+        "requiredDetections": int(min_detections),
+    }
     if len(observations) < int(min_detections):
-        raise ValueError(f"Need at least {min_detections} valid end-camera detections, got {len(observations)}")
+        raise RobotHandEyeCalibrationError(
+            f"Need at least {min_detections} valid end-camera detections, got {len(observations)}",
+            counts=counts,
+            observations=observations,
+        )
 
     diversity = observation_pose_diversity(observations)
-    require_hand_eye_pose_diversity(diversity)
+    try:
+        require_hand_eye_pose_diversity(diversity)
+    except ValueError as exc:
+        raise RobotHandEyeCalibrationError(
+            str(exc),
+            counts=counts,
+            diversity=diversity,
+            observations=observations,
+        ) from exc
     solution = solve_end_hand_eye(observations)
     result = {
         "ok": True,
@@ -1017,11 +1055,7 @@ def calibrate_robot_realsense_run(
         "description": "Flexiv end-mounted RealSense hand-eye calibration. T_A_B maps coordinates from B into A.",
         "pattern": {"cols": cols, "rows": rows, "square_size_m": square_size_m},
         "camera": camera,
-        "counts": {
-            "samples": len(samples),
-            "detections": len(observations),
-            "rot180_selected": int(sum(obs["selected"] == 1 for obs in observations)),
-        },
+        "counts": {**counts, "rot180_selected": int(sum(obs["selected"] == 1 for obs in observations))},
         "diversity": diversity,
         "end_camera": {
             "T_ee_realsense": transform_to_json(solution["T_ee_camera"]),

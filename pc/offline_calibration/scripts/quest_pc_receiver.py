@@ -2611,8 +2611,15 @@ def robot_realsense_record_summary(session_dir: Path) -> dict[str, Any] | None:
         status = "failed"
     elif session:
         status = "recorded"
-    counts = result.get("counts") if isinstance(result, dict) else {}
-    diversity = result.get("diversity") if isinstance(result, dict) else session.get("poseDiversity")
+    if isinstance(result, dict):
+        counts = result.get("counts")
+        diversity = result.get("diversity")
+    elif isinstance(failure, dict):
+        counts = failure.get("counts")
+        diversity = failure.get("diversity")
+    else:
+        counts = {}
+        diversity = session.get("poseDiversity")
     residual = None
     if isinstance(result, dict):
         residual = (
