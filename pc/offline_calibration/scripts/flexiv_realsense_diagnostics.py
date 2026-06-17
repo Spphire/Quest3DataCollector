@@ -15,7 +15,26 @@ DEFAULT_ELEMENTS_ROOT = Path("/ssd1/mzc/FlexivElementsStudio")
 DEFAULT_PROJECT_ROOT = Path("/ssd1/shenyibo/Quest3DataCollector")
 DEFAULT_ROBOT_SUBNET = "192.168.2"
 DEFAULT_ROBOT_HOSTS = ["192.168.2.100", "192.168.2.101", "192.168.2.102", "192.168.2.103", "192.168.2.104"]
-DEFAULT_PORTS = [22, 80, 443, 8000, 8080, 9000, 9100, 50051, 50052, 6000, 6001, 6379, 10000, 10001]
+DEFAULT_PORTS = [
+    22,
+    80,
+    443,
+    8000,
+    8080,
+    9000,
+    9100,
+    50051,
+    50052,
+    6000,
+    6001,
+    6379,
+    10000,
+    10001,
+    15001,
+    17001,
+    17005,
+    17006,
+]
 
 
 def main() -> int:
