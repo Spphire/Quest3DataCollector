@@ -64,7 +64,11 @@ Installed runtime packages include:
 - `pillow`
 - `flexivrdk==1.7.0`
 
-The Flexiv robot software observed through Flexiv Elements is `RobotControlApp v3.9.3`. Flexiv's compatibility table maps robot software `v3.9` to RDK `v1.7`, so the project venv should import the pip package `flexivrdk==1.7.0`. Do not add the old `/home/lvjun/flexiv_rdk/lib_py` RDK v1.4 path to this venv, because that version targets older robot software and can shadow the correct pip package.
+The Flexiv robot software observed through Flexiv Elements is `RobotControlApp v3.9.3`. Flexiv's official compatibility table maps robot software `v3.9` to RDK `v1.7`, so the project venv should import the pip package `flexivrdk==1.7.0`. Do not add the old `/home/lvjun/flexiv_rdk/lib_py` RDK v1.4 path to this venv, because that version targets older robot software and can shadow the correct pip package.
+
+Reference:
+
+- https://www.flexiv.com/software/rdk/manual/robot_software_compatibility.html
 
 Verification:
 
@@ -97,7 +101,7 @@ Robot serial candidates tested:
 
 With RDK v1.7 loaded, `Rizon4-H6uDOq` is accepted as a valid Rizon serial and RDK normalizes the Elements display string `Rizon 4-H6uDOq` to that value. It still stopped at robot discovery (`Searching for [...]`). At that point the remaining likely causes are Flexiv Remote mode/Ethernet or the RDK server not being enabled, firewall policy, or a robot-side service state. The receiver UI keeps the robot SN editable so the operator can retry without changing code.
 
-Network diagnostics on 2026-06-17 showed a wired interface `enx6c1ff75afb1f` at `192.168.2.108/24` and a reachable peer at `192.168.2.100` with ports `8000`, `15001`, `17001`, `17005`, and `17006` open. RDK was also retried with the explicit network interface whitelist `["192.168.2.108"]` and still failed at discovery, so the next site checks should be Flexiv Elements Remote/RDK server mode and host firewall rules rather than RDK/Elements version mismatch or multi-NIC routing.
+Network diagnostics on 2026-06-17 showed a wired interface `enx6c1ff75afb1f` at `192.168.2.108/24`, MTU `1500`, and a reachable peer at `192.168.2.100` with ports `8000`, `15001`, `17001`, `17005`, and `17006` open. RDK was also retried with no whitelist, the local Ethernet IP `192.168.2.108`, the interface name `enx6c1ff75afb1f`, CIDR `192.168.2.108/24`, and the Wi-Fi IP `10.128.0.227`; all variants failed at the same discovery step. That makes an RDK/Elements version mismatch or one obviously wrong whitelist parameter unlikely. The next site checks should be Flexiv Elements Remote/RDK server mode, Auto(Remote), and host firewall rules.
 
 Official Flexiv RDK connection checklist for this state:
 
@@ -105,6 +109,13 @@ Official Flexiv RDK connection checklist for this state:
 2. Put the robot into Auto(Remote). If the robot is in Manual mode, Elements should show a choice between Manual and Auto(Remote); choose Auto(Remote).
 3. Verify the host firewall is disabled or the RDK Python process is allowed for the robot network interface.
 4. Re-run the read-only diagnostic command below and check whether `RDK connection: ok=True`.
+
+References:
+
+- https://www.flexiv.com/software/rdk/manual/activate_rdk_server.html
+- https://www.flexiv.com/software/rdk/manual/enter_and_exit_remote_mode.html
+- https://www.flexiv.com/software/rdk/manual/connect_user_computer.html
+- https://www.flexiv.com/software/rdk/manual/error_handling.html
 
 ### Receiver command
 
