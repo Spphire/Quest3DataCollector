@@ -6,7 +6,7 @@
 Transport:
 
 - UDP
-- default target: `10.128.1.15:9100`
+- default target: `10.128.0.227:9100`
 - encoding: UTF-8 JSON, one datagram per message, newline terminated
 - protocol name: `quest_recording_telemetry_v1`
 
@@ -141,4 +141,4 @@ inactive/disconnected, samples will still include gaze, but
 `leftController.hasPose` and `rightController.hasPose` will remain false.
 
 Before a Quest test, confirm the sender target matches the PC address on the
-same Wi-Fi network. The default scene value is `10.128.1.15:9100`.
+same Wi-Fi network. The default scene value is `10.128.0.227:9100`.

@@ -39,7 +39,7 @@ namespace EyeTracking
         [Header("OSC")]
         [SerializeField] private int port = 9000;
         [SerializeField] private bool listenOnAnyAddress = true;
-        [SerializeField] private string pcIp = "10.128.1.15";
+        [SerializeField] private string pcIp = "10.128.0.227";
         [SerializeField] private bool filterByPcIp = true;
         [SerializeField] private bool logMessages = true;
         [SerializeField] private int maxMessagesPerFrame = 64;

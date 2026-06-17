@@ -22,7 +22,7 @@ namespace EyeTracking.Recording
 
         [Header("PC Relay")]
         [SerializeField] private bool relayEnabled;
-        [SerializeField] private string serverUrl = "http://10.128.1.15:9101";
+        [SerializeField] private string serverUrl = "http://10.128.0.227:9101";
         [SerializeField, Min(0.05f)] private float intervalSeconds = 0.5f;
         [SerializeField, Range(10, 100)] private int jpegQuality = 70;
         [SerializeField] private bool viewportFlipY = true;

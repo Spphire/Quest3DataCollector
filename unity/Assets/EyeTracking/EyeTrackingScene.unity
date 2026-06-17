@@ -13898,7 +13898,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   port: 9000
   listenOnAnyAddress: 1
-  pcIp: 10.128.1.15
+  pcIp: 10.128.0.227
   filterByPcIp: 0
   logMessages: 1
   maxMessagesPerFrame: 64
@@ -14370,7 +14370,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   sendTelemetry: 1
-  host: 10.128.1.15
+  host: 10.128.0.227
   port: 9100
   autoResolveTrackingSpace: 1
   trackingSpace: {fileID: 2017933053}
@@ -14419,7 +14419,7 @@ MonoBehaviour:
   sendLeft: 1
   sendRight: 1
   relayEnabled: 0
-  serverUrl: http://10.128.1.15:9101
+  serverUrl: http://10.128.0.227:9101
   intervalSeconds: 0.5
   jpegQuality: 70
   viewportFlipY: 1
@@ -14445,7 +14445,7 @@ MonoBehaviour:
   leftCameraAccess: {fileID: 1849170380}
   rightCameraAccess: {fileID: 37181131}
   recordRightCamera: 1
-  serverUrl: http://10.128.1.15:9101
+  serverUrl: http://10.128.0.227:9101
   frameIntervalSeconds: 0.06666667
   jpegQuality: 75
   flipVertical: 1

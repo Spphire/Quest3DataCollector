@@ -20,7 +20,7 @@ namespace EyeTracking.Recording
         [SerializeField] private bool recordRightCamera = true;
 
         [Header("PC Receiver")]
-        [SerializeField] private string serverUrl = "http://10.128.1.15:9101";
+        [SerializeField] private string serverUrl = "http://10.128.0.227:9101";
         [SerializeField, Min(0.05f)] private float frameIntervalSeconds = 1f / 15f;
         [SerializeField, Range(10, 100)] private int jpegQuality = 75;
         [SerializeField] private bool flipVertical = true;

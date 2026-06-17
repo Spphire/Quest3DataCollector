@@ -15,7 +15,7 @@ namespace EyeTracking.Recording
 
         [Header("UDP Telemetry")]
         [SerializeField] private bool sendTelemetry = true;
-        [SerializeField] private string host = "10.128.1.15";
+        [SerializeField] private string host = "10.128.0.227";
         [SerializeField] private int port = 9100;
         [SerializeField] private bool autoResolveTrackingSpace = true;
         [SerializeField] private Transform trackingSpace;
