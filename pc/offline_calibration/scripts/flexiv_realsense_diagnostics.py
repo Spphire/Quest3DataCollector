@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import re
 import socket
 import subprocess
 import sys
@@ -15,6 +16,9 @@ DEFAULT_ELEMENTS_ROOT = Path("/ssd1/mzc/FlexivElementsStudio")
 DEFAULT_PROJECT_ROOT = Path("/ssd1/shenyibo/Quest3DataCollector")
 DEFAULT_ROBOT_SUBNET = "192.168.2"
 DEFAULT_ROBOT_HOSTS = ["192.168.2.100", "192.168.2.101", "192.168.2.102", "192.168.2.103", "192.168.2.104"]
+RDK_ROBOT_SOFTWARE_COMPATIBILITY = {
+    (1, 7): (3, 9),
+}
 DEFAULT_PORTS = [
     22,
     80,
@@ -60,12 +64,15 @@ def main() -> int:
 
     hosts = args.hosts or DEFAULT_ROBOT_HOSTS
     ports = [int(part) for part in str(args.ports).split(",") if part.strip()]
+    flexivrdk = flexivrdk_info()
+    elements = elements_info(args.elements_root)
     result = {
         "python": sys.version,
-        "flexivrdk": flexivrdk_info(),
+        "flexivrdk": flexivrdk,
         "realsense": realsense_info(),
         "network": network_info(),
-        "elements": elements_info(args.elements_root),
+        "elements": elements,
+        "compatibility": compatibility_info(flexivrdk, elements),
         "probe": probe_hosts(hosts, ports),
         "robotConnection": robot_connection_info(args.robot_sn, args.network_interfaces),
     }
@@ -218,6 +225,70 @@ def elements_info(root: Path) -> dict[str, Any]:
     return payload
 
 
+def compatibility_info(flexiv: dict[str, Any], elements: dict[str, Any]) -> dict[str, Any]:
+    rdk_version = str(flexiv.get("version") or "")
+    system = elements.get("systemVersion") or {}
+    versions = system.get("software_version") if isinstance(system, dict) else {}
+    robot_version = str(versions.get("RobotControlApp") or "") if isinstance(versions, dict) else ""
+    rdk_major_minor = parse_major_minor(rdk_version)
+    robot_major_minor = parse_major_minor(robot_version)
+    payload: dict[str, Any] = {
+        "ok": None,
+        "rdkVersion": rdk_version,
+        "robotSoftwareVersion": robot_version,
+        "rdkMajorMinor": list(rdk_major_minor) if rdk_major_minor else None,
+        "robotSoftwareMajorMinor": list(robot_major_minor) if robot_major_minor else None,
+        "expectedRobotSoftwareMajorMinor": None,
+        "expectedRdkMajorMinor": None,
+        "message": "RDK/Elements compatibility could not be determined.",
+        "source": "https://www.flexiv.com/software/rdk/manual/robot_software_compatibility.html",
+    }
+    if not rdk_major_minor or not robot_major_minor:
+        return payload
+    expected_robot = RDK_ROBOT_SOFTWARE_COMPATIBILITY.get(rdk_major_minor)
+    expected_rdk = next(
+        (rdk for rdk, robot in RDK_ROBOT_SOFTWARE_COMPATIBILITY.items() if robot == robot_major_minor),
+        None,
+    )
+    if expected_robot:
+        payload["expectedRobotSoftwareMajorMinor"] = list(expected_robot)
+    if expected_rdk:
+        payload["expectedRdkMajorMinor"] = list(expected_rdk)
+    if expected_rdk is None and expected_robot is None:
+        payload["message"] = (
+            f"No local compatibility-table entry for RDK v{rdk_major_minor[0]}.{rdk_major_minor[1]} "
+            f"or RobotControlApp v{robot_major_minor[0]}.{robot_major_minor[1]}."
+        )
+        return payload
+    if expected_rdk == rdk_major_minor and expected_robot == robot_major_minor:
+        payload["ok"] = True
+        payload["message"] = (
+            f"RDK/Elements version match: RDK v{rdk_major_minor[0]}.{rdk_major_minor[1]} "
+            f"with RobotControlApp v{robot_major_minor[0]}.{robot_major_minor[1]}."
+        )
+    else:
+        payload["ok"] = False
+        expected = (
+            f"RobotControlApp v{robot_major_minor[0]}.{robot_major_minor[1]} expects "
+            f"RDK v{expected_rdk[0]}.{expected_rdk[1]}."
+            if expected_rdk
+            else f"RDK v{rdk_major_minor[0]}.{rdk_major_minor[1]} expects "
+            f"RobotControlApp v{expected_robot[0]}.{expected_robot[1]}."
+        )
+        payload["message"] = (
+            f"RDK/Elements version mismatch: active RDK is v{rdk_major_minor[0]}.{rdk_major_minor[1]}, "
+            f"RobotControlApp is v{robot_major_minor[0]}.{robot_major_minor[1]}. {expected}"
+        )
+    return payload
+
+
+def parse_major_minor(value: str) -> tuple[int, int] | None:
+    match = re.search(r"(\d+)\.(\d+)", str(value))
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
 def probe_hosts(hosts: list[str], ports: list[int]) -> list[dict[str, Any]]:
     ping_status = {host: ping_host(host) for host in hosts}
     items = [(host, port) for host in hosts for port in ports]
@@ -268,6 +339,9 @@ def print_human(result: dict[str, Any]) -> None:
         print(f"  Elements serials: {json.dumps(serials, ensure_ascii=False)}")
     if versions:
         print(f"  Elements software: {json.dumps(versions, ensure_ascii=False)}")
+    compatibility = result.get("compatibility") or {}
+    if compatibility:
+        print(f"  compatibility: ok={compatibility.get('ok')} {compatibility.get('message')}")
     print("  network interfaces:")
     print(indent(str((result.get("network") or {}).get("ipAddr") or "").strip(), "    "))
     print("  routes:")
@@ -334,6 +408,18 @@ def interpret_result(result: dict[str, Any]) -> dict[str, Any]:
     robot_version = versions.get("RobotControlApp") if isinstance(versions, dict) else None
     if robot_version:
         summary.append(f"Elements RobotControlApp: {robot_version}.")
+
+    compatibility = result.get("compatibility") or {}
+    if compatibility:
+        compat_ok = compatibility.get("ok")
+        if compat_ok is True:
+            summary.append(str(compatibility.get("message") or "RDK/Elements version match."))
+        elif compat_ok is False:
+            severity = "error"
+            summary.append(str(compatibility.get("message") or "RDK/Elements version mismatch."))
+            next_steps.append("Install the Flexiv RDK package version that matches RobotControlApp.")
+        else:
+            summary.append(str(compatibility.get("message") or "RDK/Elements compatibility unknown."))
 
     probes = result.get("probe") or []
     reachable = [row for row in probes if row.get("ping") or row.get("openPorts")]

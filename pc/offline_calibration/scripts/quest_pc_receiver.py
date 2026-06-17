@@ -31,7 +31,14 @@ from flexiv_realsense_bridge import (
     RobotRealsenseSession,
 )
 from flexiv_realsense_diagnostics import DEFAULT_PORTS as DEFAULT_ROBOT_DIAGNOSTIC_PORTS
-from flexiv_realsense_diagnostics import DEFAULT_ROBOT_HOSTS, elements_info, flexivrdk_info, interpret_result, network_info
+from flexiv_realsense_diagnostics import (
+    DEFAULT_ROBOT_HOSTS,
+    compatibility_info,
+    elements_info,
+    flexivrdk_info,
+    interpret_result,
+    network_info,
+)
 from flexiv_realsense_diagnostics import probe_hosts, realsense_info, robot_connection_info
 
 
@@ -644,15 +651,18 @@ class LiveTelemetryVisualizer:
         config = self.robot_manager.config
         robot_sn = str(payload.get("robotSn") or config.robot_sn or "").strip()
         interfaces = config.flexiv_network_interfaces
+        flexivrdk = flexivrdk_info()
+        elements = elements_info(Path("/ssd1/mzc/FlexivElementsStudio"))
         result: dict[str, Any] = {
             "ok": True,
             "enabled": True,
             "timestampUnixSeconds": time.time(),
             "config": self.robot_manager.status().get("config"),
-            "flexivrdk": flexivrdk_info(),
+            "flexivrdk": flexivrdk,
             "realsense": realsense_info(),
             "network": network_info(),
-            "elements": elements_info(Path("/ssd1/mzc/FlexivElementsStudio")),
+            "elements": elements,
+            "compatibility": compatibility_info(flexivrdk, elements),
             "probe": probe_hosts(DEFAULT_ROBOT_HOSTS, DEFAULT_ROBOT_DIAGNOSTIC_PORTS),
             "robotConnection": robot_connection_info(robot_sn, interfaces),
         }
