@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import webbrowser
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -695,6 +696,9 @@ class LiveTelemetryVisualizer:
                     return
                 if parsed.path == "/robot/urdf":
                     self._send_urdf()
+                    return
+                if parsed.path == "/robot/model":
+                    self._send_json(rizon4_model_payload())
                     return
                 if parsed.path == "/artifact":
                     self._send_artifact(parsed)
@@ -3132,6 +3136,72 @@ def read_json_if_exists(path: Path) -> Any:
         return None
 
 
+def rizon4_model_payload() -> dict[str, Any]:
+    if not DEFAULT_RIZON4_URDF.exists():
+        return {"ok": False, "reason": "missing_urdf", "path": str(DEFAULT_RIZON4_URDF)}
+    try:
+        root = ET.fromstring(DEFAULT_RIZON4_URDF.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"ok": False, "reason": "bad_urdf", "error": str(exc), "path": str(DEFAULT_RIZON4_URDF)}
+
+    joints: list[dict[str, Any]] = []
+    for joint in root.findall("joint"):
+        name = str(joint.attrib.get("name") or "")
+        joint_type = str(joint.attrib.get("type") or "")
+        parent = joint.find("parent")
+        child = joint.find("child")
+        origin = joint.find("origin")
+        axis = joint.find("axis")
+        limit = joint.find("limit")
+        if not name or parent is None or child is None:
+            continue
+        row: dict[str, Any] = {
+            "name": name,
+            "type": joint_type,
+            "parent": parent.attrib.get("link"),
+            "child": child.attrib.get("link"),
+            "xyz": parse_float_triplet(origin.attrib.get("xyz") if origin is not None else None, [0.0, 0.0, 0.0]),
+            "rpy": parse_float_triplet(origin.attrib.get("rpy") if origin is not None else None, [0.0, 0.0, 0.0]),
+            "axis": parse_float_triplet(axis.attrib.get("xyz") if axis is not None else None, [0.0, 0.0, 1.0]),
+        }
+        if limit is not None:
+            row["limit"] = {
+                "lower": parse_optional_float(limit.attrib.get("lower")),
+                "upper": parse_optional_float(limit.attrib.get("upper")),
+                "velocity": parse_optional_float(limit.attrib.get("velocity")),
+            }
+        joints.append(row)
+
+    return {
+        "ok": True,
+        "name": root.attrib.get("name") or "Rizon4",
+        "source": str(DEFAULT_RIZON4_URDF),
+        "joints": joints,
+        "activeJointNames": [joint["name"] for joint in joints if joint.get("type") != "fixed"],
+    }
+
+
+def parse_float_triplet(text: str | None, default: list[float]) -> list[float]:
+    if not text:
+        return list(default)
+    parts = text.split()
+    if len(parts) < 3:
+        return list(default)
+    try:
+        return [float(parts[0]), float(parts[1]), float(parts[2])]
+    except ValueError:
+        return list(default)
+
+
+def parse_optional_float(text: str | None) -> float | None:
+    if text is None:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 def tail_text(path: Path, max_lines: int) -> str:
     if not path.exists():
         return ""
@@ -3594,6 +3664,7 @@ const state = {
   robotSample: null,
   robotMotion: null,
   robotWorldBase: null,
+  robotModel: null,
   robotCalibration: null
 };
 
@@ -3689,6 +3760,16 @@ async function loadRobotStatus() {
     applyRobotStatus(payload);
   } catch (error) {
     robotStatus.textContent = String(error);
+  }
+}
+
+async function loadRobotModel() {
+  try {
+    const response = await fetch('/robot/model', {cache: 'no-store'});
+    const payload = await response.json();
+    if (payload.ok) state.robotModel = payload;
+  } catch (_) {
+    state.robotModel = null;
   }
 }
 
@@ -4070,12 +4151,29 @@ function drawRobotLive() {
   const matrix = pose?.matrix_4x4;
   if (!matrix) return;
   const worldMatrix = state.robotWorldBase ? multiplyMatrix4(state.robotWorldBase, matrix) : matrix;
+  drawRobotSkeleton(state.robotSample?.jointpose, state.robotWorldBase || identityMatrix4());
   const p = relPoint(matrixTranslation(worldMatrix));
   if (!p) return;
   drawPoint(p, '#ffffff', 6, 'EE');
   drawLine(p, relPoint(matrixPoint(worldMatrix, 0.08, 0, 0)), '#ff4545', 2.3);
   drawLine(p, relPoint(matrixPoint(worldMatrix, 0, 0.08, 0)), '#42e875', 2.3);
   drawLine(p, relPoint(matrixPoint(worldMatrix, 0, 0, 0.08)), '#4b7cff', 2.3);
+}
+
+function drawRobotSkeleton(jointpose, baseMatrix) {
+  const model = state.robotModel;
+  if (!model || !Array.isArray(jointpose) || jointpose.length < 7) return;
+  const frames = robotFrames(model, jointpose, baseMatrix);
+  if (frames.length < 2) return;
+  for (let i = 1; i < frames.length; i++) {
+    const a = relPoint(matrixTranslation(frames[i - 1]));
+    const b = relPoint(matrixTranslation(frames[i]));
+    drawLine(a, b, 'rgba(255,255,255,0.56)', 3);
+  }
+  for (let i = 0; i < frames.length; i++) {
+    const p = relPoint(matrixTranslation(frames[i]));
+    drawPoint(p, i === 0 ? '#cbd5df' : '#ffffff', i === 0 ? 4 : 3.5, i === frames.length - 1 ? 'flange' : '');
+  }
 }
 
 function updateStatus(frame) {
@@ -4343,6 +4441,52 @@ function multiplyMatrix4(a, b) {
   return out;
 }
 
+function identityMatrix4() {
+  return [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]];
+}
+
+function robotFrames(model, jointpose, baseMatrix) {
+  const frames = [baseMatrix];
+  let current = baseMatrix;
+  let jointIndex = 0;
+  for (const joint of model.joints || []) {
+    current = multiplyMatrix4(current, xyzRpyMatrix(joint.xyz, joint.rpy));
+    if (joint.type !== 'fixed') {
+      const angle = Number(jointpose[jointIndex++] || 0);
+      current = multiplyMatrix4(current, axisAngleMatrix(joint.axis, angle));
+    }
+    frames.push(current);
+  }
+  return frames;
+}
+
+function xyzRpyMatrix(xyz, rpy) {
+  const x = Number(xyz?.[0] || 0), y = Number(xyz?.[1] || 0), z = Number(xyz?.[2] || 0);
+  const rx = Number(rpy?.[0] || 0), ry = Number(rpy?.[1] || 0), rz = Number(rpy?.[2] || 0);
+  return multiplyMatrix4(translationMatrix(x, y, z), eulerXyzMatrix(rx, ry, rz));
+}
+
+function translationMatrix(x, y, z) {
+  return [[1,0,0,x],[0,1,0,y],[0,0,1,z],[0,0,0,1]];
+}
+
+function eulerXyzMatrix(rx, ry, rz) {
+  return multiplyMatrix4(multiplyMatrix4(axisAngleMatrix([1,0,0], rx), axisAngleMatrix([0,1,0], ry)), axisAngleMatrix([0,0,1], rz));
+}
+
+function axisAngleMatrix(axis, angle) {
+  let x = Number(axis?.[0] || 0), y = Number(axis?.[1] || 0), z = Number(axis?.[2] || 0);
+  const n = Math.hypot(x, y, z) || 1;
+  x /= n; y /= n; z /= n;
+  const c = Math.cos(angle), s = Math.sin(angle), t = 1 - c;
+  return [
+    [t*x*x + c, t*x*y - s*z, t*x*z + s*y, 0],
+    [t*x*y + s*z, t*y*y + c, t*y*z - s*x, 0],
+    [t*x*z - s*y, t*y*z + s*x, t*z*z + c, 0],
+    [0,0,0,1]
+  ];
+}
+
 function add(a, b) { return [a[0]+b[0], a[1]+b[1], a[2]+b[2]]; }
 function sub(a, b) { return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
 function length(a) { return Math.hypot(a[0], a[1], a[2]); }
@@ -4399,6 +4543,7 @@ resize();
 connect();
 loadLatestCalibration();
 loadRobotStatus().then(refreshCameras);
+loadRobotModel();
 requestAnimationFrame(draw);
 </script>
 </body>
@@ -4618,6 +4763,7 @@ const state = {
   target: [0,0,0],
   dragging: false,
   lastPointer: [0,0],
+  robotModel: null,
   trails: {head: [], left: [], right: [], gaze: [], gazeFiltered: [], gazeBoardPlane: [], hit: [], robot: []}
 };
 
@@ -4636,6 +4782,16 @@ async function loadRecords() {
   rootLabel.textContent = payload.root || '';
   renderRecordList();
   if (!state.selected && state.records.length) loadRecord(state.records[0].recordId);
+}
+
+async function loadRobotModel() {
+  try {
+    const response = await fetch('/robot/model', {cache: 'no-store'});
+    const payload = await response.json();
+    if (payload.ok) state.robotModel = payload;
+  } catch (_) {
+    state.robotModel = null;
+  }
 }
 
 function renderRecordList() {
@@ -4974,12 +5130,30 @@ function drawRobotForSample(sample) {
   const robot = nearestRobotSample(sample.recordingTimestampSeconds);
   const matrix = robot?.T_display_ee?.matrix_4x4;
   if (!matrix) return;
+  drawRobotSkeleton(robot);
   const p = matrixTranslation(matrix);
   if (!p) return;
   drawPoint(p, '#ffffff', 6, 'EE');
   drawLine(p, matrixPoint(matrix, 0.08, 0, 0), '#ff4545', 2.3);
   drawLine(p, matrixPoint(matrix, 0, 0.08, 0), '#42e875', 2.3);
   drawLine(p, matrixPoint(matrix, 0, 0, 0.08), '#4b7cff', 2.3);
+}
+
+function drawRobotSkeleton(robot) {
+  const model = state.robotModel;
+  const jointpose = robot?.jointpose;
+  const result = state.data?.robotRealSense?.result;
+  const baseMatrix = result?.questAlignment?.T_world_base?.matrix_4x4;
+  if (!model || !Array.isArray(jointpose) || jointpose.length < 7 || !baseMatrix) return;
+  const displayBase = translateMatrixPayload(baseMatrix, state.data?.boardOriginWorld || [0,0,0]);
+  const frames = robotFrames(model, jointpose, displayBase);
+  if (frames.length < 2) return;
+  for (let i = 1; i < frames.length; i++) {
+    drawLine(matrixTranslation(frames[i - 1]), matrixTranslation(frames[i]), 'rgba(255,255,255,.56)', 3);
+  }
+  for (let i = 0; i < frames.length; i++) {
+    drawPoint(matrixTranslation(frames[i]), i === 0 ? '#cbd5df' : '#ffffff', i === 0 ? 4 : 3.5, i === frames.length - 1 ? 'flange' : '');
+  }
 }
 
 function nearestRobotSample(t) {
@@ -5058,6 +5232,65 @@ function matrixTranslation(m) {
   return [Number(m[0]?.[3]), Number(m[1]?.[3]), Number(m[2]?.[3])];
 }
 
+function translateMatrixPayload(m, origin) {
+  const out = m.map(row => row.slice());
+  for (let i = 0; i < 3; i++) out[i][3] -= Number(origin?.[i] || 0);
+  return out;
+}
+
+function multiplyMatrix4(a, b) {
+  const out = Array.from({length: 4}, () => [0, 0, 0, 0]);
+  for (let r = 0; r < 4; r++) {
+    for (let c = 0; c < 4; c++) {
+      out[r][c] = 0;
+      for (let k = 0; k < 4; k++) out[r][c] += Number(a[r]?.[k] || 0) * Number(b[k]?.[c] || 0);
+    }
+  }
+  return out;
+}
+
+function robotFrames(model, jointpose, baseMatrix) {
+  const frames = [baseMatrix];
+  let current = baseMatrix;
+  let jointIndex = 0;
+  for (const joint of model.joints || []) {
+    current = multiplyMatrix4(current, xyzRpyMatrix(joint.xyz, joint.rpy));
+    if (joint.type !== 'fixed') {
+      const angle = Number(jointpose[jointIndex++] || 0);
+      current = multiplyMatrix4(current, axisAngleMatrix(joint.axis, angle));
+    }
+    frames.push(current);
+  }
+  return frames;
+}
+
+function xyzRpyMatrix(xyz, rpy) {
+  const x = Number(xyz?.[0] || 0), y = Number(xyz?.[1] || 0), z = Number(xyz?.[2] || 0);
+  const rx = Number(rpy?.[0] || 0), ry = Number(rpy?.[1] || 0), rz = Number(rpy?.[2] || 0);
+  return multiplyMatrix4(translationMatrix(x, y, z), eulerXyzMatrix(rx, ry, rz));
+}
+
+function translationMatrix(x, y, z) {
+  return [[1,0,0,x],[0,1,0,y],[0,0,1,z],[0,0,0,1]];
+}
+
+function eulerXyzMatrix(rx, ry, rz) {
+  return multiplyMatrix4(multiplyMatrix4(axisAngleMatrix([1,0,0], rx), axisAngleMatrix([0,1,0], ry)), axisAngleMatrix([0,0,1], rz));
+}
+
+function axisAngleMatrix(axis, angle) {
+  let x = Number(axis?.[0] || 0), y = Number(axis?.[1] || 0), z = Number(axis?.[2] || 0);
+  const n = Math.hypot(x, y, z) || 1;
+  x /= n; y /= n; z /= n;
+  const c = Math.cos(angle), s = Math.sin(angle), t = 1 - c;
+  return [
+    [t*x*x + c, t*x*y - s*z, t*x*z + s*y, 0],
+    [t*x*y + s*z, t*y*y + c, t*y*z - s*x, 0],
+    [t*x*z - s*y, t*y*z + s*x, t*z*z + c, 0],
+    [0,0,0,1]
+  ];
+}
+
 function quatRotate(q, v) {
   const w = q[0], x = q[1], y = q[2], z = q[3];
   const vx = v[0], vy = v[1], vz = v[2];
@@ -5134,6 +5367,7 @@ function tick(now) {
 }
 
 resize();
+loadRobotModel();
 loadRecords().catch(error => { rootLabel.textContent = String(error); });
 requestAnimationFrame(tick);
 </script>
