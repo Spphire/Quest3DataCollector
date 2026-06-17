@@ -50,8 +50,13 @@ def main() -> int:
         dest="network_interfaces",
         help="Local IPv4 address for the Flexiv RDK network interface whitelist. May repeat.",
     )
+    parser.add_argument("--_robot-connection-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     args = parser.parse_args()
+
+    if args._robot_connection_worker:
+        print(json.dumps(robot_connection_info_direct(args.robot_sn, args.network_interfaces), ensure_ascii=False))
+        return 0
 
     hosts = args.hosts or DEFAULT_ROBOT_HOSTS
     ports = [int(part) for part in str(args.ports).split(",") if part.strip()]
@@ -87,6 +92,52 @@ def flexivrdk_info() -> dict[str, Any]:
 
 
 def robot_connection_info(robot_sn: str | None, network_interfaces: list[str] | None) -> dict[str, Any] | None:
+    if not robot_sn:
+        return None
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--_robot-connection-worker",
+        "--robot-sn",
+        str(robot_sn).strip(),
+    ]
+    for interface in normalize_network_interfaces(network_interfaces):
+        command.extend(["--network-interface", interface])
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(command, text=True, capture_output=True, timeout=8.0, check=False)
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "robotSn": str(robot_sn).strip(),
+            "networkInterfaces": normalize_network_interfaces(network_interfaces),
+            "elapsedSeconds": time.monotonic() - started,
+            "error": f"RDK connection worker timed out after {exc.timeout} seconds",
+        }
+    stdout_lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    for line in reversed(stdout_lines):
+        try:
+            parsed = json.loads(line)
+            if isinstance(parsed, dict):
+                parsed.setdefault("workerReturnCode", proc.returncode)
+                if proc.stderr.strip():
+                    parsed["workerStderr"] = proc.stderr.strip()[-2000:]
+                return parsed
+        except json.JSONDecodeError:
+            continue
+    return {
+        "ok": False,
+        "robotSn": str(robot_sn).strip(),
+        "networkInterfaces": normalize_network_interfaces(network_interfaces),
+        "elapsedSeconds": time.monotonic() - started,
+        "workerReturnCode": proc.returncode,
+        "error": "RDK connection worker did not return JSON",
+        "workerStdout": proc.stdout.strip()[-2000:],
+        "workerStderr": proc.stderr.strip()[-2000:],
+    }
+
+
+def robot_connection_info_direct(robot_sn: str | None, network_interfaces: list[str] | None) -> dict[str, Any] | None:
     if not robot_sn:
         return None
     started = time.monotonic()

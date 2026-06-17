@@ -151,6 +151,8 @@ To include the read-only RDK connection test:
   --network-interface 192.168.2.108
 ```
 
+The web UI `Diagnostics` button runs the RDK connection attempt in a short-lived subprocess so a failed DDS discovery does not leave `9900/991x` UDP sockets open in the long-running receiver process.
+
 ### Web workflow
 
 Open:
