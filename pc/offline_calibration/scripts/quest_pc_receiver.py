@@ -2557,12 +2557,14 @@ def recording_replay_list_record(
     if not isinstance(summary, dict) or not summary:
         return None
     snapshot = replay_snapshot(directory, summary, source, calibration_output_root)
+    calibration_failure = replay_calibration_failure(directory, summary, source, calibration_output_root)
     sample_count = None
     if is_number(summary.get("samples")):
         sample_count = int(summary["samples"])
     elif is_number(summary.get("trajectorySampleCount")):
         sample_count = int(summary["trajectorySampleCount"])
     has_calibration = isinstance(snapshot, dict) and bool(snapshot.get("T_world_board"))
+    calibration_status = "ok" if has_calibration else ("failed" if calibration_failure else "missing")
     robot_summary = robot_realsense_record_summary(directory)
     return {
         "recordId": directory.name,
@@ -2572,6 +2574,9 @@ def recording_replay_list_record(
         "mtime": directory.stat().st_mtime,
         "samples": sample_count,
         "hasCalibrationSnapshot": has_calibration,
+        "calibrationStatus": calibration_status,
+        "calibrationReason": calibration_failure.get("reason") if isinstance(calibration_failure, dict) else None,
+        "calibrationReasonCode": calibration_failure.get("reasonCode") if isinstance(calibration_failure, dict) else None,
         "calibrationRecordId": snapshot.get("recordId") if isinstance(snapshot, dict) else None,
         "startUtc": summary.get("startUtc") or summary.get("startTimeUtc"),
         "closedReason": summary.get("closedReason"),
@@ -2669,6 +2674,46 @@ def replay_snapshot(
     return {}
 
 
+def replay_calibration_failure(
+    session_dir: Path,
+    summary: dict[str, Any],
+    source: str,
+    calibration_output_root: Path | None,
+) -> dict[str, Any] | None:
+    output_dir = summary.get("outputDirectory")
+    candidate_dirs: list[Path] = []
+    if isinstance(output_dir, str) and output_dir:
+        candidate_dirs.append(Path(output_dir))
+    if source == "raw" and calibration_output_root is not None:
+        candidate_dirs.append(calibration_output_root.resolve() / session_dir.name)
+    for output_directory in candidate_dirs:
+        failure_path = output_directory / "calibration_failure_25mm.json"
+        log_path = output_directory / "calibration_run.log"
+        if failure_path.exists() or log_path.exists():
+            return compact_calibration_failure(session_dir.name, output_directory, failure_path, log_path)
+    return None
+
+
+def compact_calibration_failure(record_id: str, output_directory: Path, failure_path: Path, log_path: Path) -> dict[str, Any]:
+    diagnostics = read_json_if_exists(failure_path)
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    detection_summary = read_json_if_exists(output_directory / "checkerboard_detection_summary_25mm.json")
+    return {
+        "type": "calibration_failure",
+        "recordId": record_id,
+        "rawRecordName": record_id,
+        "outputDirectory": str(output_directory),
+        "failurePath": str(failure_path) if failure_path.exists() else None,
+        "logPath": str(log_path) if log_path.exists() else None,
+        "reason": diagnostics.get("reason") or diagnostics.get("reason_code") or "Calibration failed",
+        "reasonCode": diagnostics.get("reason_code"),
+        "phase": diagnostics.get("phase"),
+        "diagnostics": diagnostics,
+        "detectionSummary": detection_summary,
+    }
+
+
 def recording_snapshot_from_calibration_result(record_id: str, result: dict[str, Any], result_path: Path) -> dict[str, Any]:
     event = calibration_result_event(record_id, result, result_path)
     return {
@@ -2745,6 +2790,7 @@ def build_recording_replay_payload(
     if not isinstance(summary, dict) or not summary:
         raise FileNotFoundError(f"recording summary not found for {safe_id}")
     snapshot = replay_snapshot(session_dir, summary, resolved_source, calibration_output_root)
+    calibration_failure = replay_calibration_failure(session_dir, summary, resolved_source, calibration_output_root)
 
     board_matrix_world = matrix_from_snapshot(snapshot)
     board_origin_world = matrix_translation(board_matrix_world) if board_matrix_world is not None else [0.0, 0.0, 0.0]
@@ -2773,6 +2819,7 @@ def build_recording_replay_payload(
         "sessionDir": str(session_dir),
         "summary": summary if isinstance(summary, dict) else {},
         "snapshot": snapshot,
+        "calibrationFailure": calibration_failure,
         "coordinateMode": "quest_world_axes_translated_to_board_origin",
         "boardOriginWorld": board_origin_world,
         "boardMatrix": board_matrix_display,
@@ -5865,7 +5912,7 @@ function renderRecordList() {
     const button = document.createElement('button');
     button.className = 'record-item' + (record.recordId === state.selected && record.source === state.selectedSource ? ' active' : '');
     const samples = record.samples ?? 'n/a';
-    const calib = record.hasCalibrationSnapshot ? `calib ${record.calibrationRecordId || 'yes'}` : 'no calib';
+    const calib = calibrationRecordSummaryText(record);
     const robot = robotRecordSummaryText(record.robotSummary);
     const source = record.sourceLabel || record.source || 'record';
     button.innerHTML = `<span class="record-title">${escapeHtml(record.recordId)}</span><span class="record-meta">${escapeHtml(source)} | ${samples} samples | ${escapeHtml(calib)}</span><span class="record-meta">${escapeHtml(robot)}</span><span class="record-meta">${escapeHtml(record.closedReason || '')}</span>`;
@@ -5899,6 +5946,14 @@ function robotRecordSummaryText(summary) {
     parts.push(String(summary.failureReason).slice(0, 80));
   }
   return parts.join(' | ');
+}
+
+function calibrationRecordSummaryText(record) {
+  if (record.hasCalibrationSnapshot) return `calib ${record.calibrationRecordId || 'ok'}`;
+  if (record.calibrationStatus === 'failed') {
+    return `calib failed: ${record.calibrationReasonCode || record.calibrationReason || 'failed'}`;
+  }
+  return 'no calib';
 }
 
 async function loadRecord(recordId, source = null) {
@@ -5958,8 +6013,11 @@ function currentSample() {
 function updateSnapshotInfo() {
   const data = state.data || {};
   const s = data.snapshot || {};
+  const failure = data.calibrationFailure || null;
   const origin = data.boardOriginWorld || [];
+  const status = s.T_world_board ? 'ok' : (failure ? 'failed' : 'missing');
   const kv = [
+    ['status', status],
     ['record', s.recordId || 'n/a'],
     ['mode', data.coordinateMode || 'n/a'],
     ['origin', origin.length >= 3 ? origin.map(v => Number(v).toFixed(3)).join(', ') + ' m' : 'n/a'],
@@ -5968,10 +6026,31 @@ function updateSnapshotInfo() {
     ['median', Number.isFinite(s.medianReprojectionPx) ? s.medianReprojectionPx.toFixed(2) + ' px' : 'n/a'],
     ['p90', Number.isFinite(s.p90ReprojectionPx) ? s.p90ReprojectionPx.toFixed(2) + ' px' : 'n/a']
   ];
+  if (failure) {
+    kv.push(
+      ['reason', failure.reason || 'Calibration failed'],
+      ['reason code', failure.reasonCode || failure.diagnostics?.reason_code || 'n/a'],
+      ['phase', failure.phase || failure.diagnostics?.phase || 'n/a'],
+      ['detections', calibrationDetectionText(failure)]
+    );
+  }
   snapKv.innerHTML = kv.map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
   updateDepthInfo();
   updateRobotInfo();
   recordSub.textContent = `${state.data.samples.length} samples`;
+}
+
+function calibrationDetectionText(failure) {
+  const rows = Array.isArray(failure?.detectionSummary)
+    ? failure.detectionSummary
+    : failure?.diagnostics?.detection_summary;
+  if (!Array.isArray(rows) || !rows.length) return 'n/a';
+  return rows.map(row => {
+    const side = row.side || '?';
+    const detections = row.detections ?? 'n/a';
+    const frames = row.video_frame_count ?? row.frame_metadata_count ?? 'n/a';
+    return `${side} ${detections}/${frames}`;
+  }).join(', ');
 }
 
 function updateDepthInfo() {
