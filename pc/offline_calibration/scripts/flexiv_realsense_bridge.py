@@ -710,15 +710,7 @@ class FlexivRealSenseManager:
             "bestReprojectionRmsePx": None,
             "bestReprojectionMedianPx": None,
             "overlayPath": None,
-            "message": (
-                "checkerboard detected"
-                if observation is not None
-                else (
-                    "checkerboard not detected; image is very dark"
-                    if brightness["p95"] < 20.0
-                    else "checkerboard not detected"
-                )
-            ),
+            "message": board_check_message(observation is not None, brightness),
         }
         if observation is not None:
             candidates = observation.get("candidates") or []
@@ -909,6 +901,14 @@ def safe_filename(value: str) -> str:
             cleaned.append("_")
     name = "".join(cleaned).strip("_")
     return name or "camera"
+
+
+def board_check_message(detected: bool, brightness: dict[str, float]) -> str:
+    if detected:
+        return "checkerboard detected"
+    if float(brightness.get("p95") or 0.0) < 20.0:
+        return "checkerboard not detected; image is very dark"
+    return "checkerboard not detected; make sure the full 11x8 inner-corner board is visible and not cropped or occluded"
 
 
 def camera_metadata_from_profile(profile: Any, serial: str) -> dict[str, Any]:
