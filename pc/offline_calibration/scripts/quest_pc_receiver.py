@@ -3975,7 +3975,22 @@ def controller_preflight_detail(latest: dict[str, Any], recent: dict[str, Any], 
     latest_valid_age = recent.get("latestValidAgeSeconds") if isinstance(recent, dict) else None
     if is_number(latest_valid_age):
         text += f", last valid {float(latest_valid_age):.2f}s ago"
+    hint = controller_mode_hint(latest_source)
+    if hint:
+        text += f"; {hint}"
     return text
+
+
+def controller_mode_hint(source: str) -> str:
+    if (
+        "ovrConnected=False" in source
+        and "xrValid=False" in source
+        and "interactionConnected=0" in source
+    ):
+        return "Quest reports no Touch controller input, likely Hands mode; wake/pair Touch controllers before arming motion"
+    if "interactionRefs=0" in source and "anchorActive=False" in source:
+        return "Unity scene has no controller refs/anchors resolved"
+    return ""
 
 
 def build_preflight_status(
