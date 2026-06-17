@@ -1062,6 +1062,7 @@ class PcCalibrationSession:
         self.robot_manager = robot_manager
         self.robot_session: RobotRealsenseSession | None = None
         self.robot_realsense_directory: Path | None = None
+        self.robot_start_status: dict[str, Any] | None = None
 
         metadata = dict(start_message.get("metadata") or {})
         metadata["outputDirectory"] = str(self.directory)
@@ -1092,6 +1093,7 @@ class PcCalibrationSession:
         self.start_perf = time.perf_counter()
         self.closed = False
         self.lock = threading.Lock()
+        self.robot_start_status = self._robot_start_status("not_started")
         if self.robot_manager is not None:
             self.robot_session = self.robot_manager.start_session(
                 self.directory,
@@ -1100,7 +1102,9 @@ class PcCalibrationSession:
             )
             if self.robot_session is not None:
                 self.robot_realsense_directory = self.robot_session.directory
-        self.publish_status("recording", 0.0, "PC calibration recording")
+            self.robot_start_status = self._robot_start_status("recording" if self.robot_session is not None else "not_recording")
+        self.metadata["robotStartStatus"] = self.robot_start_status
+        self.publish_status("recording", 0.0, "PC calibration recording", robotStartStatus=self.robot_start_status)
 
     def write_frame(self, side: str, query: dict[str, list[str]], body: bytes) -> None:
         with self.lock:
@@ -1187,6 +1191,7 @@ class PcCalibrationSession:
         with self.lock:
             if robot_summary is not None:
                 self.metadata["robotRealSenseSummary"] = robot_summary
+            self.metadata["robotStartStatus"] = self.robot_start_status
             (self.directory / "quest_camera_metadata.json").write_text(
                 json.dumps(self.metadata, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -1215,6 +1220,7 @@ class PcCalibrationSession:
             "rightFrames": self.frame_counts["right"],
             "samples": self.sample_count,
             "robotRealSenseDirectory": str(self.robot_realsense_directory) if self.robot_realsense_directory is not None else None,
+            "robotStartStatus": self.robot_start_status,
         }
 
     def publish_status(self, stage: str, progress: float, message: str, **extra: Any) -> None:
@@ -1230,6 +1236,43 @@ class PcCalibrationSession:
                 **extra,
             }
         )
+
+    def _robot_start_status(self, stage: str) -> dict[str, Any]:
+        if self.robot_manager is None:
+            return {"enabled": False, "stage": stage, "recording": False, "reason": "robot manager disabled"}
+        status = self.robot_manager.status()
+        robot = status.get("robot") if isinstance(status, dict) else {}
+        config = status.get("config") if isinstance(status, dict) else {}
+        active = status.get("activeSession") if isinstance(status, dict) else None
+        connected = bool(isinstance(robot, dict) and robot.get("connected"))
+        motion_armed = bool(isinstance(robot, dict) and robot.get("motionArmed"))
+        controller_motion = bool(isinstance(config, dict) and config.get("controllerMotionEnabled"))
+        robot_sn = robot.get("robotSn") or config.get("robotSn") if isinstance(robot, dict) and isinstance(config, dict) else None
+        pose_field = robot.get("poseField") or config.get("poseField") if isinstance(robot, dict) and isinstance(config, dict) else None
+        camera_serial = config.get("cameraSerial") if isinstance(config, dict) else None
+        recording = bool(self.robot_session is not None)
+        reason = "recording"
+        if not connected:
+            reason = "Flexiv robot is not connected"
+        elif not config.get("cameraSerial"):
+            reason = "RealSense camera serial is empty"
+        elif not recording:
+            reason = self.robot_manager.last_error or "robot RealSense session did not start"
+        elif not motion_armed or not controller_motion:
+            reason = "robot session records images/poses, but controller motion is not armed"
+        return {
+            "enabled": True,
+            "stage": stage,
+            "recording": recording,
+            "reason": reason,
+            "robotConnected": connected,
+            "robotSn": robot_sn,
+            "poseField": pose_field,
+            "cameraSerial": camera_serial,
+            "motionArmed": motion_armed,
+            "controllerMotionEnabled": controller_motion,
+            "activeSession": active,
+        }
 
     def _video_writer(self, side: str, width: int, height: int) -> cv2.VideoWriter:
         existing = self.video_writers.get(side)
@@ -5192,6 +5235,10 @@ function updateCalibrationStatus(event) {
     ...(state.calibration || {}),
     status: event
   };
+  if (event.robotStartStatus) {
+    state.calibration.robotStartStatus = event.robotStartStatus;
+    renderCalibrationStatusDetails(event);
+  }
   if (event.diagnostics && !state.calibration?.failure) {
     renderCalibrationDiagnostics({
       type: 'calibration_failure',
@@ -5202,6 +5249,22 @@ function updateCalibrationStatus(event) {
       failurePath: event.failurePath
     });
   }
+}
+
+function renderCalibrationStatusDetails(event) {
+  const robot = event.robotStartStatus || state.calibration?.robotStartStatus;
+  if (!robot) return;
+  const robotClass = robot.recording && robot.motionArmed && robot.controllerMotionEnabled ? 'calibration-ok' : 'calibration-alert';
+  calibrationDetails.innerHTML = `
+    <div class="${robotClass}">${escapeHtml(event.message || 'PC calibration recording')}</div>
+    <div class="calibration-kv">
+      <span>record</span><span>${escapeHtml(event.recordId || 'n/a')}</span>
+      <span>robot rec</span><span>${robot.recording ? 'yes' : 'no'}</span>
+      <span>robot</span><span>${escapeHtml(robot.robotConnected ? `${robot.robotSn || 'connected'} ${robot.poseField || ''}` : 'not connected')}</span>
+      <span>camera</span><span>${escapeHtml(robot.cameraSerial || 'n/a')}</span>
+      <span>motion</span><span>armed=${Boolean(robot.motionArmed)}, controller=${Boolean(robot.controllerMotionEnabled)}</span>
+      <span>note</span><span>${escapeHtml(robot.reason || 'n/a')}</span>
+    </div>`;
 }
 
 function updateCalibrationResult(event) {
@@ -6245,6 +6308,15 @@ function updateDepthInfo() {
 function updateRobotInfo() {
   const rr = state.data?.robotRealSense;
   if (!rr) {
+    const start = state.data?.summary?.robotStartStatus;
+    if (start) {
+      robotKv.innerHTML = [
+        ['status', 'no robot recording'],
+        ['start', replayRobotStartText(start)],
+        ['note', start.reason || 'n/a']
+      ].map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
+      return;
+    }
     robotKv.innerHTML = '<span>status</span><span>no robot recording</span>';
     return;
   }
@@ -6274,6 +6346,11 @@ function updateRobotInfo() {
     ['quest-base', align.ok ? 'T_world_base ready' : (align.reason || 'n/a')]
   ];
   robotKv.innerHTML = kv.map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
+}
+
+function replayRobotStartText(start) {
+  if (!start) return 'n/a';
+  return `recording=${Boolean(start.recording)}, connected=${Boolean(start.robotConnected)}, armed=${Boolean(start.motionArmed)}, controller=${Boolean(start.controllerMotionEnabled)}`;
 }
 
 function replayMotionSummaryText(session) {
