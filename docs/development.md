@@ -164,6 +164,40 @@ To include the read-only RDK connection test:
 
 The web UI `Diagnostics` button runs the RDK connection attempt in a short-lived subprocess so a failed DDS discovery does not leave `9900/991x` UDP sockets open in the long-running receiver process.
 
+Optional robot/RealSense smoke test before a Quest run:
+
+```bash
+cd /ssd1/shenyibo/Quest3DataCollector
+.venv312/bin/python - <<'PY'
+import time
+from pathlib import Path
+from pc.offline_calibration.scripts.flexiv_realsense_bridge import FlexivRealSenseConfig, FlexivRealSenseManager
+
+manager = FlexivRealSenseManager(FlexivRealSenseConfig(
+    robot_sn="Rizon4-062713",
+    flexiv_network_interfaces=["192.168.2.108"],
+    camera_serial="244222073667",
+    capture_interval_seconds=0.0,
+))
+print(manager.connect_robot({"waitSeconds": 0.2})["ok"])
+session = manager.start_session(
+    Path("/ssd1/shenyibo/Quest3DataCollector/pc/offline_calibration/smoke_robot_realsense"),
+    "smoke_robot_realsense",
+    None,
+)
+for index in range(3):
+    row = session.record_sample({
+        "sampleIndex": index,
+        "recordingTimestampSeconds": index * 0.033,
+        "pcReceivePerfCounterSeconds": time.perf_counter(),
+    })
+    print(row["ok"], row["images"].get("end"), len(row.get("jointpose") or []))
+print(manager.stop_session(session))
+PY
+```
+
+Expected output is three successful rows, three JPEGs under `smoke_robot_realsense/robot_realsense/images/`, and `jointpose` length `7`. This test is read-only for the robot; it does not arm or send motion commands.
+
 ### Web workflow
 
 Open:
