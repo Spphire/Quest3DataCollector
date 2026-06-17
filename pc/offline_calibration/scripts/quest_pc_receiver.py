@@ -599,11 +599,15 @@ class LiveTelemetryVisualizer:
         history_limit: int = 1200,
         robot_manager: FlexivRealSenseManager | None = None,
         adb_path: Path | None = None,
+        calibration_raw_root: Path | None = None,
+        calibration_output_root: Path | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.history_limit = max(1, history_limit)
         self.recording_root = DEFAULT_OUTPUT_ROOT.resolve()
+        self.calibration_raw_root = (calibration_raw_root or DEFAULT_QUEST_LOCAL_ROOT).resolve()
+        self.calibration_output_root = (calibration_output_root or DEFAULT_CALIBRATION_OUTPUT_ROOT).resolve()
         self.robot_manager = robot_manager
         self.adb_path = adb_path
         self.history: list[dict[str, Any]] = []
@@ -806,7 +810,13 @@ class LiveTelemetryVisualizer:
                     self._send_recordings_html()
                     return
                 if parsed.path == "/recordings/list":
-                    self._send_json(recording_replay_list(visualizer.recording_root))
+                    self._send_json(
+                        recording_replay_list(
+                            visualizer.recording_root,
+                            calibration_raw_root=visualizer.calibration_raw_root,
+                            calibration_output_root=visualizer.calibration_output_root,
+                        )
+                    )
                     return
                 if parsed.path == "/recordings/replay":
                     self._send_recording_replay_json(parsed)
@@ -923,7 +933,14 @@ class LiveTelemetryVisualizer:
                     self.send_error(400, "missing recordId")
                     return
                 try:
-                    payload = build_recording_replay_payload(visualizer.recording_root, record_id)
+                    source = first_query(query, "source")
+                    payload = build_recording_replay_payload(
+                        visualizer.recording_root,
+                        record_id,
+                        source=source,
+                        calibration_raw_root=visualizer.calibration_raw_root,
+                        calibration_output_root=visualizer.calibration_output_root,
+                    )
                 except FileNotFoundError as exc:
                     self.send_error(404, str(exc))
                     return
@@ -1501,6 +1518,8 @@ def receive(args: argparse.Namespace) -> int:
             args.visualize_history,
             robot_manager,
             args.viewer_adb,
+            args.calibration_raw_root.resolve(),
+            args.calibration_output_root.resolve(),
         )
         visualizer.start(open_browser=not args.no_open_browser)
     calibration_receiver = None
@@ -2483,47 +2502,81 @@ def visualizer_event_from_message(message: dict[str, Any], wrapper: dict[str, An
     return None
 
 
-def recording_replay_list(recording_root: Path) -> dict[str, Any]:
+def recording_replay_list(
+    recording_root: Path,
+    *,
+    calibration_raw_root: Path | None = None,
+    calibration_output_root: Path | None = None,
+) -> dict[str, Any]:
     root = recording_root.resolve()
     records: list[dict[str, Any]] = []
-    if not root.exists():
-        return {"ok": True, "root": str(root), "records": records}
+    roots = [{"source": "pc", "root": root, "label": "PC UDP"}]
+    if calibration_raw_root is not None:
+        raw_root = calibration_raw_root.resolve()
+        if raw_root != root:
+            roots.append({"source": "raw", "root": raw_root, "label": "B calibration"})
 
-    directories = [item for item in root.iterdir() if item.is_dir()]
     sortable_records: list[tuple[tuple[int, int, int, float], dict[str, Any]]] = []
-    for directory in directories:
-        samples_path = directory / "pc_samples.jsonl"
-        summary_path = directory / "pc_session_summary.json"
-        snapshot_path = directory / "pc_calibration_snapshot.json"
-        if not samples_path.exists():
+    for root_info in roots:
+        current_root = root_info["root"]
+        if not isinstance(current_root, Path) or not current_root.exists():
             continue
-        if samples_path.stat().st_size <= 0:
-            continue
-        summary = read_json_if_exists(summary_path)
-        if not isinstance(summary, dict) or not summary:
-            continue
-        snapshot = read_json_if_exists(snapshot_path)
-        sample_count = None
-        if is_number(summary.get("samples")):
-            sample_count = int(summary["samples"])
-        has_calibration = isinstance(snapshot, dict) and bool(snapshot.get("T_world_board"))
-        robot_summary = robot_realsense_record_summary(directory)
-        record = {
-            "recordId": directory.name,
-            "path": str(directory),
-            "mtime": directory.stat().st_mtime,
-            "samples": sample_count,
-            "hasCalibrationSnapshot": has_calibration,
-            "calibrationRecordId": snapshot.get("recordId") if isinstance(snapshot, dict) else None,
-            "startUtc": summary.get("startUtc"),
-            "closedReason": summary.get("closedReason"),
-            "robotSummary": robot_summary,
-        }
-        sort_samples = sample_count if sample_count is not None else 0
-        sortable_records.append(((1 if has_calibration else 0, sort_samples, directory.stat().st_mtime), record))
+        directories = [item for item in current_root.iterdir() if item.is_dir()]
+        for directory in directories:
+            record = recording_replay_list_record(
+                directory,
+                str(root_info["source"]),
+                str(root_info["label"]),
+                calibration_output_root,
+            )
+            if record is None:
+                continue
+            sample_count = int(record["samples"]) if is_number(record.get("samples")) else 0
+            has_calibration = bool(record.get("hasCalibrationSnapshot"))
+            sortable_records.append(((1 if has_calibration else 0, sample_count, directory.stat().st_mtime), record))
     sortable_records.sort(key=lambda item: item[0], reverse=True)
     records = [record for _, record in sortable_records]
-    return {"ok": True, "root": str(root), "records": records}
+    return {
+        "ok": True,
+        "root": str(root),
+        "rawRoot": str(calibration_raw_root.resolve()) if calibration_raw_root is not None else None,
+        "records": records,
+    }
+
+
+def recording_replay_list_record(
+    directory: Path,
+    source: str,
+    source_label: str,
+    calibration_output_root: Path | None,
+) -> dict[str, Any] | None:
+    samples_path = replay_samples_path(directory, source)
+    if samples_path is None or not samples_path.exists() or samples_path.stat().st_size <= 0:
+        return None
+    summary = replay_summary(directory, source)
+    if not isinstance(summary, dict) or not summary:
+        return None
+    snapshot = replay_snapshot(directory, summary, source, calibration_output_root)
+    sample_count = None
+    if is_number(summary.get("samples")):
+        sample_count = int(summary["samples"])
+    elif is_number(summary.get("trajectorySampleCount")):
+        sample_count = int(summary["trajectorySampleCount"])
+    has_calibration = isinstance(snapshot, dict) and bool(snapshot.get("T_world_board"))
+    robot_summary = robot_realsense_record_summary(directory)
+    return {
+        "recordId": directory.name,
+        "source": source,
+        "sourceLabel": source_label,
+        "path": str(directory),
+        "mtime": directory.stat().st_mtime,
+        "samples": sample_count,
+        "hasCalibrationSnapshot": has_calibration,
+        "calibrationRecordId": snapshot.get("recordId") if isinstance(snapshot, dict) else None,
+        "startUtc": summary.get("startUtc") or summary.get("startTimeUtc"),
+        "closedReason": summary.get("closedReason"),
+        "robotSummary": robot_summary,
+    }
 
 
 def robot_realsense_record_summary(session_dir: Path) -> dict[str, Any] | None:
@@ -2572,29 +2625,126 @@ def robot_realsense_record_summary(session_dir: Path) -> dict[str, Any] | None:
     }
 
 
-def build_recording_replay_payload(recording_root: Path, record_id: str) -> dict[str, Any]:
+def replay_samples_path(session_dir: Path, source: str) -> Path | None:
+    if source == "raw":
+        return session_dir / "trajectory.jsonl"
+    return session_dir / "pc_samples.jsonl"
+
+
+def replay_summary(session_dir: Path, source: str) -> dict[str, Any]:
+    if source == "raw":
+        summary = read_json_if_exists(session_dir / "pc_calibration_session_summary.json")
+        if isinstance(summary, dict) and summary:
+            return summary
+        metadata = read_json_if_exists(session_dir / "quest_camera_metadata.json")
+        return metadata if isinstance(metadata, dict) else {}
+    summary = read_json_if_exists(session_dir / "pc_session_summary.json")
+    return summary if isinstance(summary, dict) else {}
+
+
+def replay_snapshot(
+    session_dir: Path,
+    summary: dict[str, Any],
+    source: str,
+    calibration_output_root: Path | None,
+) -> dict[str, Any]:
+    snapshot = read_json_if_exists(session_dir / "pc_calibration_snapshot.json")
+    if isinstance(snapshot, dict):
+        return snapshot
+    embedded = summary.get("calibrationSnapshot")
+    if isinstance(embedded, dict):
+        return embedded
+    output_dir = summary.get("outputDirectory")
+    result_path = Path(output_dir) / "calibration_result_25mm.json" if isinstance(output_dir, str) and output_dir else None
+    if result_path is not None and result_path.exists():
+        result = read_json_if_exists(result_path)
+        if isinstance(result, dict):
+            return recording_snapshot_from_calibration_result(session_dir.name, result, result_path)
+    if source == "raw" and calibration_output_root is not None:
+        candidate = calibration_output_root.resolve() / session_dir.name / "calibration_result_25mm.json"
+        if candidate.exists():
+            result = read_json_if_exists(candidate)
+            if isinstance(result, dict):
+                return recording_snapshot_from_calibration_result(session_dir.name, result, candidate)
+    return {}
+
+
+def recording_snapshot_from_calibration_result(record_id: str, result: dict[str, Any], result_path: Path) -> dict[str, Any]:
+    event = calibration_result_event(record_id, result, result_path)
+    return {
+        "capturedUtc": datetime.now(timezone.utc).isoformat(),
+        "ok": True,
+        "kind": "result",
+        "recordId": event.get("recordId"),
+        "resultPath": event.get("resultPath"),
+        "pattern": event.get("pattern"),
+        "squareSizeM": event.get("squareSizeM"),
+        "imageYAxis": event.get("imageYAxis"),
+        "T_world_board": event.get("T_world_board"),
+        "T_board_world": event.get("T_board_world"),
+        "questWorldOriginInBoardM": event.get("questWorldOriginInBoardM"),
+        "boardNormalWorld": event.get("boardNormalWorld"),
+        "boardNormalAbsAngleToWorldYDeg": event.get("boardNormalAbsAngleToWorldYDeg"),
+        "bestLagSeconds": event.get("bestLagSeconds"),
+        "keptFrames": event.get("keptFrames"),
+        "inputFrames": event.get("inputFrames"),
+        "medianReprojectionPx": event.get("medianReprojectionPx"),
+        "p90ReprojectionPx": event.get("p90ReprojectionPx"),
+    }
+
+
+def replay_session_dir_for_record(
+    recording_root: Path,
+    record_id: str,
+    source: str | None = None,
+    calibration_raw_root: Path | None = None,
+) -> tuple[Path, str]:
     safe_id = sanitize_name(record_id)
     if safe_id != record_id:
         raise ValueError("invalid recordId")
-    session_dir = (recording_root.resolve() / safe_id).resolve()
-    try:
-        session_dir.relative_to(recording_root.resolve())
-    except ValueError as exc:
-        raise ValueError("recordId is outside recording root") from exc
-    if not session_dir.exists() or not session_dir.is_dir():
-        raise FileNotFoundError(f"recording not found: {safe_id}")
+    candidates: list[tuple[str, Path]] = []
+    if source in (None, "", "pc"):
+        candidates.append(("pc", recording_root.resolve()))
+    if calibration_raw_root is not None and source in (None, "", "raw"):
+        candidates.append(("raw", calibration_raw_root.resolve()))
+    if source not in (None, "", "pc", "raw"):
+        raise ValueError(f"unsupported recording source: {source}")
+    for candidate_source, root in candidates:
+        session_dir = (root / safe_id).resolve()
+        try:
+            session_dir.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("recordId is outside recording root") from exc
+        samples_path = replay_samples_path(session_dir, candidate_source)
+        if session_dir.exists() and session_dir.is_dir() and samples_path is not None and samples_path.exists():
+            return session_dir, candidate_source
+    raise FileNotFoundError(f"recording not found: {safe_id}")
 
-    samples_path = session_dir / "pc_samples.jsonl"
-    if not samples_path.exists():
-        raise FileNotFoundError(f"missing pc_samples.jsonl for {safe_id}")
-    summary = read_json_if_exists(session_dir / "pc_session_summary.json") or {}
+
+def build_recording_replay_payload(
+    recording_root: Path,
+    record_id: str,
+    *,
+    source: str | None = None,
+    calibration_raw_root: Path | None = None,
+    calibration_output_root: Path | None = None,
+) -> dict[str, Any]:
+    safe_id = sanitize_name(record_id)
+    if safe_id != record_id:
+        raise ValueError("invalid recordId")
+    session_dir, resolved_source = replay_session_dir_for_record(
+        recording_root,
+        safe_id,
+        source,
+        calibration_raw_root,
+    )
+    samples_path = replay_samples_path(session_dir, resolved_source)
+    if samples_path is None or not samples_path.exists():
+        raise FileNotFoundError(f"missing samples file for {safe_id}")
+    summary = replay_summary(session_dir, resolved_source)
     if not isinstance(summary, dict) or not summary:
         raise FileNotFoundError(f"recording summary not found for {safe_id}")
-    snapshot = read_json_if_exists(session_dir / "pc_calibration_snapshot.json")
-    if not isinstance(snapshot, dict):
-        snapshot = summary.get("calibrationSnapshot")
-    if not isinstance(snapshot, dict):
-        snapshot = {}
+    snapshot = replay_snapshot(session_dir, summary, resolved_source, calibration_output_root)
 
     board_matrix_world = matrix_from_snapshot(snapshot)
     board_origin_world = matrix_translation(board_matrix_world) if board_matrix_world is not None else [0.0, 0.0, 0.0]
@@ -2619,6 +2769,7 @@ def build_recording_replay_payload(recording_root: Path, record_id: str) -> dict
     return {
         "ok": True,
         "recordId": safe_id,
+        "source": resolved_source,
         "sessionDir": str(session_dir),
         "summary": summary if isinstance(summary, dict) else {},
         "snapshot": snapshot,
@@ -5662,6 +5813,7 @@ const sampleKv = document.getElementById('sampleKv');
 const state = {
   records: [],
   selected: null,
+  selectedSource: null,
   data: null,
   playing: false,
   t: 0,
@@ -5690,7 +5842,7 @@ async function loadRecords() {
   state.records = payload.records || [];
   rootLabel.textContent = payload.root || '';
   renderRecordList();
-  if (!state.selected && state.records.length) loadRecord(state.records[0].recordId);
+  if (!state.selected && state.records.length) loadRecord(state.records[0].recordId, state.records[0].source);
 }
 
 async function loadRobotModel() {
@@ -5711,12 +5863,13 @@ function renderRecordList() {
   for (const record of state.records) {
     if (needle && !record.recordId.toLowerCase().includes(needle)) continue;
     const button = document.createElement('button');
-    button.className = 'record-item' + (record.recordId === state.selected ? ' active' : '');
+    button.className = 'record-item' + (record.recordId === state.selected && record.source === state.selectedSource ? ' active' : '');
     const samples = record.samples ?? 'n/a';
     const calib = record.hasCalibrationSnapshot ? `calib ${record.calibrationRecordId || 'yes'}` : 'no calib';
     const robot = robotRecordSummaryText(record.robotSummary);
-    button.innerHTML = `<span class="record-title">${escapeHtml(record.recordId)}</span><span class="record-meta">${samples} samples | ${escapeHtml(calib)}</span><span class="record-meta">${escapeHtml(robot)}</span><span class="record-meta">${escapeHtml(record.closedReason || '')}</span>`;
-    button.onclick = () => loadRecord(record.recordId);
+    const source = record.sourceLabel || record.source || 'record';
+    button.innerHTML = `<span class="record-title">${escapeHtml(record.recordId)}</span><span class="record-meta">${escapeHtml(source)} | ${samples} samples | ${escapeHtml(calib)}</span><span class="record-meta">${escapeHtml(robot)}</span><span class="record-meta">${escapeHtml(record.closedReason || '')}</span>`;
+    button.onclick = () => loadRecord(record.recordId, record.source);
     recordList.appendChild(button);
   }
 }
@@ -5739,7 +5892,7 @@ function robotRecordSummaryText(summary) {
   if (summary.motionCommands !== undefined) {
     parts.push(`motion ${summary.motionCommands}`);
   }
-  if (Number.isFinite(Number(summary.residualMedianMm))) {
+  if (summary.residualMedianMm !== null && summary.residualMedianMm !== undefined && Number.isFinite(Number(summary.residualMedianMm))) {
     parts.push(`res ${Number(summary.residualMedianMm).toFixed(1)}mm`);
   }
   if (summary.status === 'failed' && summary.failureReason) {
@@ -5748,14 +5901,17 @@ function robotRecordSummaryText(summary) {
   return parts.join(' | ');
 }
 
-async function loadRecord(recordId) {
+async function loadRecord(recordId, source = null) {
   state.selected = recordId;
+  state.selectedSource = source;
   renderRecordList();
   recordTitle.textContent = recordId;
   recordSub.textContent = 'loading...';
   state.playing = false;
   playBtn.textContent = 'Play';
-  const response = await fetch('/recordings/replay?recordId=' + encodeURIComponent(recordId), {cache: 'no-store'});
+  const params = new URLSearchParams({recordId});
+  if (source) params.set('source', source);
+  const response = await fetch('/recordings/replay?' + params.toString(), {cache: 'no-store'});
   if (!response.ok) {
     recordSub.textContent = 'failed to load';
     return;
