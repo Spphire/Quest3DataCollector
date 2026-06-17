@@ -653,10 +653,7 @@ class LiveTelemetryVisualizer:
         self.robot_manager.configure(payload)
         try:
             result = self.robot_manager.check_end_camera_board(WORKSPACE_ROOT / "board_checks")
-            for key in ("imagePath", "overlayPath"):
-                path_text = result.get(key)
-                if isinstance(path_text, str) and path_text:
-                    result[key[:-4] + "Url"] = "/artifact?path=" + quote_path(str(resolve_artifact_path(path_text)))
+            add_board_check_artifact_urls(result)
             self.publish_event({"type": "robot_status", "stage": "board_check", "boardCheck": result})
             return result
         except Exception as exc:
@@ -668,6 +665,19 @@ class LiveTelemetryVisualizer:
             }
             self.publish_event({"type": "robot_status", "stage": "board_check_failed", "boardCheck": result})
             return result
+
+    def latest_robot_board_check_payload(self) -> dict[str, Any]:
+        path = WORKSPACE_ROOT / "board_checks" / "end_camera" / "latest_board_check.json"
+        if not path.exists():
+            return {"ok": False, "reason": "no board check yet"}
+        try:
+            result = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(result, dict):
+                raise ValueError("latest board check is not an object")
+            add_board_check_artifact_urls(result)
+            return result
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "reason": "could not read latest board check"}
 
     def robot_diagnostics_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.robot_manager is None:
@@ -763,6 +773,9 @@ class LiveTelemetryVisualizer:
                     return
                 if parsed.path == "/robot/diagnostics":
                     self._send_json(visualizer.robot_diagnostics_payload({}))
+                    return
+                if parsed.path == "/robot/board-check/latest":
+                    self._send_json(visualizer.latest_robot_board_check_payload())
                     return
                 if parsed.path == "/cameras/list":
                     self._send_json(visualizer.camera_list_payload())
@@ -3308,6 +3321,13 @@ def resolve_artifact_path(path_text: str, must_exist: bool = True) -> Path:
     return path
 
 
+def add_board_check_artifact_urls(result: dict[str, Any]) -> None:
+    for key in ("imagePath", "overlayPath"):
+        path_text = result.get(key)
+        if isinstance(path_text, str) and path_text:
+            result[key[:-4] + "Url"] = "/artifact?path=" + quote_path(str(resolve_artifact_path(path_text)))
+
+
 def quote_path(path_text: str) -> str:
     from urllib.parse import quote
 
@@ -3898,6 +3918,19 @@ async function loadRobotModel() {
   }
 }
 
+async function loadLatestBoardCheck() {
+  try {
+    const response = await fetch('/robot/board-check/latest', {cache: 'no-store'});
+    const payload = await response.json();
+    if (payload?.createdAtUtc || payload?.imageUrl) {
+      state.robotBoardCheck = payload;
+      renderRobotBoardCheck(payload);
+    }
+  } catch (_) {
+    // The board check is optional before the first capture.
+  }
+}
+
 async function refreshCameras() {
   try {
     const response = await fetch('/cameras/list', {cache: 'no-store'});
@@ -4064,6 +4097,11 @@ function updateRobotEvent(event) {
   if (event.diagnostics) {
     state.robotDiagnostics = event.diagnostics;
     renderRobotDiagnostics(event.diagnostics);
+    return;
+  }
+  if (event.boardCheck) {
+    state.robotBoardCheck = event.boardCheck;
+    renderRobotBoardCheck(event.boardCheck);
     return;
   }
   if (event.status) applyRobotStatus(event.status);
@@ -4780,6 +4818,7 @@ connect();
 loadLatestCalibration();
 loadRobotStatus().then(refreshCameras);
 loadRobotModel();
+loadLatestBoardCheck();
 requestAnimationFrame(draw);
 </script>
 </body>
