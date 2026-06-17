@@ -215,7 +215,7 @@ Then:
 3. Click `Connect Robot`.
 4. Click `Check Board` before recording. It captures one end-camera frame, checks for the 11x8 checkerboard, saves the frame/overlay under `board_checks/end_camera/`, and reports brightness. If it says the image is very dark, fix lighting/camera aim before recording.
 5. Optional: click `Arm Motion` if the right controller should drive bounded TCP offsets.
-6. Check the live viewer `Preflight` panel. It aggregates `/preflight/status` and should show OK for Quest live telemetry, Flexiv, End RealSense, checkerboard, and URDF model before a real run.
+6. Check the live viewer `Preflight` panel. It aggregates `/preflight/status` and should show OK for Quest live telemetry, Flexiv, End RealSense, checkerboard, and URDF model before a real run. The right-controller robot-motion row is advisory: it should be OK only if you intend to drive the robot with the right controller during the capture.
 7. Press Quest B once to start PC calibration capture.
 8. Move the Quest for Quest/checkerboard pose diversity.
 9. Move the robot/end camera for robot/checkerboard pose diversity while keeping the checkerboard visible to the end-mounted RealSense in at least six captured samples.

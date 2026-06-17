@@ -3481,10 +3481,13 @@ def build_preflight_status(
     quest_live = isinstance(last_sample, dict) and sample_age is not None and sample_age <= 3.0
     head_ok = bool(last_sample.get("head", {}).get("ok")) if isinstance(last_sample, dict) else False
     gaze_ok = bool(last_sample.get("gaze", {}).get("ok")) if isinstance(last_sample, dict) else False
+    right_controller_ok = bool(last_sample.get("right", {}).get("ok")) if isinstance(last_sample, dict) else False
 
     robot = robot_status.get("robot") if isinstance(robot_status, dict) else {}
     robot_config = robot_status.get("config") if isinstance(robot_status, dict) else {}
     robot_connected = bool(isinstance(robot, dict) and robot.get("connected"))
+    motion_armed = bool(isinstance(robot, dict) and robot.get("motionArmed"))
+    motion_enabled = bool(isinstance(robot_config, dict) and robot_config.get("controllerMotionEnabled"))
     camera_serial = str(robot_config.get("cameraSerial") or "") if isinstance(robot_config, dict) else ""
     cameras = camera_status.get("cameras") if isinstance(camera_status, dict) else []
     camera_serials = {
@@ -3541,8 +3544,18 @@ def build_preflight_status(
             if model_ok
             else str(model_status.get("reason") or "missing model"),
         },
+        {
+            "id": "robotMotion",
+            "label": "Right controller robot motion",
+            "ok": bool(motion_armed and motion_enabled and right_controller_ok),
+            "required": False,
+            "detail": (
+                f"armed={motion_armed}, controllerMotion={motion_enabled}, rightPose={right_controller_ok}; "
+                "OK only needed when the right controller should drive robot motion"
+            ),
+        },
     ]
-    ok = all(bool(check.get("ok")) for check in checks)
+    ok = all(bool(check.get("ok")) for check in checks if check.get("required", True))
     return {
         "ok": ok,
         "ready": ok,
@@ -3836,6 +3849,9 @@ label {
 }
 .preflight-badge.ok {
   color: #b8f58f;
+}
+.preflight-badge.note {
+  color: #8fc8ff;
 }
 .preflight-detail {
   color: var(--muted);
@@ -4342,9 +4358,12 @@ function renderPreflight(payload) {
   const checks = Array.isArray(payload?.checks) ? payload.checks : [];
   preflightList.innerHTML = checks.map(check => {
     const ok = Boolean(check.ok);
+    const advisory = check.required === false;
+    const badge = ok ? 'OK' : (advisory ? 'NOTE' : 'CHECK');
+    const badgeClass = ok ? 'ok' : (advisory ? 'note' : '');
     return `
       <div class="preflight-row">
-        <div class="preflight-badge ${ok ? 'ok' : ''}">${ok ? 'OK' : 'CHECK'}</div>
+        <div class="preflight-badge ${badgeClass}">${badge}</div>
         <div>
           <div>${escapeHtml(check.label || check.id || '')}</div>
           <div class="preflight-detail">${escapeHtml(check.detail || '')}</div>
