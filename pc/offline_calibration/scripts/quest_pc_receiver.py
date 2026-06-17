@@ -21,6 +21,15 @@ from typing import Any
 import cv2
 import numpy as np
 
+from flexiv_realsense_bridge import (
+    DEFAULT_END_CAMERA_SERIAL,
+    DEFAULT_FLEXIV_RDK_ROOT,
+    DEFAULT_FLEXIV_ROBOT_SN,
+    FlexivRealSenseConfig,
+    FlexivRealSenseManager,
+    RobotRealsenseSession,
+)
+
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = WORKSPACE_ROOT / "pc_recordings"
@@ -168,6 +177,47 @@ def main() -> int:
         "--no-calibrate-after-pc-recording",
         action="store_true",
         help="Write PC calibration raw records but do not run calibrate_records_25mm.py after stop.",
+    )
+    receive_parser.add_argument(
+        "--no-flexiv-realsense",
+        action="store_true",
+        help="Disable Flexiv/RealSense controls and synchronized robot capture.",
+    )
+    receive_parser.add_argument(
+        "--flexiv-robot-sn",
+        default=DEFAULT_FLEXIV_ROBOT_SN,
+        help=f"Default Flexiv robot serial shown in the web UI. Default: {DEFAULT_FLEXIV_ROBOT_SN}",
+    )
+    receive_parser.add_argument(
+        "--flexiv-pose-field",
+        choices=["flange_pose", "tcp_pose"],
+        default="flange_pose",
+        help="RobotStates field to record as the end-effector pose. Default: flange_pose",
+    )
+    receive_parser.add_argument(
+        "--flexiv-rdk",
+        type=Path,
+        default=DEFAULT_FLEXIV_RDK_ROOT,
+        help="Optional legacy Flexiv RDK root containing lib_py. Default: use the active Python flexivrdk package.",
+    )
+    receive_parser.add_argument(
+        "--realsense-serial",
+        default=DEFAULT_END_CAMERA_SERIAL,
+        help=f"Default end-mounted RealSense serial. Default: {DEFAULT_END_CAMERA_SERIAL}",
+    )
+    receive_parser.add_argument("--realsense-width", type=int, default=1280, help="RealSense color width. Default: 1280")
+    receive_parser.add_argument("--realsense-height", type=int, default=720, help="RealSense color height. Default: 720")
+    receive_parser.add_argument("--realsense-fps", type=int, default=30, help="RealSense color FPS. Default: 30")
+    receive_parser.add_argument(
+        "--robot-capture-interval",
+        type=float,
+        default=0.35,
+        help="Seconds between synchronized robot/RealSense captures during B-button calibration. Default: 0.35",
+    )
+    receive_parser.add_argument(
+        "--no-robot-hand-eye",
+        action="store_true",
+        help="Record robot/RealSense samples but skip automatic robot hand-eye calibration after B-button stop.",
     )
     receive_parser.set_defaults(func=receive)
 
@@ -487,11 +537,18 @@ class SessionWriter:
 
 
 class LiveTelemetryVisualizer:
-    def __init__(self, host: str, port: int, history_limit: int = 1200) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        history_limit: int = 1200,
+        robot_manager: FlexivRealSenseManager | None = None,
+    ) -> None:
         self.host = host
         self.port = port
         self.history_limit = max(1, history_limit)
         self.recording_root = DEFAULT_OUTPUT_ROOT.resolve()
+        self.robot_manager = robot_manager
         self.history: list[dict[str, Any]] = []
         self.clients: list[queue.Queue[str | None]] = []
         self.lock = threading.Lock()
@@ -538,6 +595,37 @@ class LiveTelemetryVisualizer:
             except queue.Full:
                 pass
 
+    def robot_status_payload(self) -> dict[str, Any]:
+        if self.robot_manager is None:
+            return {"ok": False, "enabled": False, "reason": "disabled"}
+        return self.robot_manager.status()
+
+    def camera_list_payload(self) -> dict[str, Any]:
+        if self.robot_manager is None:
+            return {"ok": False, "enabled": False, "reason": "disabled", "cameras": []}
+        return self.robot_manager.list_cameras()
+
+    def configure_robot_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.robot_manager is None:
+            return {"ok": False, "enabled": False, "reason": "disabled"}
+        status = self.robot_manager.configure(payload)
+        self.publish_event({"type": "robot_status", "stage": "configured", "status": status})
+        return status
+
+    def connect_robot_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.robot_manager is None:
+            return {"ok": False, "enabled": False, "reason": "disabled"}
+        result = self.robot_manager.connect_robot(payload)
+        self.publish_event({"type": "robot_status", "stage": "connect", **result})
+        return result
+
+    def disconnect_robot_payload(self) -> dict[str, Any]:
+        if self.robot_manager is None:
+            return {"ok": False, "enabled": False, "reason": "disabled"}
+        status = self.robot_manager.disconnect_robot()
+        self.publish_event({"type": "robot_status", "stage": "disconnect", "status": status})
+        return status
+
     def _make_server(self) -> ThreadingHTTPServer:
         visualizer = self
 
@@ -566,10 +654,44 @@ class LiveTelemetryVisualizer:
                 if parsed.path == "/calibration/latest":
                     self._send_json(latest_calibration_snapshot(DEFAULT_CALIBRATION_OUTPUT_ROOT))
                     return
+                if parsed.path == "/robot/status":
+                    self._send_json(visualizer.robot_status_payload())
+                    return
+                if parsed.path == "/cameras/list":
+                    self._send_json(visualizer.camera_list_payload())
+                    return
                 if parsed.path == "/artifact":
                     self._send_artifact(parsed)
                     return
                 self.send_error(404)
+
+            def do_POST(self) -> None:  # noqa: N802
+                parsed = urlparse(self.path)
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    self.send_error(400, "bad Content-Length")
+                    return
+                if length < 0 or length > 1024 * 1024:
+                    self.send_error(413, "request body too large")
+                    return
+                body = self.rfile.read(length)
+                try:
+                    payload = json.loads(body.decode("utf-8")) if body else {}
+                    if not isinstance(payload, dict):
+                        raise ValueError("JSON body must be an object")
+                    if parsed.path == "/robot/configure":
+                        self._send_json(visualizer.configure_robot_payload(payload))
+                        return
+                    if parsed.path == "/robot/connect":
+                        self._send_json(visualizer.connect_robot_payload(payload))
+                        return
+                    if parsed.path == "/robot/disconnect":
+                        self._send_json(visualizer.disconnect_robot_payload())
+                        return
+                    self.send_error(404)
+                except Exception as exc:
+                    self.send_error(500, str(exc))
 
             def log_message(self, format: str, *args: Any) -> None:
                 return
@@ -702,6 +824,7 @@ class PcCalibrationSession:
         start_message: dict[str, Any],
         visualizer: "LiveTelemetryVisualizer | None",
         run_calibration: bool,
+        robot_manager: FlexivRealSenseManager | None = None,
     ) -> None:
         self.record_id = sanitize_name(record_id)
         self.raw_root = raw_root.resolve()
@@ -712,6 +835,9 @@ class PcCalibrationSession:
         self.output_directory = unique_directory(self.output_root / self.record_id)
         self.visualizer = visualizer
         self.run_calibration = run_calibration
+        self.robot_manager = robot_manager
+        self.robot_session: RobotRealsenseSession | None = None
+        self.robot_realsense_directory: Path | None = None
 
         metadata = dict(start_message.get("metadata") or {})
         metadata["outputDirectory"] = str(self.directory)
@@ -742,6 +868,14 @@ class PcCalibrationSession:
         self.start_perf = time.perf_counter()
         self.closed = False
         self.lock = threading.Lock()
+        if self.robot_manager is not None:
+            self.robot_session = self.robot_manager.start_session(
+                self.directory,
+                self.record_id,
+                self.visualizer.publish_event if self.visualizer is not None else None,
+            )
+            if self.robot_session is not None:
+                self.robot_realsense_directory = self.robot_session.directory
         self.publish_status("recording", 0.0, "PC calibration recording")
 
     def write_frame(self, side: str, query: dict[str, list[str]], body: bytes) -> None:
@@ -791,6 +925,11 @@ class PcCalibrationSession:
             self.trajectory_file.write(json_line(sample))
             self.trajectory_file.flush()
             self.sample_count += 1
+            robot_session = self.robot_session
+        if robot_session is not None:
+            robot_sample = dict(sample)
+            robot_sample["pcReceivePerfCounterSeconds"] = message.get("pcReceivePerfCounterSeconds")
+            robot_session.record_sample(robot_sample)
 
     def close(self, stop_message: dict[str, Any] | None = None) -> dict[str, Any]:
         with self.lock:
@@ -813,11 +952,23 @@ class PcCalibrationSession:
             self.metadata["rightFrameCount"] = self.frame_counts["right"]
             self.metadata["trajectorySampleCount"] = self.sample_count
             self.metadata["recordingQualitySummary"] = self._quality_summary()
+            robot_session = self.robot_session
+            self.robot_session = None
+            if robot_session is not None:
+                self.robot_realsense_directory = robot_session.directory
+            robot_summary = None
+        if self.robot_manager is not None and robot_session is not None:
+            robot_summary = self.robot_manager.stop_session(robot_session)
+        with self.lock:
+            if robot_summary is not None:
+                self.metadata["robotRealSenseSummary"] = robot_summary
             (self.directory / "quest_camera_metadata.json").write_text(
                 json.dumps(self.metadata, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
             summary = self.summary("calibration_stop")
+            if robot_summary is not None:
+                summary["robotRealSense"] = robot_summary
             (self.directory / "pc_calibration_session_summary.json").write_text(
                 json.dumps(summary, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -838,6 +989,7 @@ class PcCalibrationSession:
             "leftFrames": self.frame_counts["left"],
             "rightFrames": self.frame_counts["right"],
             "samples": self.sample_count,
+            "robotRealSenseDirectory": str(self.robot_realsense_directory) if self.robot_realsense_directory is not None else None,
         }
 
     def publish_status(self, stage: str, progress: float, message: str, **extra: Any) -> None:
@@ -948,6 +1100,24 @@ class PcCalibrationSession:
         if self.visualizer is not None:
             self.visualizer.publish_event(event)
         self.publish_status("done", 1.0, "Calibration complete", resultPath=str(result_path))
+        if self.robot_manager is not None and self.robot_realsense_directory is not None:
+            self._run_robot_hand_eye_worker(event)
+
+    def _run_robot_hand_eye_worker(self, quest_calibration_event: dict[str, Any]) -> None:
+        if self.robot_manager is None or self.robot_realsense_directory is None:
+            return
+        if not self.robot_manager.config.run_hand_eye:
+            return
+        self.publish_status("robot_calibrating", 1.0, "Running Flexiv/RealSense hand-eye calibration")
+        result = self.robot_manager.calibrate_session(
+            self.robot_realsense_directory,
+            quest_calibration_event,
+            self.visualizer.publish_event if self.visualizer is not None else None,
+        )
+        if result.get("ok"):
+            self.publish_status("robot_done", 1.0, "Flexiv/RealSense hand-eye calibration complete")
+        else:
+            self.publish_status("robot_failed", 1.0, result.get("error") or "Flexiv/RealSense hand-eye calibration failed")
 
 
 class PcCalibrationHttpReceiver:
@@ -959,6 +1129,7 @@ class PcCalibrationHttpReceiver:
         output_root: Path,
         visualizer: LiveTelemetryVisualizer | None,
         run_calibration: bool,
+        robot_manager: FlexivRealSenseManager | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -966,6 +1137,7 @@ class PcCalibrationHttpReceiver:
         self.output_root = output_root
         self.visualizer = visualizer
         self.run_calibration = run_calibration
+        self.robot_manager = robot_manager
         self.sessions: dict[str, PcCalibrationSession] = {}
         self.lock = threading.Lock()
         self.server = self._make_server()
@@ -1037,6 +1209,7 @@ class PcCalibrationHttpReceiver:
                         message,
                         receiver.visualizer,
                         receiver.run_calibration,
+                        receiver.robot_manager,
                     )
                     receiver.sessions[record_id] = session
                 print(f"Started PC calibration raw record: {session.directory}", flush=True)
@@ -1060,6 +1233,8 @@ class PcCalibrationHttpReceiver:
                 session = receiver._session(record_id)
                 if session is None:
                     raise ValueError(f"unknown calibration recordId: {record_id}")
+                message["pcReceiveUnixSeconds"] = time.time()
+                message["pcReceivePerfCounterSeconds"] = time.perf_counter()
                 session.write_sample(message)
                 self._json_response({"ok": True})
 
@@ -1090,12 +1265,28 @@ class PcCalibrationHttpReceiver:
 def receive(args: argparse.Namespace) -> int:
     output_root = args.output_root.resolve()
     output_root.mkdir(parents=True, exist_ok=True)
+    robot_manager = None
+    if not args.no_flexiv_realsense:
+        robot_manager = FlexivRealSenseManager(
+            FlexivRealSenseConfig(
+                robot_sn=args.flexiv_robot_sn,
+                robot_pose_field=args.flexiv_pose_field,
+                flexiv_rdk=args.flexiv_rdk,
+                camera_serial=args.realsense_serial,
+                width=args.realsense_width,
+                height=args.realsense_height,
+                fps=args.realsense_fps,
+                capture_interval_seconds=args.robot_capture_interval,
+                run_hand_eye=not args.no_robot_hand_eye,
+            )
+        )
     visualizer = None
     if args.visualize:
         visualizer = LiveTelemetryVisualizer(
             args.visualize_host,
             args.visualize_port,
             args.visualize_history,
+            robot_manager,
         )
         visualizer.start(open_browser=not args.no_open_browser)
     calibration_receiver = None
@@ -1107,6 +1298,7 @@ def receive(args: argparse.Namespace) -> int:
             args.calibration_output_root.resolve(),
             visualizer,
             run_calibration=not args.no_calibrate_after_pc_recording,
+            robot_manager=robot_manager,
         )
         calibration_receiver.start()
 
@@ -2050,6 +2242,7 @@ def build_recording_replay_payload(recording_root: Path, record_id: str) -> dict
 
     gaze_diagnostics = build_gaze_depth_diagnostics(raw_rows, snapshot)
     enrich_replay_samples_with_gaze_diagnostics(samples, gaze_diagnostics, board_origin_world)
+    robot_realsense = build_robot_realsense_replay(session_dir, board_origin_world)
 
     return {
         "ok": True,
@@ -2061,8 +2254,64 @@ def build_recording_replay_payload(recording_root: Path, record_id: str) -> dict
         "boardOriginWorld": board_origin_world,
         "boardMatrix": board_matrix_display,
         "gazeDepthDiagnostics": gaze_diagnostics.get("summary", {}),
+        "robotRealSense": robot_realsense,
         "samples": samples,
     }
+
+
+def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict[str, Any] | None:
+    robot_dir = session_dir / "robot_realsense"
+    samples_path = robot_dir / "samples.jsonl"
+    if not samples_path.exists():
+        return None
+    rows: list[dict[str, Any]] = []
+    with samples_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                continue
+            pose = row.get("T_base_ee") if isinstance(row.get("T_base_ee"), dict) else None
+            translated_pose = translate_transform_payload(pose, origin) if pose is not None else None
+            rows.append(
+                {
+                    "sampleIndex": row.get("sample_index"),
+                    "questSampleIndex": row.get("quest_sample_index"),
+                    "recordingTimestampSeconds": row.get("quest_recording_timestamp_seconds"),
+                    "ok": bool(row.get("ok")),
+                    "T_base_ee": pose,
+                    "T_display_ee": translated_pose,
+                    "jointpose": row.get("jointpose"),
+                    "error": row.get("error"),
+                }
+            )
+    result = read_json_if_exists(robot_dir / "robot_hand_eye_result.json")
+    failure = read_json_if_exists(robot_dir / "robot_hand_eye_failure.json")
+    return {
+        "directory": str(robot_dir),
+        "samples": rows,
+        "result": result if isinstance(result, dict) else None,
+        "failure": failure if isinstance(failure, dict) else None,
+    }
+
+
+def translate_transform_payload(payload: dict[str, Any] | None, origin: list[float]) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    matrix = payload.get("matrix_4x4")
+    if not isinstance(matrix, list) or len(matrix) < 4:
+        return None
+    try:
+        result = [[float(row[col]) for col in range(4)] for row in matrix[:4]]
+        for index in range(3):
+            result[index][3] -= origin[index]
+        translated = dict(payload)
+        translated["matrix_4x4"] = result
+        translated["translation_m"] = [result[0][3], result[1][3], result[2][3]]
+        return translated
+    except (TypeError, ValueError, IndexError):
+        return None
 
 
 def matrix_from_snapshot(snapshot: dict[str, Any]) -> list[list[float]] | None:
@@ -3092,6 +3341,47 @@ label {
   background: #0e1216;
   color: #aeb8c1;
 }
+.robot-panel {
+  border-top: 1px solid var(--line);
+  margin-top: 12px;
+  padding-top: 12px;
+  display: grid;
+  gap: 8px;
+}
+.robot-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.robot-panel label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.robot-panel input,
+.robot-panel select {
+  width: 100%;
+  color: var(--text);
+  background: #10161b;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font: inherit;
+}
+.robot-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.robot-status {
+  white-space: pre-wrap;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+  background: #0e1216;
+}
 #status {
   white-space: pre-wrap;
   color: var(--muted);
@@ -3145,6 +3435,40 @@ label {
       <div class="calibration-progress"><div id="mCalibrationFill" class="calibration-progress-fill"></div></div>
     </div>
     <div id="calibrationDetails" class="calibration-details"></div>
+    <div class="robot-panel">
+      <h1>Flexiv / RealSense</h1>
+      <label>End RealSense
+        <select id="robotCamera"></select>
+      </label>
+      <div class="robot-grid">
+        <label>Robot SN
+          <input id="robotSn" spellcheck="false">
+        </label>
+        <label>Pose field
+          <select id="robotPoseField">
+            <option value="flange_pose">flange_pose</option>
+            <option value="tcp_pose">tcp_pose</option>
+          </select>
+        </label>
+      </div>
+      <div class="robot-grid">
+        <label>Capture interval
+          <input id="robotInterval" type="number" min="0.05" step="0.05">
+        </label>
+        <label>Hand-eye
+          <select id="robotHandEye">
+            <option value="true">auto</option>
+            <option value="false">record only</option>
+          </select>
+        </label>
+      </div>
+      <div class="robot-actions">
+        <button id="robotRefresh">Refresh Cameras</button>
+        <button id="robotConnect">Connect Robot</button>
+        <button id="robotDisconnect">Disconnect</button>
+      </div>
+      <div id="robotStatus" class="robot-status">disabled or loading</div>
+    </div>
     <div id="status"></div>
   </aside>
 </div>
@@ -3168,6 +3492,15 @@ const statusEl = document.getElementById('status');
 const recordingBanner = document.getElementById('recordingBanner');
 const recordingLabel = document.getElementById('recordingLabel');
 const recordingDetail = document.getElementById('recordingDetail');
+const robotCamera = document.getElementById('robotCamera');
+const robotSn = document.getElementById('robotSn');
+const robotPoseField = document.getElementById('robotPoseField');
+const robotInterval = document.getElementById('robotInterval');
+const robotHandEye = document.getElementById('robotHandEye');
+const robotRefresh = document.getElementById('robotRefresh');
+const robotConnect = document.getElementById('robotConnect');
+const robotDisconnect = document.getElementById('robotDisconnect');
+const robotStatus = document.getElementById('robotStatus');
 
 const state = {
   frames: [],
@@ -3180,7 +3513,10 @@ const state = {
   dragging: false,
   lastPointer: [0, 0],
   counts: {head: 0, left: 0, right: 0},
-  calibration: null
+  calibration: null,
+  robot: null,
+  robotSample: null,
+  robotCalibration: null
 };
 
 function resize() {
@@ -3244,6 +3580,12 @@ function connect() {
       updateCalibrationResult(sample);
     } else if (sample.type === 'calibration_failure') {
       updateCalibrationFailure(sample);
+    } else if (sample.type === 'robot_status') {
+      updateRobotEvent(sample);
+    } else if (sample.type === 'robot_sample') {
+      updateRobotSample(sample);
+    } else if (sample.type === 'robot_calibration_result' || sample.type === 'robot_calibration_failure') {
+      updateRobotCalibration(sample);
     }
   };
 }
@@ -3258,6 +3600,140 @@ async function loadLatestCalibration() {
   } catch (_) {
     // The live stream still works if the snapshot endpoint is unavailable.
   }
+}
+
+async function loadRobotStatus() {
+  try {
+    const response = await fetch('/robot/status', {cache: 'no-store'});
+    const payload = await response.json();
+    applyRobotStatus(payload);
+  } catch (error) {
+    robotStatus.textContent = String(error);
+  }
+}
+
+async function refreshCameras() {
+  try {
+    const response = await fetch('/cameras/list', {cache: 'no-store'});
+    const payload = await response.json();
+    const current = robotCamera.value;
+    robotCamera.innerHTML = '';
+    for (const camera of payload.cameras || []) {
+      const option = document.createElement('option');
+      option.value = camera.serial || '';
+      option.textContent = `${camera.serial || 'unknown'} ${camera.name || ''}`;
+      robotCamera.appendChild(option);
+    }
+    if (current) robotCamera.value = current;
+    if (!robotCamera.value && state.robot?.config?.cameraSerial) robotCamera.value = state.robot.config.cameraSerial;
+    if (!payload.ok) robotStatus.textContent = payload.error || payload.reason || 'camera list unavailable';
+  } catch (error) {
+    robotStatus.textContent = String(error);
+  }
+}
+
+function robotPayloadFromControls() {
+  return {
+    robotSn: robotSn.value.trim(),
+    poseField: robotPoseField.value,
+    cameraSerial: robotCamera.value,
+    captureIntervalSeconds: Number(robotInterval.value || 0.35),
+    runHandEye: robotHandEye.value === 'true'
+  };
+}
+
+async function configureRobot() {
+  const response = await fetch('/robot/configure', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(robotPayloadFromControls())
+  });
+  applyRobotStatus(await response.json());
+}
+
+async function connectRobot() {
+  robotConnect.disabled = true;
+  robotStatus.textContent = 'connecting...';
+  try {
+    const response = await fetch('/robot/connect', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(robotPayloadFromControls())
+    });
+    const payload = await response.json();
+    applyRobotStatus(payload.status || payload);
+    if (!payload.ok) robotStatus.textContent += `\nerror: ${payload.error || 'connect failed'}`;
+  } catch (error) {
+    robotStatus.textContent = String(error);
+  } finally {
+    robotConnect.disabled = false;
+  }
+}
+
+async function disconnectRobot() {
+  const response = await fetch('/robot/disconnect', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+  applyRobotStatus(await response.json());
+}
+
+function updateRobotEvent(event) {
+  if (event.status) applyRobotStatus(event.status);
+  else renderRobotStatus(event);
+}
+
+function updateRobotSample(event) {
+  state.robotSample = event;
+  renderRobotStatus(state.robot);
+}
+
+function updateRobotCalibration(event) {
+  state.robotCalibration = event;
+  renderRobotStatus(state.robot);
+}
+
+function applyRobotStatus(payload) {
+  state.robot = payload;
+  const config = payload?.config || {};
+  if (config.robotSn && !robotSn.value) robotSn.value = config.robotSn;
+  if (config.poseField) robotPoseField.value = config.poseField;
+  if (config.cameraSerial && !robotCamera.value) {
+    const existing = Array.from(robotCamera.options).some(option => option.value === config.cameraSerial);
+    if (!existing) {
+      const option = document.createElement('option');
+      option.value = config.cameraSerial;
+      option.textContent = `${config.cameraSerial} configured`;
+      robotCamera.appendChild(option);
+    }
+    robotCamera.value = config.cameraSerial;
+  }
+  if (Number.isFinite(config.captureIntervalSeconds)) robotInterval.value = config.captureIntervalSeconds;
+  if (typeof config.runHandEye === 'boolean') robotHandEye.value = config.runHandEye ? 'true' : 'false';
+  renderRobotStatus(payload);
+}
+
+function renderRobotStatus(payload) {
+  if (!payload) {
+    robotStatus.textContent = 'loading';
+    return;
+  }
+  if (payload.enabled === false) {
+    robotStatus.textContent = 'disabled';
+    return;
+  }
+  const robot = payload.robot || {};
+  const lines = [
+    `robot: ${robot.connected ? 'connected' : 'not connected'} ${robot.robotSn || ''}`.trim(),
+    `pose: ${robot.poseField || 'n/a'}`,
+    `camera: ${payload.config?.cameraSerial || 'n/a'}`,
+    `session: ${payload.activeSession ? `${payload.activeSession.samples || 0} samples, ${payload.activeSession.images || 0} images` : 'idle'}`
+  ];
+  if (state.robotSample) {
+    lines.push(`last sample: ${state.robotSample.sampleIndex} quest ${state.robotSample.questSampleIndex}`);
+  }
+  if (state.robotCalibration) {
+    lines.push(state.robotCalibration.type === 'robot_calibration_result' ? 'hand-eye: done' : `hand-eye: failed ${state.robotCalibration.error || ''}`);
+  }
+  if (robot.lastError || payload.lastError) lines.push(`error: ${robot.lastError || payload.lastError}`);
+  robotStatus.textContent = lines.join('\n');
 }
 
 function ingest(sample) {
@@ -3748,6 +4224,12 @@ resetButton.addEventListener('click', resetView);
 clearButton.addEventListener('click', () => {
   state.frames = state.frames.slice(-1);
 });
+robotRefresh.addEventListener('click', refreshCameras);
+robotConnect.addEventListener('click', connectRobot);
+robotDisconnect.addEventListener('click', disconnectRobot);
+for (const input of [robotCamera, robotSn, robotPoseField, robotInterval, robotHandEye]) {
+  input.addEventListener('change', configureRobot);
+}
 document.getElementById('records').addEventListener('click', () => {
   window.location.href = '/recordings';
 });
@@ -3756,6 +4238,7 @@ window.addEventListener('resize', resize);
 resize();
 connect();
 loadLatestCalibration();
+loadRobotStatus().then(refreshCameras);
 requestAnimationFrame(draw);
 </script>
 </body>
@@ -3784,6 +4267,7 @@ RECORDINGS_REPLAY_HTML = r"""<!doctype html>
   --gaze: #ffd65c;
   --hit: #ff9b54;
   --board: #f2c94c;
+  --robot: #ffffff;
 }
 * { box-sizing: border-box; }
 body {
@@ -3918,6 +4402,7 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
       <span class="pill"><span class="dot" style="background:var(--right)"></span>Right</span>
       <span class="pill"><span class="dot" style="background:var(--gaze)"></span>Gaze3D</span>
       <span class="pill"><span class="dot" style="background:var(--hit)"></span>Hit</span>
+      <span class="pill"><span class="dot" style="background:var(--robot)"></span>Robot EE</span>
     </div>
     <div class="section">
       <div class="ok">Calibration snapshot</div>
@@ -3926,6 +4411,10 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
     <div class="section">
       <div class="ok">Gaze depth</div>
       <div class="kv" id="depthKv"></div>
+    </div>
+    <div class="section">
+      <div class="ok">Robot / RealSense</div>
+      <div class="kv" id="robotKv"></div>
     </div>
     <div class="section">
       <div class="ok">Sample</div>
@@ -3953,6 +4442,7 @@ const sampleLabel = document.getElementById('sampleLabel');
 const recordingLabel = document.getElementById('recordingLabel');
 const snapKv = document.getElementById('snapKv');
 const depthKv = document.getElementById('depthKv');
+const robotKv = document.getElementById('robotKv');
 const sampleKv = document.getElementById('sampleKv');
 
 const state = {
@@ -3968,7 +4458,7 @@ const state = {
   target: [0,0,0],
   dragging: false,
   lastPointer: [0,0],
-  trails: {head: [], left: [], right: [], gaze: [], gazeFiltered: [], gazeBoardPlane: [], hit: []}
+  trails: {head: [], left: [], right: [], gaze: [], gazeFiltered: [], gazeBoardPlane: [], hit: [], robot: []}
 };
 
 function resize() {
@@ -4027,7 +4517,7 @@ async function loadRecord(recordId) {
 }
 
 function buildTrails() {
-  state.trails = {head: [], left: [], right: [], gaze: [], gazeFiltered: [], gazeBoardPlane: [], hit: []};
+  state.trails = {head: [], left: [], right: [], gaze: [], gazeFiltered: [], gazeBoardPlane: [], hit: [], robot: []};
   for (const s of state.data?.samples || []) {
     if (s.head?.p) state.trails.head.push(s.head.p);
     if (s.left?.p) state.trails.left.push(s.left.p);
@@ -4036,6 +4526,10 @@ function buildTrails() {
     if (s.gazeFiltered?.p) state.trails.gazeFiltered.push(s.gazeFiltered.p);
     if (s.gazeBoardPlane?.p) state.trails.gazeBoardPlane.push(s.gazeBoardPlane.p);
     if (s.gazeHit?.p) state.trails.hit.push(s.gazeHit.p);
+  }
+  for (const row of state.data?.robotRealSense?.samples || []) {
+    const p = matrixTranslation(row.T_display_ee?.matrix_4x4);
+    if (p) state.trails.robot.push(p);
   }
 }
 
@@ -4065,6 +4559,7 @@ function updateSnapshotInfo() {
   ];
   snapKv.innerHTML = kv.map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
   updateDepthInfo();
+  updateRobotInfo();
   recordSub.textContent = `${state.data.samples.length} samples`;
 }
 
@@ -4085,6 +4580,26 @@ function updateDepthInfo() {
     ['spikes', `>50mm ${spikes.gt50mm ?? 'n/a'}, >100mm ${spikes.gt100mm ?? 'n/a'}`]
   ];
   depthKv.innerHTML = kv.map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
+}
+
+function updateRobotInfo() {
+  const rr = state.data?.robotRealSense;
+  if (!rr) {
+    robotKv.innerHTML = '<span>status</span><span>no robot recording</span>';
+    return;
+  }
+  const result = rr.result || {};
+  const counts = result.counts || {};
+  const residual = result.end_camera?.residuals?.translation_mm || {};
+  const align = result.questAlignment || {};
+  const kv = [
+    ['samples', String(rr.samples?.length || 0)],
+    ['detections', counts.detections ?? 'n/a'],
+    ['hand-eye', result.ok ? 'ok' : (rr.failure ? 'failed' : 'pending')],
+    ['residual', Number.isFinite(residual.median) ? `med ${residual.median.toFixed(1)}mm p95 ${Number(residual.p95 || 0).toFixed(1)}mm` : 'n/a'],
+    ['quest-base', align.ok ? 'T_world_base ready' : (align.reason || 'n/a')]
+  ];
+  robotKv.innerHTML = kv.map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
 }
 
 function statText(stats, unit) {
@@ -4150,6 +4665,10 @@ function resetView() {
       if (s[key]?.p) pts.push(s[key].p);
     }
   }
+  for (const row of state.data?.robotRealSense?.samples || []) {
+    const p = matrixTranslation(row.T_display_ee?.matrix_4x4);
+    if (p) pts.push(p);
+  }
   if (!pts.length) {
     state.distance = 1.45;
     return;
@@ -4181,6 +4700,7 @@ function render() {
   drawTrails();
   const s = currentSample();
   if (!s) return;
+  drawRobotForSample(s);
   const head = s.head?.p;
   const gaze = currentGazePoint(s);
   const hit = s.gazeHit?.p;
@@ -4251,6 +4771,7 @@ function drawTrails() {
   if (gazeMode.value === 'filtered' || gazeMode.value === 'all') drawTrail(state.trails.gazeFiltered, 'rgba(70,220,255,.34)');
   if (gazeMode.value === 'board' || gazeMode.value === 'all') drawTrail(state.trails.gazeBoardPlane, 'rgba(170,255,132,.34)');
   drawTrail(state.trails.hit, 'rgba(255,155,84,.25)');
+  drawTrail(state.trails.robot, 'rgba(255,255,255,.38)');
 }
 
 function currentGazePoint(s) {
@@ -4287,6 +4808,35 @@ function drawPose(pose, color, label, axisScale) {
   drawLine(pose.p, add(pose.p, quatRotate(q, [0,axisScale,0])), '#42e875', 2.1);
   drawLine(pose.p, add(pose.p, quatRotate(q, [0,0,axisScale])), '#4b7cff', 2.1);
   drawPoint(pose.p, color, label === 'head' ? 6 : 5, label);
+}
+
+function drawRobotForSample(sample) {
+  const robot = nearestRobotSample(sample.recordingTimestampSeconds);
+  const matrix = robot?.T_display_ee?.matrix_4x4;
+  if (!matrix) return;
+  const p = matrixTranslation(matrix);
+  if (!p) return;
+  drawPoint(p, '#ffffff', 6, 'EE');
+  drawLine(p, matrixPoint(matrix, 0.08, 0, 0), '#ff4545', 2.3);
+  drawLine(p, matrixPoint(matrix, 0, 0.08, 0), '#42e875', 2.3);
+  drawLine(p, matrixPoint(matrix, 0, 0, 0.08), '#4b7cff', 2.3);
+}
+
+function nearestRobotSample(t) {
+  const rows = state.data?.robotRealSense?.samples || [];
+  if (!rows.length) return null;
+  if (!Number.isFinite(t)) return rows[0];
+  let best = rows[0], bestDt = Infinity;
+  for (const row of rows) {
+    const rt = Number(row.recordingTimestampSeconds);
+    if (!Number.isFinite(rt)) continue;
+    const dt = Math.abs(rt - t);
+    if (dt < bestDt) {
+      best = row;
+      bestDt = dt;
+    }
+  }
+  return best;
 }
 
 function drawPoint(p, color, radius, label) {
@@ -4332,11 +4882,20 @@ function project(p) {
 }
 
 function boardPoint(m, x, y, z) {
+  return matrixPoint(m, x, y, z);
+}
+
+function matrixPoint(m, x, y, z) {
   return [
     m[0][0]*x + m[0][1]*y + m[0][2]*z + m[0][3],
     m[1][0]*x + m[1][1]*y + m[1][2]*z + m[1][3],
     m[2][0]*x + m[2][1]*y + m[2][2]*z + m[2][3]
   ];
+}
+
+function matrixTranslation(m) {
+  if (!Array.isArray(m) || m.length < 3) return null;
+  return [Number(m[0]?.[3]), Number(m[1]?.[3]), Number(m[2]?.[3])];
 }
 
 function quatRotate(q, v) {
