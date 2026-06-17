@@ -662,6 +662,15 @@ class LiveTelemetryVisualizer:
             return {"ok": False, "enabled": False, "reason": "disabled", "cameras": []}
         return self.robot_manager.list_cameras()
 
+    def preflight_status_payload(self) -> dict[str, Any]:
+        with self.lock:
+            last_sample = next((event for event in reversed(self.history) if event.get("type") == "sample"), None)
+        robot_status = self.robot_status_payload()
+        camera_status = self.camera_list_payload()
+        board_status = self.latest_robot_board_check_payload()
+        model_status = rizon4_model_payload()
+        return build_preflight_status(last_sample, robot_status, camera_status, board_status, model_status)
+
     def robot_board_check_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.robot_manager is None:
             return {"ok": False, "enabled": False, "reason": "disabled"}
@@ -807,6 +816,9 @@ class LiveTelemetryVisualizer:
                     return
                 if parsed.path == "/quest/adb/status":
                     self._send_json(visualizer.quest_adb_status_payload())
+                    return
+                if parsed.path == "/preflight/status":
+                    self._send_json(visualizer.preflight_status_payload())
                     return
                 if parsed.path == "/robot/status":
                     self._send_json(visualizer.robot_status_payload())
@@ -3455,6 +3467,92 @@ def rizon4_model_payload() -> dict[str, Any]:
     }
 
 
+def build_preflight_status(
+    last_sample: dict[str, Any] | None,
+    robot_status: dict[str, Any],
+    camera_status: dict[str, Any],
+    board_status: dict[str, Any],
+    model_status: dict[str, Any],
+) -> dict[str, Any]:
+    now = time.time()
+    sample_age = None
+    if isinstance(last_sample, dict) and is_number(last_sample.get("pcReceiveUnixSeconds")):
+        sample_age = max(0.0, now - float(last_sample["pcReceiveUnixSeconds"]))
+    quest_live = isinstance(last_sample, dict) and sample_age is not None and sample_age <= 3.0
+    head_ok = bool(last_sample.get("head", {}).get("ok")) if isinstance(last_sample, dict) else False
+    gaze_ok = bool(last_sample.get("gaze", {}).get("ok")) if isinstance(last_sample, dict) else False
+
+    robot = robot_status.get("robot") if isinstance(robot_status, dict) else {}
+    robot_config = robot_status.get("config") if isinstance(robot_status, dict) else {}
+    robot_connected = bool(isinstance(robot, dict) and robot.get("connected"))
+    camera_serial = str(robot_config.get("cameraSerial") or "") if isinstance(robot_config, dict) else ""
+    cameras = camera_status.get("cameras") if isinstance(camera_status, dict) else []
+    camera_serials = {
+        str(camera.get("serial"))
+        for camera in cameras
+        if isinstance(camera, dict) and camera.get("serial") is not None
+    }
+    camera_ok = bool(camera_serial and camera_serial in camera_serials)
+
+    board_ok = bool(board_status.get("ok")) if isinstance(board_status, dict) else False
+    board_corners = board_status.get("detectedCorners") if isinstance(board_status, dict) else None
+    board_rmse = board_status.get("bestReprojectionRmsePx") if isinstance(board_status, dict) else None
+    model_ok = bool(model_status.get("ok")) if isinstance(model_status, dict) else False
+    active_joints = model_status.get("activeJointNames") if isinstance(model_status, dict) else []
+    active_joint_count = len(active_joints) if isinstance(active_joints, list) else 0
+
+    checks = [
+        {
+            "id": "questLive",
+            "label": "Quest live telemetry",
+            "ok": bool(quest_live and head_ok and gaze_ok),
+            "detail": f"sample age {sample_age:.2f}s, head={head_ok}, gaze={gaze_ok}" if sample_age is not None else "no live sample yet",
+        },
+        {
+            "id": "flexiv",
+            "label": "Flexiv robot",
+            "ok": robot_connected,
+            "detail": f"{robot.get('robotSn') or robot_config.get('robotSn') or 'n/a'} {robot.get('poseField') or robot_config.get('poseField') or ''}".strip()
+            if isinstance(robot, dict)
+            else "robot disabled",
+        },
+        {
+            "id": "realsense",
+            "label": "End RealSense",
+            "ok": camera_ok,
+            "detail": f"{camera_serial or 'not selected'}; detected {len(camera_serials)} camera(s)",
+        },
+        {
+            "id": "board",
+            "label": "End camera checkerboard",
+            "ok": board_ok,
+            "detail": (
+                f"{board_corners or 0} corners"
+                + (f", {float(board_rmse):.2f}px rmse" if is_number(board_rmse) else "")
+            )
+            if board_status
+            else "no board check yet",
+        },
+        {
+            "id": "model",
+            "label": "URDF robot model",
+            "ok": model_ok and active_joint_count >= 7,
+            "detail": f"{model_status.get('name') or 'Rizon4'}, {active_joint_count} active joints"
+            if model_ok
+            else str(model_status.get("reason") or "missing model"),
+        },
+    ]
+    ok = all(bool(check.get("ok")) for check in checks)
+    return {
+        "ok": ok,
+        "ready": ok,
+        "timestampUnixSeconds": now,
+        "sampleAgeSeconds": sample_age,
+        "checks": checks,
+        "summary": "ready for B-button calibration" if ok else "check required items before B-button calibration",
+    }
+
+
 def parse_float_triplet(text: str | None, default: list[float]) -> list[float]:
     if not text:
         return list(default)
@@ -3700,6 +3798,49 @@ label {
   background: #f2c94c;
   transition: width 160ms ease;
 }
+.preflight-panel {
+  border-top: 1px solid var(--line);
+  padding: 10px 0;
+  display: grid;
+  gap: 8px;
+}
+.preflight-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.preflight-status {
+  font-weight: 700;
+  color: #ffd66b;
+}
+.preflight-status.ready {
+  color: #b8f58f;
+}
+.preflight-list {
+  display: grid;
+  gap: 5px;
+}
+.preflight-row {
+  display: grid;
+  grid-template-columns: 58px 1fr;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: #0e1216;
+}
+.preflight-badge {
+  font-weight: 700;
+  color: #ffd66b;
+}
+.preflight-badge.ok {
+  color: #b8f58f;
+}
+.preflight-detail {
+  color: var(--muted);
+  font-size: 12px;
+}
 .calibration-details {
   display: grid;
   gap: 8px;
@@ -3902,6 +4043,14 @@ label {
     <div class="metric"><strong>Samples</strong><span id="mSamples">0</span></div>
     <div class="metric"><strong>Current</strong><span id="mCurrent">n/a</span></div>
     <div class="metric"><strong>Pose Count</strong><span id="mCounts">head 0, left 0, right 0</span></div>
+    <div class="preflight-panel">
+      <div class="preflight-head">
+        <strong>Preflight</strong>
+        <button id="preflightRefresh">Refresh</button>
+      </div>
+      <div id="preflightStatus" class="preflight-status">checking</div>
+      <div id="preflightList" class="preflight-list"></div>
+    </div>
     <div class="metric">
       <strong>Calibration</strong><span id="mCalibration">idle</span>
       <div class="calibration-progress"><div id="mCalibrationFill" class="calibration-progress-fill"></div></div>
@@ -4006,6 +4155,9 @@ const mCurrent = document.getElementById('mCurrent');
 const mCounts = document.getElementById('mCounts');
 const mCalibration = document.getElementById('mCalibration');
 const mCalibrationFill = document.getElementById('mCalibrationFill');
+const preflightRefresh = document.getElementById('preflightRefresh');
+const preflightStatus = document.getElementById('preflightStatus');
+const preflightList = document.getElementById('preflightList');
 const calibrationDetails = document.getElementById('calibrationDetails');
 const statusEl = document.getElementById('status');
 const recordingBanner = document.getElementById('recordingBanner');
@@ -4059,7 +4211,9 @@ const state = {
   robotWorldBase: null,
   robotModel: null,
   robotCalibration: null,
-  questAdb: null
+  questAdb: null,
+  preflight: null,
+  lastPreflightRefreshMs: 0
 };
 
 function resize() {
@@ -4169,6 +4323,34 @@ async function loadRobotModel() {
   }
   if (state.robotBoardCheck) renderRobotBoardCheck(state.robotBoardCheck);
   else if (state.robot) renderRobotStatus(state.robot);
+}
+
+async function loadPreflightStatus() {
+  try {
+    const response = await fetch('/preflight/status', {cache: 'no-store'});
+    renderPreflight(await response.json());
+  } catch (error) {
+    renderPreflight({ok: false, ready: false, summary: String(error), checks: []});
+  }
+}
+
+function renderPreflight(payload) {
+  state.preflight = payload || {};
+  const ready = Boolean(payload?.ready);
+  preflightStatus.classList.toggle('ready', ready);
+  preflightStatus.textContent = ready ? 'READY' : (payload?.summary || 'check required');
+  const checks = Array.isArray(payload?.checks) ? payload.checks : [];
+  preflightList.innerHTML = checks.map(check => {
+    const ok = Boolean(check.ok);
+    return `
+      <div class="preflight-row">
+        <div class="preflight-badge ${ok ? 'ok' : ''}">${ok ? 'OK' : 'CHECK'}</div>
+        <div>
+          <div>${escapeHtml(check.label || check.id || '')}</div>
+          <div class="preflight-detail">${escapeHtml(check.detail || '')}</div>
+        </div>
+      </div>`;
+  }).join('');
 }
 
 async function loadQuestAdbStatus() {
@@ -4296,6 +4478,7 @@ async function connectRobot() {
     const payload = await response.json();
     applyRobotStatus(payload.status || payload);
     if (!payload.ok) robotStatus.textContent += `\nerror: ${payload.error || 'connect failed'}`;
+    loadPreflightStatus();
   } catch (error) {
     robotStatus.textContent = String(error);
   } finally {
@@ -4336,6 +4519,7 @@ async function checkRobotBoard() {
     const payload = await response.json();
     state.robotBoardCheck = payload;
     renderRobotBoardCheck(payload);
+    loadPreflightStatus();
   } catch (error) {
     robotStatus.textContent = String(error);
   } finally {
@@ -4587,10 +4771,18 @@ function ingest(sample) {
   if (sample.right?.ok) state.counts.right++;
   mSamples.textContent = String(Number(mSamples.textContent || '0') + 1);
   mCounts.textContent = `head ${state.counts.head}, left ${state.counts.left}, right ${state.counts.right}`;
+  maybeRefreshPreflight();
   if (followHead && followHead.checked) {
     const p = relPose(sample.head);
     if (p) state.target = p;
   }
+}
+
+function maybeRefreshPreflight() {
+  const now = performance.now();
+  if (state.lastPreflightRefreshMs && now - state.lastPreflightRefreshMs < 2500) return;
+  state.lastPreflightRefreshMs = now;
+  loadPreflightStatus();
 }
 
 function updateRecordingStatus(frame) {
@@ -5170,6 +5362,7 @@ robotConnect.addEventListener('click', connectRobot);
 robotArmMotion.addEventListener('click', armRobotMotion);
 robotDisarmMotion.addEventListener('click', disarmRobotMotion);
 robotDisconnect.addEventListener('click', disconnectRobot);
+preflightRefresh.addEventListener('click', loadPreflightStatus);
 questAdbRefresh.addEventListener('click', loadQuestAdbStatus);
 questCalibStart.addEventListener('click', () => sendQuestCalibrationCommand('calib_start'));
 questCalibStop.addEventListener('click', () => sendQuestCalibrationCommand('calib_stop'));
@@ -5187,6 +5380,7 @@ loadLatestCalibration();
 loadRobotStatus().then(refreshCameras);
 loadRobotModel();
 loadLatestBoardCheck();
+loadPreflightStatus();
 loadQuestAdbStatus();
 requestAnimationFrame(draw);
 </script>
