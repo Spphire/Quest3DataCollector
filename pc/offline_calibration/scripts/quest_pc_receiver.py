@@ -1314,6 +1314,8 @@ class PcCalibrationSession:
                 diagnostics=failure_event.get("diagnostics"),
                 returnCode=returncode,
             )
+            if self.robot_manager is not None and self.robot_realsense_directory is not None:
+                self._run_robot_hand_eye_worker(failure_event)
             return
         result_path = self.output_directory / "calibration_result_25mm.json"
         result = json.loads(result_path.read_text(encoding="utf-8"))
@@ -1326,12 +1328,18 @@ class PcCalibrationSession:
         if self.robot_manager is not None and self.robot_realsense_directory is not None:
             self._run_robot_hand_eye_worker(event)
 
-    def _run_robot_hand_eye_worker(self, quest_calibration_event: dict[str, Any]) -> None:
+    def _run_robot_hand_eye_worker(self, quest_calibration_event: dict[str, Any] | None) -> None:
         if self.robot_manager is None or self.robot_realsense_directory is None:
             return
         if not self.robot_manager.config.run_hand_eye:
             return
-        self.publish_status("robot_calibrating", 1.0, "Running Flexiv/RealSense hand-eye calibration")
+        has_quest_alignment = bool(is_successful_calibration_snapshot(quest_calibration_event))
+        message = (
+            "Running Flexiv/RealSense hand-eye calibration"
+            if has_quest_alignment
+            else "Running Flexiv/RealSense hand-eye calibration without Quest-board alignment"
+        )
+        self.publish_status("robot_calibrating", 1.0, message)
         result = self.robot_manager.calibrate_session(
             self.robot_realsense_directory,
             quest_calibration_event,
