@@ -6094,20 +6094,25 @@ function updateRobotInfo() {
     return;
   }
   const result = rr.result || {};
-  const counts = result.counts || {};
+  const failure = rr.failure || {};
+  const counts = result.counts || failure.counts || {};
   const residual = result.end_camera?.residuals?.translation_mm || {};
   const align = result.questAlignment || {};
-  const diversity = result.diversity || rr.poseDiversity;
+  const diversity = result.diversity || failure.diversity || rr.poseDiversity;
   const sample = state.data?.samples?.[state.idx] || {};
   const robot = nearestRobotSample(sample.recordingTimestampSeconds);
   const fkError = replayRobotFkErrorMm(robot);
+  const detections = counts.requiredDetections !== undefined
+    ? `${counts.detections ?? 'n/a'} / ${counts.requiredDetections}`
+    : (counts.detections ?? 'n/a');
   const kv = [
     ['samples', String(rr.samples?.length || 0)],
-    ['detections', counts.detections ?? 'n/a'],
+    ['detections', detections],
     ['model', replayRobotModelStatusText()],
     ['URDF FK', Number.isFinite(fkError) ? `${fkError.toFixed(1)}mm vs flange` : 'n/a'],
     ['ee motion', replayPoseDiversityText(diversity)],
     ['hand-eye', result.ok ? 'ok' : (rr.failure ? 'failed' : 'pending')],
+    ['failure', rr.failure?.error || 'n/a'],
     ['residual', Number.isFinite(residual.median) ? `med ${residual.median.toFixed(1)}mm p95 ${Number(residual.p95 || 0).toFixed(1)}mm` : 'n/a'],
     ['quest-base', align.ok ? 'T_world_base ready' : (align.reason || 'n/a')]
   ];
