@@ -14,6 +14,8 @@ This repository is a thin packaging of the Quest 3 chessboard calibration workfl
 - `sampleIndex` is the primary join key between Quest trajectory and PC samples.
 - `gazePoint3DWorld` is considered a world-space gaze point, not a camera reprojection result.
 - PC replay is read-only.
+- Replay keeps Quest world rotation unchanged and only translates the board near the origin for inspection.
+- Robot replay should expose both `T_display_tool_tcp` and `T_display_end_camera`, plus the recorded end-camera MP4 and camera metadata.
 
 ## Runtime paths
 
@@ -214,8 +216,8 @@ Then:
 2. Enter the Flexiv robot SN.
 3. Click `Connect Robot`.
 4. Click `Check Board` before recording. It captures one end-camera frame, checks for the 11x8 checkerboard, saves the frame/overlay under `board_checks/end_camera/`, and reports brightness. If it says the image is very dark, fix lighting/camera aim before recording.
-5. Optional: click `Arm Motion` if the right controller should drive bounded TCP offsets.
-6. Check the live viewer `Preflight` panel. It aggregates `/preflight/status` and should show OK for Quest live telemetry, Flexiv, End RealSense, checkerboard, and URDF model before a real run. The right-controller robot-motion row is advisory: it should be OK only if you intend to drive the robot with the right controller during the capture.
+5. Connect the robot. Robot motion is armed automatically when the robot session starts, so the right controller can drive bounded TCP offsets during B-button calibration.
+6. Check the live viewer `Preflight` panel. It aggregates `/preflight/status` and should show OK for Quest live telemetry, Flexiv, End RealSense, checkerboard, and URDF model before a real run. The right-controller robot-motion row is advisory and should report armed motion once the robot session is live.
 7. Press Quest B once to start PC calibration capture.
 8. Move the Quest for Quest/checkerboard pose diversity.
 9. Move the robot/end camera for robot/checkerboard pose diversity while keeping the checkerboard visible to the end-mounted RealSense in at least six captured samples.
@@ -243,9 +245,11 @@ The PC receiver writes:
 
 - Quest videos/frame metadata/trajectory under `raw/<recordId>/`.
 - Robot states, `jointpose`, `T_base_ee`, and RealSense images under `raw/<recordId>/robot_realsense/`.
-- Right-controller robot target commands under `raw/<recordId>/robot_realsense/controller_motion.jsonl` when `Arm Motion` is enabled. Motion rows include the controller anchor, robot TCP anchor, total offset, per-step offset, and target TCP pose so the relative controller-to-robot command can be audited after the run.
+- Right-controller robot target commands under `raw/<recordId>/robot_realsense/controller_motion.jsonl` while the robot session is live. Motion rows include the controller anchor, robot TCP anchor, total offset, per-step offset, and target TCP pose so the relative controller-to-robot command can be audited after the run.
 - Quest/checkerboard result under `outputs/pc_live_calibration/<recordId>/`.
 - Robot hand-eye result under `raw/<recordId>/robot_realsense/robot_hand_eye_result.json`.
+- Robot camera serials and intrinsics under `raw/<recordId>/robot_realsense/cameras.json` and `capture_config.json`.
+- End-camera video and robot replay metadata are stored as MP4 plus JSON/JSONL under `raw/<recordId>/robot_realsense/videos/` and `raw/<recordId>/robot_realsense/video_frames.jsonl`.
 
 When both Quest/checkerboard and robot hand-eye succeed, the bridge computes:
 
@@ -263,6 +267,7 @@ This unifies Quest world, checkerboard, and robot base in the live/replay visual
 - RealSense intrinsics come from `pyrealsense2` color stream metadata.
 - The board is fixed at 11x8 inner corners, 25 mm square size.
 - Hand-eye calibration solves `T_ee_realsense` and `T_base_board` from repeated end-camera observations of the fixed board.
+- A red marker near one of the four corner squares is treated as an optional global orientation hint to resolve the 180-degree checkerboard ambiguity. If no red anchor is present in a frame, the solver may still use the frame by trying the identity and 180-degree corner orderings. A single reliable red-anchored frame can orient the whole record.
 - Replay keeps Quest axes and translates the view near the board origin; robot EE samples are drawn as white points with local RGB axes.
 - A Flexiv Rizon4 URDF asset is stored at `pc/offline_calibration/assets/urdf/flexiv_Rizon4_kinematics.urdf` and served by the live viewer at `/robot/urdf`. The live and replay viewers parse the URDF joint chain, draw the robot as a line skeleton from recorded `jointpose`, and report the URDF FK-vs-`flange_pose` translation error when a robot sample is available.
 

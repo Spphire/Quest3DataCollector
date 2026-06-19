@@ -510,6 +510,8 @@ namespace EyeTracking.Recording
             double recordingTimestampSeconds,
             string telemetryMode)
         {
+            ResolveTelemetrySender();
+
             bool previousHasLeftFrame = hasLatestLeftFrame;
             bool previousHasRightFrame = hasLatestRightFrame;
             FrameMetadata previousLeftFrame = latestLeftFrame;

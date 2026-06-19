@@ -20,8 +20,15 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from typing import Any
 
+os.environ.setdefault("OPENCV_OPENCL_RUNTIME", "disabled")
+
 import cv2
 import numpy as np
+
+try:
+    cv2.ocl.setUseOpenCL(False)
+except Exception:
+    pass
 
 from flexiv_realsense_bridge import (
     DEFAULT_END_CAMERA_SERIAL,
@@ -34,6 +41,8 @@ from flexiv_realsense_bridge import (
     DEFAULT_GRIPPER_SPEED_MPS,
     DEFAULT_GRIPPER_TRIGGER_CLOSE_THRESHOLD,
     DEFAULT_GRIPPER_TRIGGER_OPEN_THRESHOLD,
+    DEFAULT_CONTROLLER_MAX_ROTATION_DEG,
+    DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG,
     FlexivRealSenseConfig,
     FlexivRealSenseManager,
     RobotRealsenseSession,
@@ -60,7 +69,7 @@ DEFAULT_RIZON4_URDF = WORKSPACE_ROOT / "assets" / "urdf" / "flexiv_Rizon4_kinema
 LATE_RECORDING_SAMPLE_GRACE_SECONDS = 5.0
 MAX_CALIBRATION_HTTP_BODY_BYTES = 8 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
-ALLOWED_ARTIFACT_SUFFIXES = {".html", ".json", ".jsonl", ".log", ".jpg", ".jpeg", ".png"}
+ALLOWED_ARTIFACT_SUFFIXES = {".html", ".json", ".jsonl", ".log", ".jpg", ".jpeg", ".png", ".mp4"}
 QUEST_RECORD_COMMAND_PATH = "/sdcard/Android/data/com.Apricity.EyeTrackingTest/files/record_command.txt"
 DEFAULT_ADB = Path(
     r"C:\Program Files\Unity\Hub\Editor\6000.0.60f1\Editor\Data\PlaybackEngines\AndroidPlayer\SDK\platform-tools\adb.exe"
@@ -287,6 +296,21 @@ def main() -> int:
         help="Maximum TCP target position change per received sample, in meters. Default: 0.015",
     )
     receive_parser.add_argument(
+        "--controller-motion-max-rotation",
+        type=float,
+        default=DEFAULT_CONTROLLER_MAX_ROTATION_DEG,
+        help=f"Maximum TCP rotation from the controller anchor, in degrees. Default: {DEFAULT_CONTROLLER_MAX_ROTATION_DEG}",
+    )
+    receive_parser.add_argument(
+        "--controller-motion-max-rotation-step",
+        type=float,
+        default=DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG,
+        help=(
+            "Maximum TCP target rotation change per received sample, in degrees. "
+            f"Default: {DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG}"
+        ),
+    )
+    receive_parser.add_argument(
         "--enable-gripper",
         action="store_true",
         help="Enable Flexiv gripper trigger control during synchronized robot sessions.",
@@ -468,7 +492,10 @@ class SessionWriter:
                 self.record_id,
                 self.visualizer.publish_event if self.visualizer is not None else None,
                 robot_alignment_result=robot_alignment,
-                require_controller_alignment=True,
+                # Calibration needs to be able to drive the robot before Quest-board
+                # alignment exists; the robot motion layer already falls back to an
+                # unaligned controller mapping when no T_world_base is available.
+                require_controller_alignment=False,
             )
             if self.robot_session is not None:
                 self.robot_realsense_directory = self.robot_session.directory
@@ -681,6 +708,8 @@ class SessionWriter:
         config = status.get("config") if isinstance(status, dict) else {}
         active = status.get("activeSession") if isinstance(status, dict) else None
         connected = bool(isinstance(robot, dict) and robot.get("connected"))
+        motion_armed = bool(isinstance(robot, dict) and robot.get("motionArmed"))
+        controller_motion = bool(isinstance(config, dict) and config.get("controllerMotionEnabled"))
         recording = bool(self.robot_session is not None)
         reason = "recording"
         if not connected:
@@ -689,6 +718,10 @@ class SessionWriter:
             reason = "RealSense camera serial is empty"
         elif not recording:
             reason = self.robot_manager.last_error or "robot RealSense session did not start"
+        elif not motion_armed:
+            reason = self.robot_manager.last_error or "robot motion is not armed"
+        else:
+            reason = "recording; hold right middle-finger trigger to teleoperate"
         return {
             "enabled": True,
             "stage": stage,
@@ -699,8 +732,10 @@ class SessionWriter:
             "poseField": robot.get("poseField") if isinstance(robot, dict) else None,
             "cameraSerial": config.get("cameraSerial") if isinstance(config, dict) else None,
             "thirdCameraSerial": config.get("thirdCameraSerial") if isinstance(config, dict) else None,
-            "motionArmed": bool(isinstance(robot, dict) and robot.get("motionArmed")),
-            "controllerMotionEnabled": bool(isinstance(config, dict) and config.get("controllerMotionEnabled")),
+            "motionArmed": motion_armed,
+            "controllerMotionEnabled": controller_motion,
+            "teleopRequiresRightSideButton": True,
+            "teleopRequiresRightHandTrigger": True,
             "gripperEnabled": bool(isinstance(config, dict) and config.get("gripperEnabled")),
             "activeSession": active,
         }
@@ -735,6 +770,21 @@ class LiveTelemetryVisualizer:
         self.history: list[dict[str, Any]] = []
         self.clients: list[queue.Queue[str | None]] = []
         self.lock = threading.Lock()
+        self.udp_status: dict[str, Any] = {
+            "listening": False,
+            "bind": None,
+            "totalDatagrams": 0,
+            "sampleDatagrams": 0,
+            "recordingDatagrams": 0,
+            "lastReceiveUnixSeconds": None,
+            "lastReceiveUtc": None,
+            "lastRemote": None,
+            "lastType": None,
+            "lastRecordId": None,
+            "lastSampleIndex": None,
+            "lastIsRecording": None,
+            "lastBytes": None,
+        }
         self.server = self._make_server()
         self.thread = threading.Thread(target=self.server.serve_forever, name="quest-telemetry-visualizer", daemon=True)
 
@@ -764,6 +814,30 @@ class LiveTelemetryVisualizer:
             return
         self.publish_event(event)
 
+    def set_udp_listener(self, host: str, port: int) -> None:
+        with self.lock:
+            self.udp_status["listening"] = True
+            self.udp_status["bind"] = f"{host}:{port}"
+
+    def note_udp_datagram(self, message: dict[str, Any], wrapper: dict[str, Any], byte_count: int) -> None:
+        msg_type = str(message.get("type") or "?")
+        is_sample = msg_type == "sample"
+        is_recording = bool(message.get("isRecording", True)) if is_sample else msg_type in ("recording_start", "recording_stop")
+        with self.lock:
+            self.udp_status["totalDatagrams"] = int(self.udp_status.get("totalDatagrams") or 0) + 1
+            if is_sample:
+                self.udp_status["sampleDatagrams"] = int(self.udp_status.get("sampleDatagrams") or 0) + 1
+            if is_recording:
+                self.udp_status["recordingDatagrams"] = int(self.udp_status.get("recordingDatagrams") or 0) + 1
+            self.udp_status["lastReceiveUnixSeconds"] = wrapper.get("pcReceiveUnixSeconds")
+            self.udp_status["lastReceiveUtc"] = wrapper.get("pcReceiveUtc")
+            self.udp_status["lastRemote"] = wrapper.get("remote")
+            self.udp_status["lastType"] = msg_type
+            self.udp_status["lastRecordId"] = message.get("recordId")
+            self.udp_status["lastSampleIndex"] = message.get("sampleIndex")
+            self.udp_status["lastIsRecording"] = is_recording
+            self.udp_status["lastBytes"] = int(byte_count)
+
     def publish_event(self, event: dict[str, Any]) -> None:
         payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         with self.lock:
@@ -788,16 +862,43 @@ class LiveTelemetryVisualizer:
             return {"ok": False, "enabled": False, "reason": "disabled", "cameras": []}
         return self.robot_manager.list_cameras()
 
+    def start_realsense_stream_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.robot_manager is None:
+            return {"ok": False, "enabled": False, "reason": "disabled"}
+        self.robot_manager.configure(payload)
+        result = self.robot_manager.start_realsense_stream()
+        self.publish_event({"type": "robot_status", "stage": "realsense_stream_start", **result})
+        return result
+
+    def stop_realsense_stream_payload(self) -> dict[str, Any]:
+        if self.robot_manager is None:
+            return {"ok": False, "enabled": False, "reason": "disabled"}
+        result = self.robot_manager.stop_realsense_stream()
+        self.publish_event({"type": "robot_status", "stage": "realsense_stream_stop", **result})
+        return result
+
+    def robot_end_camera_frame_payload(self, overlay: bool = False) -> tuple[bytes, dict[str, Any]]:
+        return self.robot_camera_frame_payload("end", overlay=overlay)
+
+    def robot_camera_frame_payload(self, role: str = "end", overlay: bool = False) -> tuple[bytes, dict[str, Any]]:
+        if self.robot_manager is None:
+            raise RuntimeError("Flexiv/RealSense support is disabled")
+        role = str(role or "end").strip().lower()
+        if overlay and role == "end":
+            return self.robot_manager.capture_end_camera_overlay_jpeg()
+        return self.robot_manager.capture_camera_preview_jpeg(role)
+
     def preflight_status_payload(self) -> dict[str, Any]:
         with self.lock:
             recent_samples = [event for event in self.history if event.get("type") == "sample"]
             last_sample = recent_samples[-1] if recent_samples else None
             controller_window = recent_controller_status(recent_samples)
+            udp_status = dict(self.udp_status)
         robot_status = self.robot_status_payload()
         camera_status = self.camera_list_payload()
         board_status = self.latest_robot_board_check_payload()
         model_status = rizon4_model_payload()
-        return build_preflight_status(last_sample, controller_window, robot_status, camera_status, board_status, model_status)
+        return build_preflight_status(last_sample, controller_window, robot_status, camera_status, board_status, model_status, udp_status)
 
     def robot_board_check_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.robot_manager is None:
@@ -890,6 +991,7 @@ class LiveTelemetryVisualizer:
                 "error": "right_controller_pose_missing",
                 "message": "Right Touch controller pose is required before arming robot motion.",
                 "controllerWindow": controller_window,
+                "status": self.robot_manager.status(),
             }
             self.publish_event({"type": "robot_status", "stage": "arm_motion_rejected", **result})
             return result
@@ -963,7 +1065,7 @@ class LiveTelemetryVisualizer:
                     self._send_recording_replay_json(parsed)
                     return
                 if parsed.path == "/calibration/latest":
-                    self._send_json(latest_calibration_snapshot(DEFAULT_CALIBRATION_OUTPUT_ROOT))
+                    self._send_json(latest_calibration_snapshot(visualizer.calibration_output_root))
                     return
                 if parsed.path == "/quest/adb/status":
                     self._send_json(visualizer.quest_adb_status_payload())
@@ -980,6 +1082,12 @@ class LiveTelemetryVisualizer:
                 if parsed.path == "/robot/board-check/latest":
                     self._send_json(visualizer.latest_robot_board_check_payload())
                     return
+                if parsed.path == "/robot/end-camera/frame":
+                    self._send_robot_camera_frame(parsed, default_role="end")
+                    return
+                if parsed.path == "/robot/camera-frame":
+                    self._send_robot_camera_frame(parsed, default_role="end")
+                    return
                 if parsed.path == "/cameras/list":
                     self._send_json(visualizer.camera_list_payload())
                     return
@@ -988,6 +1096,9 @@ class LiveTelemetryVisualizer:
                     return
                 if parsed.path == "/robot/model":
                     self._send_json(rizon4_model_payload())
+                    return
+                if parsed.path == "/robot/mesh":
+                    self._send_robot_mesh(parsed)
                     return
                 if parsed.path == "/artifact":
                     self._send_artifact(parsed)
@@ -1020,6 +1131,12 @@ class LiveTelemetryVisualizer:
                         return
                     if parsed.path == "/robot/board-check":
                         self._send_json(visualizer.robot_board_check_payload(payload))
+                        return
+                    if parsed.path == "/robot/realsense-stream/start":
+                        self._send_json(visualizer.start_realsense_stream_payload(payload))
+                        return
+                    if parsed.path == "/robot/realsense-stream/stop":
+                        self._send_json(visualizer.stop_realsense_stream_payload())
                         return
                     if parsed.path == "/robot/disconnect":
                         self._send_json(visualizer.disconnect_robot_payload())
@@ -1064,6 +1181,39 @@ class LiveTelemetryVisualizer:
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _send_robot_camera_frame(self, parsed: Any, default_role: str = "end") -> None:
+                # Keep live preview on the shared stream hub, but do not run per-frame
+                # checkerboard overlay here; OpenCV detection is too heavy for live UI.
+                query = parse_qs(parsed.query)
+                role = (first_query(query, "role") or default_role or "end").strip().lower()
+                overlay = False
+                try:
+                    data, meta = visualizer.robot_camera_frame_payload(role=role, overlay=overlay)
+                except Exception as exc:
+                    self.send_error(503, str(exc))
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                if meta.get("createdAtUtc"):
+                    self.send_header("X-Frame-Created-At-Utc", str(meta["createdAtUtc"]))
+                if meta.get("sequence") is not None:
+                    self.send_header("X-Frame-Sequence", str(meta["sequence"]))
+                if meta.get("role"):
+                    self.send_header("X-Camera-Role", str(meta["role"]))
+                camera = meta.get("camera") if isinstance(meta.get("camera"), dict) else {}
+                if camera.get("serial") is not None:
+                    self.send_header("X-Camera-Serial", str(camera["serial"]))
+                board = meta.get("board") if isinstance(meta.get("board"), dict) else {}
+                if board:
+                    self.send_header("X-Checkerboard-Ok", "1" if board.get("ok") else "0")
+                    self.send_header("X-Checkerboard-Corners", str(board.get("detectedCorners") or 0))
+                    if board.get("method"):
+                        self.send_header("X-Checkerboard-Method", str(board["method"]))
                 self.end_headers()
                 self.wfile.write(data)
 
@@ -1116,6 +1266,8 @@ class LiveTelemetryVisualizer:
                     content_type = "image/jpeg"
                 elif suffix == ".png":
                     content_type = "image/png"
+                elif suffix == ".mp4":
+                    content_type = "video/mp4"
                 elif suffix == ".html":
                     content_type = "text/html; charset=utf-8"
                 elif suffix in (".json", ".jsonl"):
@@ -1139,6 +1291,36 @@ class LiveTelemetryVisualizer:
                 data = DEFAULT_RIZON4_URDF.read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/xml; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _send_robot_mesh(self, parsed: Any) -> None:
+                query = parse_qs(parsed.query)
+                path_text = first_query(query, "path")
+                if not path_text:
+                    self.send_error(400, "missing path")
+                    return
+                try:
+                    path = resolve_robot_mesh_path(path_text)
+                except ValueError as exc:
+                    self.send_error(403, str(exc))
+                    return
+                if not path.exists() or not path.is_file():
+                    self.send_error(404, "robot mesh not found")
+                    return
+                suffix = path.suffix.lower()
+                if suffix not in (".obj", ".mtl"):
+                    self.send_error(403, "unsupported robot mesh type")
+                    return
+                size = path.stat().st_size
+                if size > MAX_ARTIFACT_BYTES:
+                    self.send_error(413, "robot mesh too large")
+                    return
+                data = path.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
@@ -1400,8 +1582,10 @@ class PcCalibrationSession:
             reason = "RealSense camera serial is empty"
         elif not recording:
             reason = self.robot_manager.last_error or "robot RealSense session did not start"
-        elif not motion_armed or not controller_motion:
-            reason = "robot session records images/poses, but controller motion is not armed"
+        elif not motion_armed:
+            reason = self.robot_manager.last_error or "robot motion is not armed"
+        else:
+            reason = "recording; hold right middle-finger trigger to teleoperate"
         return {
             "enabled": True,
             "stage": stage,
@@ -1414,6 +1598,8 @@ class PcCalibrationSession:
             "thirdCameraSerial": third_camera_serial,
             "motionArmed": motion_armed,
             "controllerMotionEnabled": controller_motion,
+            "teleopRequiresRightSideButton": True,
+            "teleopRequiresRightHandTrigger": True,
             "gripperEnabled": bool(isinstance(config, dict) and config.get("gripperEnabled")),
             "activeSession": active,
         }
@@ -1773,6 +1959,8 @@ def receive(args: argparse.Namespace) -> int:
                 controller_translation_scale=args.controller_motion_scale,
                 controller_max_offset_m=args.controller_motion_max_offset,
                 controller_max_step_m=args.controller_motion_max_step,
+                controller_max_rotation_deg=args.controller_motion_max_rotation,
+                controller_max_rotation_step_deg=args.controller_motion_max_rotation_step,
                 gripper_enabled=args.enable_gripper,
                 gripper_device=args.gripper_device,
                 gripper_open_width_m=args.gripper_open_width,
@@ -1811,6 +1999,8 @@ def receive(args: argparse.Namespace) -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(0.25)
     sock.bind((args.host, args.port))
+    if visualizer is not None:
+        visualizer.set_udp_listener(args.host, int(args.port))
 
     print(f"Listening on udp://{args.host}:{args.port}", flush=True)
     print(f"PC recording root: {output_root}", flush=True)
@@ -1899,6 +2089,7 @@ def receive(args: argparse.Namespace) -> int:
                 total_samples += 1
 
             if visualizer is not None:
+                visualizer.note_udp_datagram(message, wrapper, len(data))
                 visualizer.publish(message, wrapper)
 
             can_open_session = should_write and (msg_type == "recording_start" or is_sample)
@@ -3097,6 +3288,7 @@ def build_recording_replay_payload(
     enrich_replay_samples_with_gaze_diagnostics(samples, gaze_diagnostics, board_origin_world)
     robot_realsense = build_robot_realsense_replay(session_dir, board_origin_world)
     raw_artifacts = replay_raw_artifacts(session_dir, summary, resolved_source, calibration_output_root)
+    recording_audit = build_recording_audit(session_dir, raw_rows, samples, snapshot, robot_realsense)
 
     return {
         "ok": True,
@@ -3111,6 +3303,7 @@ def build_recording_replay_payload(
         "boardMatrix": board_matrix_display,
         "gazeDepthDiagnostics": gaze_diagnostics.get("summary", {}),
         "robotRealSense": robot_realsense,
+        "recordingAudit": recording_audit,
         "rawArtifacts": raw_artifacts,
         "samples": samples,
     }
@@ -3152,6 +3345,123 @@ def replay_raw_artifacts(
             if path.exists() and key not in artifacts:
                 artifacts[key] = artifact_payload(path, artifact_label(key))
     return artifacts
+
+
+def audit_item(id_value: str, label: str, ok: bool, detail: str, **extra: Any) -> dict[str, Any]:
+    return {"id": id_value, "label": label, "ok": bool(ok), "detail": detail, **extra}
+
+
+def build_recording_audit(
+    session_dir: Path,
+    raw_rows: list[dict[str, Any]],
+    replay_samples: list[dict[str, Any]],
+    snapshot: dict[str, Any] | None,
+    robot_realsense: dict[str, Any] | None,
+) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    checks.append(
+        audit_item(
+            "quest_gaze3d",
+            "Quest gaze3D",
+            any(sample.get("gaze", {}).get("ok") for sample in replay_samples),
+            f"{sum(1 for sample in replay_samples if sample.get('gaze', {}).get('ok'))}/{len(replay_samples)} replay samples with gaze3D",
+        )
+    )
+    has_snapshot = bool(snapshot and snapshot.get("T_world_board"))
+    checks.append(
+        audit_item(
+            "quest_board_calibration",
+            "Quest board calibration",
+            has_snapshot,
+            "T_world_board available" if has_snapshot else "missing T_world_board calibration snapshot",
+        )
+    )
+    robot_dir = session_dir / "robot_realsense"
+    cameras = read_json_if_exists(robot_dir / "cameras.json")
+    camera_roles = sorted(cameras.keys()) if isinstance(cameras, dict) else []
+    expected_camera_roles = ["end"]
+    session_config = read_json_if_exists(robot_dir / "capture_config.json")
+    if isinstance(session_config, dict) and session_config.get("thirdCameraSerial"):
+        expected_camera_roles.append("third")
+    intr_roles = []
+    if isinstance(cameras, dict):
+        for role, camera in cameras.items():
+            if not isinstance(camera, dict):
+                continue
+            if camera.get("serial") and all(is_number(camera.get(key)) for key in ("fx", "fy", "cx", "cy")):
+                intr_roles.append(role)
+    checks.append(
+        audit_item(
+            "camera_metadata",
+            "Camera serial/intrinsics metadata",
+            all(role in intr_roles for role in expected_camera_roles),
+            f"expected {', '.join(expected_camera_roles)}; roles with serial+fx/fy/cx/cy: {', '.join(sorted(intr_roles)) or 'none'}",
+            roles=camera_roles,
+            expectedRoles=expected_camera_roles,
+        )
+    )
+    videos = sorted((robot_dir / "videos").glob("*.mp4")) if (robot_dir / "videos").exists() else []
+    video_role_names = {path.name.split("_", 1)[0] for path in videos}
+    checks.append(
+        audit_item(
+            "robot_camera_mp4",
+            "Robot camera MP4",
+            all(role in video_role_names for role in expected_camera_roles),
+            f"expected {', '.join(expected_camera_roles)}; files: {', '.join(path.name for path in videos) or 'no mp4 videos'}",
+            files=[str(path) for path in videos],
+            expectedRoles=expected_camera_roles,
+        )
+    )
+    if robot_realsense is None:
+        for id_value, label in (
+            ("robot_tool_tcp", "Robot tool TCP trajectory"),
+            ("robot_end_camera", "Robot end-camera trajectory"),
+            ("robot_unified_coords", "Robot unified coordinates"),
+            ("robot_replay_media", "Robot replay media"),
+        ):
+            checks.append(audit_item(id_value, label, False, "no robot_realsense recording"))
+        ok = all(check["ok"] for check in checks)
+        return {"ok": ok, "checks": checks, "summary": audit_summary_text(checks)}
+
+    robot_samples = robot_realsense.get("samples") if isinstance(robot_realsense.get("samples"), list) else []
+    tcp_count = sum(1 for row in robot_samples if isinstance(row.get("T_base_tool_tcp"), dict))
+    end_cam_count = sum(1 for row in robot_samples if isinstance(row.get("T_base_end_camera"), dict))
+    world_tcp_count = sum(1 for row in robot_samples if isinstance(row.get("T_world_tool_tcp"), dict) and isinstance(row.get("T_display_tool_tcp"), dict))
+    world_end_count = sum(1 for row in robot_samples if isinstance(row.get("T_world_end_camera"), dict) and isinstance(row.get("T_display_end_camera"), dict))
+    replay_video_count = sum(1 for row in robot_samples if any((item or {}).get("url") for item in (row.get("videos") or {}).values()))
+    gaze_in_robot_count = sum(1 for row in robot_samples if isinstance(row.get("questGaze3DWorld"), list) and len(row.get("questGaze3DWorld")) >= 3)
+    checks.extend(
+        [
+            audit_item("robot_tool_tcp", "Robot tool TCP trajectory", tcp_count > 0, f"{tcp_count}/{len(robot_samples)} robot samples with T_base_tool_tcp"),
+            audit_item("robot_end_camera", "Robot end-camera trajectory", end_cam_count > 0, f"{end_cam_count}/{len(robot_samples)} robot samples with T_base_end_camera"),
+            audit_item(
+                "robot_unified_coords",
+                "Robot unified coordinates",
+                world_tcp_count > 0 and world_end_count > 0,
+                f"TCP world/display {world_tcp_count}/{len(robot_samples)}, end camera world/display {world_end_count}/{len(robot_samples)}",
+            ),
+            audit_item("robot_replay_media", "Robot replay media", replay_video_count > 0, f"{replay_video_count}/{len(robot_samples)} samples with replayable video artifact"),
+            audit_item("robot_gaze3d_copy", "gaze3D copied into robot samples", gaze_in_robot_count > 0, f"{gaze_in_robot_count}/{len(robot_samples)} robot samples with questGaze3DWorld"),
+        ]
+    )
+    result = robot_realsense.get("result") if isinstance(robot_realsense.get("result"), dict) else {}
+    red_counts = result.get("red_anchor_global") if isinstance(result.get("red_anchor_global"), dict) else None
+    checks.append(
+        audit_item(
+            "red_anchor_optional_global",
+            "Optional global red anchor",
+            True,
+            (red_counts or {}).get("note") if isinstance(red_counts, dict) else "red anchor optional; no red frames required for every detection",
+            globalAnchor=red_counts,
+        )
+    )
+    ok = all(check["ok"] for check in checks)
+    return {"ok": ok, "checks": checks, "summary": audit_summary_text(checks)}
+
+
+def audit_summary_text(checks: list[dict[str, Any]]) -> str:
+    passed = sum(1 for check in checks if check.get("ok"))
+    return f"{passed}/{len(checks)} checks passing"
 
 
 def artifact_label(key: str) -> str:
@@ -3206,13 +3516,14 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
             row = json.loads(line)
             if not isinstance(row, dict):
                 continue
-            pose = row.get("T_base_ee") if isinstance(row.get("T_base_ee"), dict) else None
+            pose = row.get("T_base_tool_tcp") if isinstance(row.get("T_base_tool_tcp"), dict) else row.get("T_base_ee")
+            pose = pose if isinstance(pose, dict) else None
             pose_matrix = transform_from_json(pose)
             end_camera_pose = row.get("T_base_end_camera") if isinstance(row.get("T_base_end_camera"), dict) else None
             end_camera_matrix = transform_from_json(end_camera_pose)
-            world_pose = None
+            world_pose = row.get("T_world_tool_tcp") if isinstance(row.get("T_world_tool_tcp"), dict) else None
             display_pose = None
-            world_end_camera_pose = None
+            world_end_camera_pose = row.get("T_world_end_camera") if isinstance(row.get("T_world_end_camera"), dict) else None
             display_end_camera_pose = None
             display_frame = "unaligned_robot_base"
             if pose_matrix is not None:
@@ -3220,15 +3531,19 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
                 if end_camera_matrix is None and t_ee_end_camera is not None:
                     end_camera_matrix = pose_matrix @ t_ee_end_camera
                     end_camera_pose = transform_payload_from_matrix(end_camera_matrix)
-                if t_world_base is not None:
+                if t_world_base is not None and world_pose is None:
                     world_matrix = t_world_base @ pose_matrix
                     world_pose = transform_payload_from_matrix(world_matrix)
+                if world_pose is not None:
                     display_pose = translate_transform_payload(world_pose, origin)
-                    if end_camera_matrix is not None:
-                        world_end_camera_matrix = t_world_base @ end_camera_matrix
-                        world_end_camera_pose = transform_payload_from_matrix(world_end_camera_matrix)
-                        display_end_camera_pose = translate_transform_payload(world_end_camera_pose, origin)
+                if t_world_base is not None and end_camera_matrix is not None and world_end_camera_pose is None:
+                    world_end_camera_matrix = t_world_base @ end_camera_matrix
+                    world_end_camera_pose = transform_payload_from_matrix(world_end_camera_matrix)
+                if world_end_camera_pose is not None:
+                    display_end_camera_pose = translate_transform_payload(world_end_camera_pose, origin)
+                if world_pose is not None or world_end_camera_pose is not None:
                     display_frame = "quest_world_axes_translated_to_board_origin"
+            videos = row.get("videos") if isinstance(row.get("videos"), dict) else {}
             images = row.get("images") if isinstance(row.get("images"), dict) else {}
             rows.append(
                 {
@@ -3237,6 +3552,9 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
                     "recordingTimestampSeconds": row.get("quest_recording_timestamp_seconds"),
                     "ok": bool(row.get("ok")),
                     "T_base_ee": pose,
+                    "T_base_tool_tcp": row.get("T_base_tool_tcp") if isinstance(row.get("T_base_tool_tcp"), dict) else pose,
+                    "T_world_tool_tcp": world_pose,
+                    "T_display_tool_tcp": display_pose,
                     "T_world_ee": world_pose,
                     "T_display_ee": display_pose,
                     "T_base_end_camera": end_camera_pose,
@@ -3245,6 +3563,10 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
                     "displayFrame": display_frame,
                     "jointpose": row.get("jointpose"),
                     "images": robot_image_artifacts(robot_dir, images),
+                    "videos": robot_video_artifacts(robot_dir, videos),
+                    "videoFrames": row.get("videoFrames"),
+                    "questGaze3DWorld": row.get("quest_gaze3d_world"),
+                    "questGaze3DSource": row.get("quest_gaze3d_source"),
                     "gripper": row.get("gripper"),
                     "error": row.get("error"),
                 }
@@ -3272,6 +3594,37 @@ def robot_image_artifacts(robot_dir: Path, images: dict[str, Any]) -> dict[str, 
             payload[role] = artifact_payload(path, f"{role} camera")
         else:
             payload[role] = {"label": f"{role} camera", "path": str(path), "url": None, "error": "missing image"}
+    return payload
+
+
+def robot_video_artifacts(robot_dir: Path, videos: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for role, item in videos.items():
+        if isinstance(item, dict):
+            rel_path = item.get("path")
+            frame_index = item.get("frameIndex")
+            serial = item.get("serial")
+        else:
+            rel_path = item
+            frame_index = None
+            serial = None
+        if not isinstance(rel_path, str) or not rel_path:
+            continue
+        path = (robot_dir / rel_path).resolve()
+        if path.exists():
+            artifact = artifact_payload(path, f"{role} camera video")
+            artifact["frameIndex"] = frame_index
+            artifact["serial"] = serial
+            payload[role] = artifact
+        else:
+            payload[role] = {
+                "label": f"{role} camera video",
+                "path": str(path),
+                "url": None,
+                "frameIndex": frame_index,
+                "serial": serial,
+                "error": "missing video",
+            }
     return payload
 
 
@@ -3741,23 +4094,30 @@ def head_pose_from_pair(left_pose: dict[str, Any], right_pose: dict[str, Any], s
 def visualizer_controller_pose(value: Any, handedness: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         return missing_visualizer_pose("missing_controller_payload")
+    input_summary = controller_input_summary(value)
     if not value.get("hasPose"):
         reason = value.get("missingReason")
-        return missing_visualizer_pose(reason if isinstance(reason, str) and reason else "hasPose=false")
+        pose = missing_visualizer_pose(reason if isinstance(reason, str) and reason else "hasPose=false")
+        pose["input"] = input_summary
+        return pose
 
     position = vec3_list(value.get("position"))
     rotation = quat_list(value.get("rotation"))
     if position is None:
         pose = pose_from_pose_array(value.get("pose"), value.get("source") or handedness)
         if pose["ok"]:
+            pose["input"] = input_summary
             return pose
-        return missing_visualizer_pose("missing_controller_position")
+        pose = missing_visualizer_pose("missing_controller_position")
+        pose["input"] = input_summary
+        return pose
 
     return {
         "ok": True,
         "source": value.get("source") or handedness,
         "p": position,
         "q": rotation or [1.0, 0.0, 0.0, 0.0],
+        "input": input_summary,
     }
 
 
@@ -3933,6 +4293,7 @@ def calibration_result_event(record_id: str, result: dict[str, Any], result_path
     order = result.get("order_summary") if isinstance(result.get("order_summary"), dict) else {}
     stats_obj = result.get("stats") if isinstance(result.get("stats"), dict) else {}
     overall = stats_obj.get("overall") if isinstance(stats_obj.get("overall"), dict) else {}
+    red_anchor_policy = result.get("red_anchor_policy") if isinstance(result.get("red_anchor_policy"), dict) else {}
     return {
         "type": "calibration_result",
         "recordId": record_id,
@@ -3948,6 +4309,10 @@ def calibration_result_event(record_id: str, result: dict[str, Any], result_path
         "bestLagSeconds": result.get("best_lag_seconds"),
         "keptFrames": order.get("kept_frames"),
         "inputFrames": order.get("input_frames"),
+        "redAnchorFrames": order.get("red_anchor_frames"),
+        "reprojectionOrderFrames": order.get("reprojection_frames"),
+        "rot180Frames": order.get("rot180_frames"),
+        "redAnchorPolicy": red_anchor_policy,
         "medianReprojectionPx": overall.get("median_px"),
         "p90ReprojectionPx": overall.get("p90_px"),
     }
@@ -3981,6 +4346,10 @@ def recording_calibration_snapshot(output_root: Path | None) -> dict[str, Any] |
         "bestLagSeconds": event.get("bestLagSeconds"),
         "keptFrames": event.get("keptFrames"),
         "inputFrames": event.get("inputFrames"),
+        "redAnchorFrames": event.get("redAnchorFrames"),
+        "reprojectionOrderFrames": event.get("reprojectionOrderFrames"),
+        "rot180Frames": event.get("rot180Frames"),
+        "redAnchorPolicy": event.get("redAnchorPolicy"),
         "medianReprojectionPx": event.get("medianReprojectionPx"),
         "p90ReprojectionPx": event.get("p90ReprojectionPx"),
     }
@@ -4064,6 +4433,7 @@ def latest_calibration_snapshot(output_root: Path) -> dict[str, Any]:
     candidates = [path for path in output_root.iterdir() if path.is_dir() and path.name.startswith("record_pc_calib")]
     if not candidates:
         return {"ok": False, "reason": "no_calibration_records", "outputRoot": str(output_root)}
+
     def candidate_stamp(path: Path) -> float:
         result_path = path / "calibration_result_25mm.json"
         if result_path.exists():
@@ -4073,26 +4443,48 @@ def latest_calibration_snapshot(output_root: Path) -> dict[str, Any]:
             return failure_path.stat().st_mtime
         return path.stat().st_mtime
 
-    latest = max(candidates, key=candidate_stamp)
-    result_path = latest / "calibration_result_25mm.json"
+    def failure_payload(path: Path) -> dict[str, Any]:
+        log_path = path / "calibration_run.log"
+        return {
+            "kind": "failure",
+            "recordId": path.name,
+            "event": calibration_failure_event(path.name, path, log_path, None),
+        }
+
+    latest_any = max(candidates, key=candidate_stamp)
+    latest_success = max(
+        (path for path in candidates if (path / "calibration_result_25mm.json").exists()),
+        key=lambda path: (path / "calibration_result_25mm.json").stat().st_mtime,
+        default=None,
+    )
+    if latest_success is None:
+        latest_failure = failure_payload(latest_any)
+        return {
+            "ok": True,
+            **latest_failure,
+            "latestFailure": latest_failure,
+        }
+
+    result_path = latest_success / "calibration_result_25mm.json"
     if result_path.exists():
         try:
             result = json.loads(result_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             result = {}
-        return {
+        latest_failure = None
+        if latest_any != latest_success and (latest_any / "calibration_failure_25mm.json").exists():
+            latest_failure = failure_payload(latest_any)
+        payload = {
             "ok": True,
             "kind": "result",
-            "recordId": latest.name,
-            "event": calibration_result_event(latest.name, result, result_path),
+            "recordId": latest_success.name,
+            "event": calibration_result_event(latest_success.name, result, result_path),
         }
-    log_path = latest / "calibration_run.log"
-    return {
-        "ok": True,
-        "kind": "failure",
-        "recordId": latest.name,
-        "event": calibration_failure_event(latest.name, latest, log_path, None),
-    }
+        if latest_failure is not None:
+            payload["latestFailure"] = latest_failure
+        return payload
+    latest_failure = failure_payload(latest_any)
+    return {"ok": True, **latest_failure, "latestFailure": latest_failure}
 
 
 def calibration_artifacts(output_directory: Path, diagnostics: dict[str, Any], detection_summary: Any) -> dict[str, Any]:
@@ -4161,11 +4553,40 @@ def rizon4_model_payload() -> dict[str, Any]:
             }
         joints.append(row)
 
+    links: dict[str, Any] = {}
+    for link in root.findall("link"):
+        link_name = str(link.attrib.get("name") or "")
+        if not link_name:
+            continue
+        visuals: list[dict[str, Any]] = []
+        for visual in link.findall("visual"):
+            origin = visual.find("origin")
+            mesh = visual.find("geometry/mesh")
+            if mesh is None:
+                continue
+            filename = str(mesh.attrib.get("filename") or "")
+            asset_path = package_mesh_asset_path(filename)
+            visual_row: dict[str, Any] = {
+                "name": visual.attrib.get("name") or "",
+                "xyz": parse_float_triplet(origin.attrib.get("xyz") if origin is not None else None, [0.0, 0.0, 0.0]),
+                "rpy": parse_float_triplet(origin.attrib.get("rpy") if origin is not None else None, [0.0, 0.0, 0.0]),
+                "mesh": {
+                    "filename": filename,
+                    "assetPath": asset_path,
+                    "url": "/robot/mesh?path=" + quote_path(asset_path) if asset_path else None,
+                    "exists": resolve_robot_mesh_path(asset_path).exists() if asset_path else False,
+                    "scale": parse_float_triplet(mesh.attrib.get("scale"), [1.0, 1.0, 1.0]),
+                },
+            }
+            visuals.append(visual_row)
+        links[link_name] = {"visuals": visuals}
+
     return {
         "ok": True,
         "name": root.attrib.get("name") or "Rizon4",
         "source": str(DEFAULT_RIZON4_URDF),
         "joints": joints,
+        "links": links,
         "activeJointNames": [joint["name"] for joint in joints if joint.get("type") != "fixed"],
     }
 
@@ -4186,12 +4607,15 @@ def recent_controller_status(samples: list[dict[str, Any]], window_seconds: floa
 
     def summarize(key: str) -> dict[str, Any]:
         valid = 0
+        input_samples = 0
         missing: dict[str, int] = {}
         sources: dict[str, int] = {}
         latest: dict[str, Any] = {}
+        latest_input: dict[str, Any] = {}
         latest_age = None
         latest_valid_age = None
         latest_valid_source = None
+        latest_input_age = None
         for row in rows:
             controller = row.get(key)
             if not isinstance(controller, dict):
@@ -4211,14 +4635,24 @@ def recent_controller_status(samples: list[dict[str, Any]], window_seconds: floa
                     latest_valid_source = source
             else:
                 missing[source] = missing.get(source, 0) + 1
+            input_summary = controller_input_summary(controller)
+            if input_summary["hasAny"]:
+                input_samples += 1
+                if not latest_input:
+                    latest_input = input_summary
+                    row_timestamp = row.get("pcReceiveUnixSeconds")
+                    latest_input_age = max(0.0, now - float(row_timestamp)) if is_number(row_timestamp) else None
 
         return {
             "samples": len(rows),
             "validSamples": valid,
+            "inputSamples": input_samples,
             "latestAgeSeconds": latest_age,
             "latestValidAgeSeconds": latest_valid_age,
             "latestValidSource": latest_valid_source,
+            "latestInputAgeSeconds": latest_input_age,
             "latest": latest,
+            "latestInput": latest_input,
             "sources": sources,
             "missing": missing,
         }
@@ -4231,19 +4665,128 @@ def recent_controller_status(samples: list[dict[str, Any]], window_seconds: floa
     }
 
 
+def controller_input_summary(controller: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(controller, dict):
+        controller = {}
+    nested_input = controller.get("input")
+    if isinstance(nested_input, dict) and nested_input.get("hasAny"):
+        return {
+            "hasAny": True,
+            "handTrigger": nested_input.get("handTrigger"),
+            "indexTrigger": nested_input.get("indexTrigger"),
+            "handTriggerPressed": nested_input.get("handTriggerPressed"),
+            "indexTriggerPressed": nested_input.get("indexTriggerPressed"),
+            "aButton": nested_input.get("aButton"),
+            "bButton": nested_input.get("bButton"),
+            "teleopHeld": bool(nested_input.get("teleopHeld")),
+            "teleopThreshold": nested_input.get("teleopThreshold") if is_number(nested_input.get("teleopThreshold")) else 0.65,
+        }
+    buttons = controller.get("buttons")
+    if not isinstance(buttons, dict):
+        buttons = {}
+
+    def first_float(*keys: str) -> float | None:
+        for key in keys:
+            value = controller.get(key)
+            if is_number(value):
+                return max(0.0, min(1.0, float(value)))
+            value = buttons.get(key)
+            if is_number(value):
+                return max(0.0, min(1.0, float(value)))
+        return None
+
+    def first_bool(*keys: str) -> bool | None:
+        for key in keys:
+            value = controller.get(key)
+            if isinstance(value, bool):
+                return value
+            value = buttons.get(key)
+            if isinstance(value, bool):
+                return value
+        return None
+
+    hand_trigger = first_float("handTrigger", "rightHandTrigger", "grip", "primaryHandTrigger")
+    index_trigger = first_float("indexTrigger", "rightIndexTrigger", "trigger", "primaryIndexTrigger")
+    hand_pressed = first_bool("handTriggerPressed", "rightHandTriggerPressed", "gripPressed", "gripButton")
+    index_pressed = first_bool("indexTriggerPressed", "rightIndexTriggerPressed", "triggerPressed", "triggerButton")
+    a_button = first_bool("aButton", "buttonA", "primaryButton")
+    b_button = first_bool("bButton", "buttonB", "secondaryButton")
+    has_any = any(
+        value is not None
+        for value in (hand_trigger, index_trigger, hand_pressed, index_pressed, a_button, b_button)
+    )
+    teleop_held = bool(hand_pressed) or (hand_trigger is not None and hand_trigger >= 0.65)
+    return {
+        "hasAny": has_any,
+        "handTrigger": hand_trigger,
+        "indexTrigger": index_trigger,
+        "handTriggerPressed": hand_pressed,
+        "indexTriggerPressed": index_pressed,
+        "aButton": a_button,
+        "bButton": b_button,
+        "teleopHeld": teleop_held,
+        "teleopThreshold": 0.65,
+    }
+
+
+def controller_input_text(summary: dict[str, Any]) -> str:
+    if not isinstance(summary, dict) or not summary.get("hasAny"):
+        return "input missing"
+    hand = summary.get("handTrigger")
+    index = summary.get("indexTrigger")
+    parts = []
+    if is_number(hand):
+        parts.append(f"hand={float(hand):.2f}")
+    elif summary.get("handTriggerPressed") is not None:
+        parts.append("hand=n/a")
+    if summary.get("handTriggerPressed") is not None:
+        parts.append(f"handPressed={bool(summary.get('handTriggerPressed'))}")
+    if is_number(index):
+        parts.append(f"index={float(index):.2f}")
+    elif summary.get("indexTriggerPressed") is not None:
+        parts.append("index=n/a")
+    if summary.get("indexTriggerPressed") is not None:
+        parts.append(f"indexPressed={bool(summary.get('indexTriggerPressed'))}")
+    if summary.get("aButton") is not None:
+        parts.append(f"A={bool(summary.get('aButton'))}")
+    if summary.get("bButton") is not None:
+        parts.append(f"B={bool(summary.get('bButton'))}")
+    parts.append(f"teleopHeld={bool(summary.get('teleopHeld'))}")
+    return ", ".join(parts)
+
+
 def controller_preflight_detail(latest: dict[str, Any], recent: dict[str, Any], prefix: str) -> str:
     latest_ok = bool(latest.get("ok")) if isinstance(latest, dict) else False
     latest_source = str(latest.get("source") or "n/a") if isinstance(latest, dict) else "n/a"
     valid = int(recent.get("validSamples") or 0) if isinstance(recent, dict) else 0
     samples = int(recent.get("samples") or 0) if isinstance(recent, dict) else 0
+    input_samples = int(recent.get("inputSamples") or 0) if isinstance(recent, dict) else 0
     window = float(recent.get("windowSeconds", 5.0)) if isinstance(recent, dict) else 5.0
-    text = f"{prefix}latest={latest_ok} ({latest_source}); {valid}/{samples} valid in last {window:.0f}s"
+    input_summary = (
+        recent.get("latestInput")
+        if isinstance(recent.get("latestInput"), dict) and recent.get("latestInput", {}).get("hasAny")
+        else controller_input_summary(latest if isinstance(latest, dict) else {})
+    )
+    text = (
+        f"{prefix}latest={latest_ok} ({latest_source}); "
+        f"{valid}/{samples} pose valid, {input_samples}/{samples} input in last {window:.0f}s; "
+        f"{controller_input_text(input_summary)}"
+    )
     latest_valid_age = recent.get("latestValidAgeSeconds") if isinstance(recent, dict) else None
     if is_number(latest_valid_age):
         text += f", last valid {float(latest_valid_age):.2f}s ago"
+    latest_input_age = recent.get("latestInputAgeSeconds") if isinstance(recent, dict) else None
+    if is_number(latest_input_age):
+        text += f", last input {float(latest_input_age):.2f}s ago"
     hint = controller_mode_hint(latest_source)
     if hint:
         text += f"; {hint}"
+    elif samples <= 0:
+        text += "; no Quest controller samples received in this window"
+    elif not latest_ok:
+        text += "; Quest controller pose is missing"
+    elif not input_summary.get("hasAny"):
+        text += "; Quest sample has controller pose but no button/trigger fields"
     return text
 
 
@@ -4266,6 +4809,7 @@ def build_preflight_status(
     camera_status: dict[str, Any],
     board_status: dict[str, Any],
     model_status: dict[str, Any],
+    udp_status: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     now = time.time()
     sample_age = None
@@ -4287,12 +4831,11 @@ def build_preflight_status(
 
     robot = robot_status.get("robot") if isinstance(robot_status, dict) else {}
     robot_config = robot_status.get("config") if isinstance(robot_status, dict) else {}
+    stream = robot_status.get("realsenseStream") if isinstance(robot_status, dict) else {}
     robot_connected = bool(isinstance(robot, dict) and robot.get("connected"))
-    motion_armed = bool(isinstance(robot, dict) and robot.get("motionArmed"))
-    motion_enabled = bool(isinstance(robot_config, dict) and robot_config.get("controllerMotionEnabled"))
     hand_eye_enabled = bool(isinstance(robot_config, dict) and robot_config.get("runHandEye", True))
-    motion_required = bool(robot_connected and hand_eye_enabled)
     camera_serial = str(robot_config.get("cameraSerial") or "") if isinstance(robot_config, dict) else ""
+    third_camera_serial = str(robot_config.get("thirdCameraSerial") or "") if isinstance(robot_config, dict) else ""
     cameras = camera_status.get("cameras") if isinstance(camera_status, dict) else []
     camera_serials = {
         str(camera.get("serial"))
@@ -4300,20 +4843,65 @@ def build_preflight_status(
         if isinstance(camera, dict) and camera.get("serial") is not None
     }
     camera_ok = bool(camera_serial and camera_serial in camera_serials)
+    third_camera_ok = bool(not third_camera_serial or third_camera_serial in camera_serials)
 
-    board_ok = bool(board_status.get("ok")) if isinstance(board_status, dict) else False
-    board_corners = board_status.get("detectedCorners") if isinstance(board_status, dict) else None
-    board_rmse = board_status.get("bestReprojectionRmsePx") if isinstance(board_status, dict) else None
     model_ok = bool(model_status.get("ok")) if isinstance(model_status, dict) else False
     active_joints = model_status.get("activeJointNames") if isinstance(model_status, dict) else []
     active_joint_count = len(active_joints) if isinstance(active_joints, list) else 0
+    stream_roles = set(stream.get("roles") or []) if isinstance(stream, dict) else set()
+    stream_latest = stream.get("latest") if isinstance(stream, dict) else {}
+    stream_running = bool(isinstance(stream, dict) and stream.get("running"))
+
+    def stream_detail(role: str, serial: str) -> tuple[bool, str]:
+        latest = stream_latest.get(role) if isinstance(stream_latest, dict) else {}
+        sequence = latest.get("sequence") if isinstance(latest, dict) else None
+        captured = latest.get("capturedAtUtc") if isinstance(latest, dict) else None
+        ok = bool(stream_running and role in stream_roles and sequence is not None)
+        detail = f"{serial or 'not configured'}; running={stream_running}, role={role in stream_roles}"
+        if sequence is not None:
+            detail += f", frame #{sequence}"
+        if captured:
+            detail += f", {captured}"
+        if isinstance(stream, dict) and stream.get("lastError"):
+            detail += f", error={stream.get('lastError')}"
+        return ok, detail
+
+    end_stream_ok, end_stream_detail = stream_detail("end", camera_serial)
+    third_stream_ok, third_stream_detail = stream_detail("third", third_camera_serial)
+    udp_status = udp_status if isinstance(udp_status, dict) else {}
+    last_udp_time = udp_status.get("lastReceiveUnixSeconds")
+    last_udp_age = max(0.0, now - float(last_udp_time)) if is_number(last_udp_time) else None
+    total_datagrams = int(udp_status.get("totalDatagrams") or 0)
+    sample_datagrams = int(udp_status.get("sampleDatagrams") or 0)
+    udp_detail = (
+        f"listening {udp_status.get('bind') or 'n/a'}, datagrams={total_datagrams}, samples={sample_datagrams}"
+    )
+    if last_udp_age is not None:
+        udp_detail += (
+            f", last {float(last_udp_age):.2f}s ago"
+            f" type={udp_status.get('lastType') or 'n/a'}"
+            f" record={udp_status.get('lastRecordId') or 'n/a'}"
+            f" sample={udp_status.get('lastSampleIndex') if udp_status.get('lastSampleIndex') is not None else 'n/a'}"
+            f" from={udp_status.get('lastRemote') or 'n/a'}"
+        )
 
     checks = [
+        {
+            "id": "questUdp",
+            "label": "Quest UDP receiver",
+            "ok": total_datagrams > 0,
+            "required": False,
+            "detail": udp_detail,
+        },
         {
             "id": "questLive",
             "label": "Quest live telemetry",
             "ok": bool(quest_live and head_ok and gaze_ok),
-            "detail": f"sample age {sample_age:.2f}s, head={head_ok}, gaze={gaze_ok}" if sample_age is not None else "no live sample yet",
+            "detail": (
+                f"sample age {sample_age:.2f}s, head={head_ok}, gaze={gaze_ok}"
+                if sample_age is not None
+                else f"no live sample yet; {udp_detail}"
+            ),
         },
         {
             "id": "flexiv",
@@ -4325,20 +4913,26 @@ def build_preflight_status(
         },
         {
             "id": "realsense",
-            "label": "End RealSense",
-            "ok": camera_ok,
-            "detail": f"{camera_serial or 'not selected'}; detected {len(camera_serials)} camera(s)",
+            "label": "RealSense cameras",
+            "ok": camera_ok and third_camera_ok,
+            "detail": (
+                f"end={camera_serial or 'not selected'} {'seen' if camera_ok else 'missing'}; "
+                f"third={third_camera_serial or 'off'} {'seen' if third_camera_ok else 'missing'}; "
+                f"detected {len(camera_serials)} camera(s)"
+            ),
         },
         {
-            "id": "board",
-            "label": "End camera checkerboard",
-            "ok": board_ok,
-            "detail": (
-                f"{board_corners or 0} corners"
-                + (f", {float(board_rmse):.2f}px rmse" if is_number(board_rmse) else "")
-            )
-            if board_status
-            else "no board check yet",
+            "id": "endCameraStream",
+            "label": "End camera stream",
+            "ok": end_stream_ok,
+            "detail": end_stream_detail,
+        },
+        {
+            "id": "thirdCameraStream",
+            "label": "Third camera stream",
+            "ok": third_stream_ok if third_camera_serial else True,
+            "required": bool(third_camera_serial),
+            "detail": third_stream_detail if third_camera_serial else "third camera not configured",
         },
         {
             "id": "model",
@@ -4352,21 +4946,11 @@ def build_preflight_status(
             "id": "controllerTelemetry",
             "label": "Quest controller telemetry",
             "ok": right_controller_ok,
-            "required": motion_required,
+            "required": bool(robot_connected and hand_eye_enabled),
             "detail": (
                 controller_preflight_detail(left_controller, left_recent, "left: ")
                 + " | "
                 + controller_preflight_detail(right_controller, right_recent, "right: ")
-            ),
-        },
-        {
-            "id": "robotMotion",
-            "label": "Right controller robot motion",
-            "ok": bool(motion_armed and motion_enabled and right_controller_ok),
-            "required": motion_required,
-            "detail": (
-                f"required={motion_required}, armed={motion_armed}, controllerMotion={motion_enabled}, "
-                f"rightPose={right_controller_ok}, right={right_controller_source}"
             ),
         },
     ]
@@ -4378,7 +4962,7 @@ def build_preflight_status(
         "sampleAgeSeconds": sample_age,
         "controllerWindow": controller_window,
         "checks": checks,
-        "summary": "ready for B-button calibration" if ok else "check required items before B-button calibration",
+        "summary": "ready for Quest recording" if ok else "check required items before Quest recording",
     }
 
 
@@ -4423,6 +5007,29 @@ def resolve_artifact_path(path_text: str, must_exist: bool = True) -> Path:
         raise ValueError("artifact path is outside offline_calibration") from exc
     if must_exist and not path.exists():
         raise ValueError("artifact path does not exist")
+    return path
+
+
+def package_mesh_asset_path(filename: str) -> str | None:
+    prefix = "package://"
+    if not filename.startswith(prefix):
+        return None
+    asset_path = filename[len(prefix) :].replace("\\", "/").lstrip("/")
+    return asset_path if asset_path.startswith("meshes/") else None
+
+
+def resolve_robot_mesh_path(path_text: str) -> Path:
+    if not path_text:
+        raise ValueError("robot mesh path is empty")
+    normalized = path_text.replace("\\", "/").lstrip("/")
+    if not normalized.startswith("meshes/"):
+        raise ValueError("robot mesh path must be under meshes/")
+    path = (DEFAULT_RIZON4_URDF.parent / normalized).resolve()
+    root = (DEFAULT_RIZON4_URDF.parent / "meshes").resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("robot mesh path is outside mesh root") from exc
     return path
 
 
@@ -4494,7 +5101,8 @@ body {
 }
 #app {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 330px;
+  --sidebar-width: 330px;
+  grid-template-columns: minmax(0, 1fr) 8px var(--sidebar-width);
   height: 100vh;
 }
 #view {
@@ -4506,8 +5114,19 @@ body {
   touch-action: none;
 }
 #view:active { cursor: grabbing; }
-aside {
+.sidebar-resizer {
+  width: 8px;
   border-left: 1px solid var(--line);
+  border-right: 1px solid rgba(255,255,255,0.03);
+  background: #101417;
+  cursor: col-resize;
+  touch-action: none;
+}
+.sidebar-resizer:hover,
+.sidebar-resizer.dragging {
+  background: #24303a;
+}
+aside {
   background: var(--panel);
   padding: 14px;
   overflow: auto;
@@ -4764,6 +5383,44 @@ label {
   padding: 8px;
   background: #0e1216;
 }
+.robot-live-camera {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+  background: #0e1216;
+  display: grid;
+  gap: 8px;
+}
+.robot-live-camera.running {
+  border-color: rgba(130, 173, 255, 0.5);
+}
+.robot-live-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+.robot-live-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text);
+  font-weight: 650;
+}
+.robot-live-status {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+.robot-live-camera img {
+  display: block;
+  width: 100%;
+  max-height: 260px;
+  object-fit: contain;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #080a0c;
+}
 .quest-command-panel {
   border-top: 1px solid var(--line);
   margin-top: 12px;
@@ -4790,43 +5447,6 @@ label {
   gap: 8px;
   flex-wrap: wrap;
 }
-.robot-board-preview img {
-  display: block;
-  width: 100%;
-  max-height: 260px;
-  object-fit: contain;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: #0e1216;
-}
-.robot-board-card {
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 8px;
-  background: #0e1216;
-  display: grid;
-  gap: 8px;
-}
-.robot-board-card.ok {
-  border-color: rgba(156, 209, 104, 0.46);
-}
-.robot-board-card.fail {
-  border-color: rgba(255, 93, 112, 0.48);
-}
-.robot-board-title {
-  font-weight: 650;
-  color: var(--text);
-}
-.robot-board-hint {
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.35;
-}
-.robot-board-link {
-  color: #a8d8ff;
-  font-size: 12px;
-  text-decoration: none;
-}
 #status {
   white-space: pre-wrap;
   color: var(--muted);
@@ -4836,6 +5456,7 @@ label {
 }
 @media (max-width: 860px) {
   #app { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr) auto; }
+  .sidebar-resizer { display: none; }
   aside { max-height: 46vh; border-left: 0; border-top: 1px solid var(--line); }
 }
 </style>
@@ -4843,6 +5464,7 @@ label {
 <body>
 <div id="app">
   <canvas id="view"></canvas>
+  <div id="sidebarResizer" class="sidebar-resizer" title="Drag to resize controls"></div>
   <aside>
     <h1>Quest Live Telemetry 3D</h1>
     <div class="sub">Drag the 3D view to rotate. Mouse wheel zooms.</div>
@@ -4950,6 +5572,14 @@ label {
         <input id="robotMaxStep" type="number" min="0" step="0.005">
       </label>
       <div class="robot-grid">
+        <label>Max rot deg
+          <input id="robotMaxRotation" type="number" min="0" step="1">
+        </label>
+        <label>Rot step deg
+          <input id="robotMaxRotationStep" type="number" min="0" step="0.5">
+        </label>
+      </div>
+      <div class="robot-grid">
         <label>Gripper
           <select id="robotGripperEnabled">
             <option value="false">off</option>
@@ -4978,15 +5608,30 @@ label {
       </div>
       <div class="robot-actions">
         <button id="robotRefresh">Refresh Cameras</button>
+        <button id="robotStreamStart">Start Stream</button>
+        <button id="robotStreamStop">Stop Stream</button>
         <button id="robotBoardCheck">Check Board</button>
         <button id="robotDiagnostics">Diagnostics</button>
         <button id="robotConnect">Connect Robot</button>
-        <button id="robotArmMotion">Arm Motion</button>
-        <button id="robotDisarmMotion">Disarm</button>
         <button id="robotDisconnect">Disconnect</button>
       </div>
       <div id="robotStatus" class="robot-status">disabled or loading</div>
-      <div id="robotBoardPreview" class="robot-board-preview"></div>
+      <div class="robot-live-grid">
+        <div id="robotLiveCamera" class="robot-live-camera">
+          <div class="robot-live-head">
+            <span>End camera</span>
+            <span id="robotLiveStatus" class="robot-live-status">stream stopped</span>
+          </div>
+          <img id="robotLiveImage" alt="end camera live frame">
+        </div>
+        <div id="robotThirdLiveCamera" class="robot-live-camera">
+          <div class="robot-live-head">
+            <span>Third camera</span>
+            <span id="robotThirdLiveStatus" class="robot-live-status">stream stopped</span>
+          </div>
+          <img id="robotThirdLiveImage" alt="third camera live frame">
+        </div>
+      </div>
     </div>
     <div class="quest-command-panel">
       <h1>Quest Trigger</h1>
@@ -5005,6 +5650,8 @@ label {
 <script>
 const canvas = document.getElementById('view');
 const ctx = canvas.getContext('2d');
+const app = document.getElementById('app');
+const sidebarResizer = document.getElementById('sidebarResizer');
 const resetButton = document.getElementById('reset');
 const clearButton = document.getElementById('clear');
 const showTrail = document.getElementById('showTrail');
@@ -5039,6 +5686,8 @@ const robotBoardWarmup = document.getElementById('robotBoardWarmup');
 const robotMotionScale = document.getElementById('robotMotionScale');
 const robotMaxOffset = document.getElementById('robotMaxOffset');
 const robotMaxStep = document.getElementById('robotMaxStep');
+const robotMaxRotation = document.getElementById('robotMaxRotation');
+const robotMaxRotationStep = document.getElementById('robotMaxRotationStep');
 const robotGripperEnabled = document.getElementById('robotGripperEnabled');
 const robotGripperDevice = document.getElementById('robotGripperDevice');
 const robotGripperOpen = document.getElementById('robotGripperOpen');
@@ -5046,14 +5695,19 @@ const robotGripperClose = document.getElementById('robotGripperClose');
 const robotGripperSpeed = document.getElementById('robotGripperSpeed');
 const robotGripperForce = document.getElementById('robotGripperForce');
 const robotRefresh = document.getElementById('robotRefresh');
+const robotStreamStart = document.getElementById('robotStreamStart');
+const robotStreamStop = document.getElementById('robotStreamStop');
 const robotBoardCheck = document.getElementById('robotBoardCheck');
 const robotDiagnostics = document.getElementById('robotDiagnostics');
 const robotConnect = document.getElementById('robotConnect');
-const robotArmMotion = document.getElementById('robotArmMotion');
-const robotDisarmMotion = document.getElementById('robotDisarmMotion');
 const robotDisconnect = document.getElementById('robotDisconnect');
 const robotStatus = document.getElementById('robotStatus');
-const robotBoardPreview = document.getElementById('robotBoardPreview');
+const robotLiveCamera = document.getElementById('robotLiveCamera');
+const robotLiveImage = document.getElementById('robotLiveImage');
+const robotLiveStatus = document.getElementById('robotLiveStatus');
+const robotThirdLiveCamera = document.getElementById('robotThirdLiveCamera');
+const robotThirdLiveImage = document.getElementById('robotThirdLiveImage');
+const robotThirdLiveStatus = document.getElementById('robotThirdLiveStatus');
 const questAdbRefresh = document.getElementById('questAdbRefresh');
 const questCalibStart = document.getElementById('questCalibStart');
 const questCalibStop = document.getElementById('questCalibStop');
@@ -5063,7 +5717,7 @@ const questAdbManual = document.getElementById('questAdbManual');
 const state = {
   frames: [],
   maxFrames: 1200,
-  origin: null,
+  origin: [0, 0, 0],
   yaw: -0.72,
   pitch: -0.36,
   distance: 1.35,
@@ -5080,7 +5734,13 @@ const state = {
   robotBoardCheck: null,
   robotWorldBase: null,
   robotModel: null,
+  robotMeshes: {},
+  robotMeshPending: {},
   robotCalibration: null,
+  robotLiveTimer: null,
+  robotLiveLastSequence: {},
+  robotLiveLastStatusRefreshMs: 0,
+  latestCalibrationRecordId: null,
   questAdb: null,
   preflight: null,
   lastPreflightRefreshMs: 0
@@ -5104,6 +5764,7 @@ function resetView() {
 
 function computeBounds() {
   const pts = [];
+  pts.push(...liveBoardPoints());
   for (const frame of state.frames) {
     for (const key of ['head', 'left', 'right']) {
       const p = relPose(frame[key]);
@@ -5129,6 +5790,22 @@ function computeBounds() {
   let radius = 0.1;
   for (const p of pts) radius = Math.max(radius, length(sub(p, center)));
   return {center, radius};
+}
+
+function liveBoardPoints() {
+  const result = state.calibration?.result;
+  const matrix = result?.T_world_board?.matrix_4x4;
+  if (!matrix || !state.origin) return [];
+  const pattern = result.pattern || [11, 8];
+  const square = result.squareSizeM || 0.025;
+  const width = (Number(pattern[0] || 11) - 1) * square;
+  const height = (Number(pattern[1] || 8) - 1) * square;
+  return [
+    boardPoint(matrix, 0, 0, 0),
+    boardPoint(matrix, width, 0, 0),
+    boardPoint(matrix, width, height, 0),
+    boardPoint(matrix, 0, height, 0),
+  ].map(relPoint).filter(Boolean);
 }
 
 function connect() {
@@ -5168,6 +5845,8 @@ async function loadLatestCalibration() {
     const response = await fetch('/calibration/latest', {cache: 'no-store'});
     const payload = await response.json();
     if (!payload.ok || !payload.event) return;
+    const nextId = payload.event.recordId || payload.event.rawRecordName || null;
+    if (nextId && nextId === state.latestCalibrationRecordId) return;
     if (payload.kind === 'result') updateCalibrationResult(payload.event);
     if (payload.kind === 'failure') updateCalibrationFailure(payload.event);
   } catch (_) {
@@ -5185,11 +5864,101 @@ async function loadRobotStatus() {
   }
 }
 
+async function startRobotStream() {
+  await configureRobot();
+  robotStreamStart.disabled = true;
+  robotLiveStatus.textContent = 'starting stream...';
+  try {
+    const response = await fetch('/robot/realsense-stream/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(robotPayloadFromControls())
+    });
+    const payload = await response.json();
+    applyRobotStatus(payload.status || payload);
+    if (!payload.ok) robotStatus.textContent += `\nerror: ${payload.error || 'stream start failed'}`;
+    else refreshRobotLiveFrame();
+  } catch (error) {
+    robotLiveStatus.textContent = String(error);
+  } finally {
+    syncRobotLiveLoop();
+  }
+}
+
+async function stopRobotStream() {
+  robotStreamStop.disabled = true;
+  robotLiveStatus.textContent = 'stopping stream...';
+  try {
+    const response = await fetch('/robot/realsense-stream/stop', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: '{}'
+    });
+    const payload = await response.json();
+    applyRobotStatus(payload.status || payload);
+  } catch (error) {
+    robotLiveStatus.textContent = String(error);
+  } finally {
+    syncRobotLiveLoop();
+  }
+}
+
+function syncRobotLiveLoop() {
+  const running = Boolean(state.robot?.realsenseStream?.running);
+  robotLiveCamera.classList.toggle('running', running);
+  robotThirdLiveCamera.classList.toggle('running', running && robotThirdCamera.value);
+  robotStreamStart.disabled = running;
+  robotStreamStop.disabled = !running;
+  if (running && !state.robotLiveTimer) {
+    state.robotLiveTimer = window.setInterval(refreshRobotLiveFrame, 700);
+    refreshRobotLiveFrame();
+  } else if (!running && state.robotLiveTimer) {
+    window.clearInterval(state.robotLiveTimer);
+    state.robotLiveTimer = null;
+  }
+  if (!running) {
+    state.robotLiveLastSequence = {};
+    robotLiveStatus.textContent = 'stream stopped';
+    robotThirdLiveStatus.textContent = robotThirdCamera.value ? 'stream stopped' : 'third off';
+  }
+}
+
+function refreshRobotLiveFrame() {
+  if (!state.robot?.realsenseStream?.running) return;
+  refreshRobotLiveFrameRole('end', robotLiveImage, robotLiveStatus);
+  if (robotThirdCamera.value) refreshRobotLiveFrameRole('third', robotThirdLiveImage, robotThirdLiveStatus);
+  else {
+    robotThirdLiveImage.removeAttribute('src');
+    robotThirdLiveStatus.textContent = 'third off';
+  }
+}
+
+function refreshRobotLiveFrameRole(role, image, statusEl) {
+  const url = `/robot/camera-frame?role=${encodeURIComponent(role)}&ts=${Date.now()}`;
+  image.onload = () => {
+    const stream = state.robot?.realsenseStream || {};
+    const latest = stream.latest?.[role] || {};
+    const sequence = latest.sequence ?? stream.frameCount ?? '';
+    state.robotLiveLastSequence[role] = sequence;
+    statusEl.textContent = `live ${sequence ? `#${sequence}` : ''}`.trim();
+    const now = performance.now();
+    if (!state.robotLiveLastStatusRefreshMs || now - state.robotLiveLastStatusRefreshMs > 2000) {
+      state.robotLiveLastStatusRefreshMs = now;
+      loadRobotStatus();
+    }
+  };
+  image.onerror = () => {
+    statusEl.textContent = 'frame unavailable';
+  };
+  image.src = url;
+}
+
 async function loadRobotModel() {
   try {
     const response = await fetch('/robot/model', {cache: 'no-store'});
     const payload = await response.json();
     state.robotModel = payload;
+    preloadRobotMeshes(payload);
   } catch (_) {
     state.robotModel = null;
   }
@@ -5287,7 +6056,6 @@ async function loadLatestBoardCheck() {
     const payload = await response.json();
     if (payload?.createdAtUtc || payload?.imageUrl) {
       state.robotBoardCheck = payload;
-      renderRobotBoardCheck(payload);
     }
   } catch (_) {
     // The board check is optional before the first capture.
@@ -5300,6 +6068,9 @@ async function refreshCameras() {
     const payload = await response.json();
     const current = robotCamera.value;
     const currentThird = robotThirdCamera.value;
+    const configured = state.robot?.config || {};
+    const configuredEnd = configured.cameraSerial || '';
+    const configuredThird = configured.thirdCameraSerial || '';
     robotCamera.innerHTML = '';
     robotThirdCamera.innerHTML = '<option value="">off</option>';
     for (const camera of payload.cameras || []) {
@@ -5310,23 +6081,39 @@ async function refreshCameras() {
       const thirdOption = option.cloneNode(true);
       robotThirdCamera.appendChild(thirdOption);
     }
-    if (current) robotCamera.value = current;
-    if (currentThird) robotThirdCamera.value = currentThird;
-    if (!robotCamera.value && state.robot?.config?.cameraSerial) robotCamera.value = state.robot.config.cameraSerial;
-    if (!robotThirdCamera.value && state.robot?.config?.thirdCameraSerial) robotThirdCamera.value = state.robot.config.thirdCameraSerial;
+    setCameraSelectValue(robotCamera, configuredEnd || current);
+    setCameraSelectValue(robotThirdCamera, configuredThird || currentThird);
     if (!payload.ok) robotStatus.textContent = payload.error || payload.reason || 'camera list unavailable';
   } catch (error) {
     robotStatus.textContent = String(error);
   }
 }
 
+function setCameraSelectValue(select, serial) {
+  const value = String(serial || '').trim();
+  if (!value) {
+    select.value = '';
+    return;
+  }
+  const existing = Array.from(select.options).some(option => option.value === value);
+  if (!existing) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = `${value} configured`;
+    select.appendChild(option);
+  }
+  select.value = value;
+}
+
 function robotPayloadFromControls() {
+  const endSerial = robotCamera.value;
+  const thirdSerial = robotThirdCamera.value === endSerial ? '' : robotThirdCamera.value;
   return {
     robotSn: robotSn.value.trim(),
     poseField: robotPoseField.value,
     networkInterfaces: robotNetworkInterfaces.value.split(/[,\s;]+/).map(v => v.trim()).filter(Boolean),
-    cameraSerial: robotCamera.value,
-    thirdCameraSerial: robotThirdCamera.value,
+    cameraSerial: endSerial,
+    thirdCameraSerial: thirdSerial,
     captureIntervalSeconds: Number(robotInterval.value || 0.35),
     realsenseAutoExposure: robotExposureMode.value !== 'manual',
     realsenseExposure: robotExposure.value ? Number(robotExposure.value) : null,
@@ -5336,6 +6123,8 @@ function robotPayloadFromControls() {
     controllerTranslationScale: Number(robotMotionScale.value || 1.0),
     controllerMaxOffsetM: Number(robotMaxOffset.value || 0.18),
     controllerMaxStepM: Number(robotMaxStep.value || 0.015),
+    controllerMaxRotationDeg: Number(robotMaxRotation.value || 30.0),
+    controllerMaxRotationStepDeg: Number(robotMaxRotationStep.value || 2.0),
     gripperEnabled: robotGripperEnabled.value === 'true',
     gripperDevice: robotGripperDevice.value.trim(),
     gripperOpenWidthM: Number(robotGripperOpen.value || 0.08),
@@ -5407,6 +6196,8 @@ async function checkRobotBoard() {
     const payload = await response.json();
     state.robotBoardCheck = payload;
     renderRobotBoardCheck(payload);
+    syncRobotLiveLoop();
+    loadRobotStatus();
     loadPreflightStatus();
   } catch (error) {
     robotStatus.textContent = String(error);
@@ -5426,6 +6217,13 @@ function renderRobotBoardCheck(payload) {
   if (Number.isFinite(payload?.bestReprojectionRmsePx)) {
     lines.push(`reproj: ${payload.bestReprojectionRmsePx.toFixed(2)} px`);
   }
+  const anchor = payload?.redAnchor;
+  if (anchor) {
+    const anchorText = anchor.ok
+      ? `red anchor: corner ${anchor.observedIndex} -> target ${anchor.targetIndex}, ${anchor.order}, score ${Number(anchor.bestScore || 0).toFixed(3)}`
+      : `red anchor: ${anchor.reason || 'not found'}`;
+    lines.push(anchorText);
+  }
   if (Number.isFinite(payload?.brightness?.mean) && Number.isFinite(payload?.brightness?.p95)) {
     lines.push(`brightness: mean ${payload.brightness.mean.toFixed(1)}, p95 ${payload.brightness.p95.toFixed(1)}`);
   }
@@ -5440,51 +6238,15 @@ function renderRobotBoardCheck(payload) {
   if (payload?.error) lines.push(`error: ${payload.error}`);
   robotStatus.textContent = lines.join('\n');
   const url = payload?.overlayUrl || payload?.imageUrl;
-  if (!url) {
-    robotBoardPreview.innerHTML = '';
-    return;
-  }
-  const title = detected ? 'End camera sees the board' : 'End camera board not detected';
-  const brightness = Number.isFinite(payload?.brightness?.p95)
-    ? `brightness p95 ${payload.brightness.p95.toFixed(1)}`
-    : 'brightness n/a';
-  const hint = detected
-    ? `Detected ${payload?.detectedCorners ?? 0} corners. This frame is usable for hand-eye calibration.`
-    : 'Move the arm/camera or clear occlusion until the full 11x8 inner-corner board is inside the image.';
-  robotBoardPreview.innerHTML = `
-    <div class="robot-board-card ${detected ? 'ok' : 'fail'}">
-      <div class="robot-board-title">${escapeHtml(title)}</div>
-      <a href="${escapeHtml(url)}" target="_blank"><img src="${escapeHtml(url)}" alt="end camera board check"></a>
-      <div class="robot-board-hint">${escapeHtml(hint)} ${escapeHtml(brightness)}.</div>
-      <a class="robot-board-link" href="${escapeHtml(url)}" target="_blank">open full image</a>
-    </div>`;
+  if (url) lines.push(`saved check: ${url}`);
+  robotLiveStatus.textContent = detected
+    ? `checkerboard ${payload?.detectedCorners ?? 0} corners`
+    : 'checkerboard not detected';
 }
 
 async function disconnectRobot() {
   const response = await fetch('/robot/disconnect', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
   applyRobotStatus(await response.json());
-}
-
-async function armRobotMotion() {
-  await configureRobot();
-  robotArmMotion.disabled = true;
-  robotStatus.textContent = 'arming motion...';
-  try {
-    const response = await fetch('/robot/arm-motion', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
-    const payload = await response.json();
-    applyRobotStatus(payload.status || payload);
-    if (!payload.ok) robotStatus.textContent += `\nerror: ${payload.error || 'arm failed'}`;
-  } catch (error) {
-    robotStatus.textContent = String(error);
-  } finally {
-    robotArmMotion.disabled = false;
-  }
-}
-
-async function disarmRobotMotion() {
-  const response = await fetch('/robot/disarm-motion', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
-  const payload = await response.json();
-  applyRobotStatus(payload.status || payload);
 }
 
 function updateRobotEvent(event) {
@@ -5531,26 +6293,8 @@ function applyRobotStatus(payload) {
   if (Array.isArray(config.networkInterfaces) && !robotNetworkInterfaces.value) {
     robotNetworkInterfaces.value = config.networkInterfaces.join(', ');
   }
-  if (config.cameraSerial && !robotCamera.value) {
-    const existing = Array.from(robotCamera.options).some(option => option.value === config.cameraSerial);
-    if (!existing) {
-      const option = document.createElement('option');
-      option.value = config.cameraSerial;
-      option.textContent = `${config.cameraSerial} configured`;
-      robotCamera.appendChild(option);
-    }
-    robotCamera.value = config.cameraSerial;
-  }
-  if (config.thirdCameraSerial && !robotThirdCamera.value) {
-    const existing = Array.from(robotThirdCamera.options).some(option => option.value === config.thirdCameraSerial);
-    if (!existing) {
-      const option = document.createElement('option');
-      option.value = config.thirdCameraSerial;
-      option.textContent = `${config.thirdCameraSerial} configured`;
-      robotThirdCamera.appendChild(option);
-    }
-    robotThirdCamera.value = config.thirdCameraSerial;
-  }
+  setCameraSelectValue(robotCamera, config.cameraSerial);
+  setCameraSelectValue(robotThirdCamera, config.thirdCameraSerial);
   if (Number.isFinite(config.captureIntervalSeconds)) robotInterval.value = config.captureIntervalSeconds;
   if (typeof config.realsenseAutoExposure === 'boolean') robotExposureMode.value = config.realsenseAutoExposure ? 'auto' : 'manual';
   if (Number.isFinite(config.realsenseExposure)) robotExposure.value = config.realsenseExposure;
@@ -5560,12 +6304,15 @@ function applyRobotStatus(payload) {
   if (Number.isFinite(config.controllerTranslationScale)) robotMotionScale.value = config.controllerTranslationScale;
   if (Number.isFinite(config.controllerMaxOffsetM)) robotMaxOffset.value = config.controllerMaxOffsetM;
   if (Number.isFinite(config.controllerMaxStepM)) robotMaxStep.value = config.controllerMaxStepM;
+  if (Number.isFinite(config.controllerMaxRotationDeg)) robotMaxRotation.value = config.controllerMaxRotationDeg;
+  if (Number.isFinite(config.controllerMaxRotationStepDeg)) robotMaxRotationStep.value = config.controllerMaxRotationStepDeg;
   if (typeof config.gripperEnabled === 'boolean') robotGripperEnabled.value = config.gripperEnabled ? 'true' : 'false';
   if (config.gripperDevice && !robotGripperDevice.value) robotGripperDevice.value = config.gripperDevice;
   if (Number.isFinite(config.gripperOpenWidthM)) robotGripperOpen.value = config.gripperOpenWidthM;
   if (Number.isFinite(config.gripperCloseWidthM)) robotGripperClose.value = config.gripperCloseWidthM;
   if (Number.isFinite(config.gripperSpeedMps)) robotGripperSpeed.value = config.gripperSpeedMps;
   if (Number.isFinite(config.gripperForceN)) robotGripperForce.value = config.gripperForceN;
+  syncRobotLiveLoop();
   renderRobotStatus(payload);
 }
 
@@ -5579,15 +6326,16 @@ function renderRobotStatus(payload) {
     return;
   }
   const robot = payload.robot || {};
-  const controllerMotion = Boolean(payload.config?.controllerMotionEnabled);
   const active = payload.activeSession || {};
   const lines = [
     `robot: ${robot.connected ? 'connected' : 'not connected'} ${robot.robotSn || ''}`.trim(),
-    `motion: ${robot.motionArmed ? 'ARMED' : 'disarmed'} / controller ${controllerMotion ? 'on' : 'off'}`,
+    `teleop: hold right middle-finger trigger${robot.motionArmed ? ' (motion mode active)' : ' (motion not armed)'}`,
+    `controller motion: ${payload.config?.controllerMotionEnabled ? 'enabled' : 'disabled'}`,
     `pose: ${robot.poseField || 'n/a'}`,
     `rdk iface: ${(payload.config?.networkInterfaces || []).join(', ') || 'default'}`,
     `camera: ${payload.config?.cameraSerial || 'n/a'}`,
     `third camera: ${payload.config?.thirdCameraSerial || 'off'}`,
+    `stream: ${realsenseStreamText(payload.realsenseStream)}`,
     `exposure: ${payload.config?.realsenseAutoExposure === false ? 'manual' : 'auto'}${Number.isFinite(payload.config?.realsenseExposure) ? ` ${payload.config.realsenseExposure}` : ''}${Number.isFinite(payload.config?.realsenseGain) ? ` gain ${payload.config.realsenseGain}` : ''}`,
     `session: ${payload.activeSession ? `${active.samples || 0} samples, ${active.images || 0} images` : 'idle'}`
   ];
@@ -5597,6 +6345,8 @@ function renderRobotStatus(payload) {
     const fkError = robotFkErrorMm(state.robotSample, null);
     if (Number.isFinite(fkError)) lines.push(`URDF FK vs flange: ${fkError.toFixed(1)}mm`);
     lines.push(`hand-eye motion: ${poseDiversityText(state.robotSample.poseDiversity)}`);
+    const rightInput = robotControllerInputText(state.robotSample.rightController);
+    if (rightInput) lines.push(`right input: ${rightInput}`);
   } else if (active.poseDiversity) {
     lines.push(`hand-eye motion: ${poseDiversityText(active.poseDiversity)}`);
   }
@@ -5612,10 +6362,13 @@ function renderRobotStatus(payload) {
   }
   if (state.robotMotion) {
     const offset = Array.isArray(state.robotMotion.offsetM) ? state.robotMotion.offsetM.map(v => Number(v).toFixed(3)).join(', ') : (state.robotMotion.reason || state.robotMotion.error || 'n/a');
-    lines.push(`motion: ${state.robotMotion.ok ? 'sent' : 'skip'} ${offset}`);
+    const rot = Number.isFinite(state.robotMotion.rotationDeg) ? ` rot ${Number(state.robotMotion.rotationDeg).toFixed(1)}deg` : '';
+    const hold = robotTeleopHoldText(state.robotMotion);
+    lines.push(`motion: ${state.robotMotion.ok ? 'sent' : 'skip'} ${offset}${rot}${hold}`);
     if (state.robotMotion.anchored !== undefined) {
       const step = Array.isArray(state.robotMotion.stepOffsetM) ? state.robotMotion.stepOffsetM.map(v => Number(v).toFixed(3)).join(', ') : 'n/a';
-      lines.push(`motion anchor: ${state.robotMotion.anchored ? 'set' : 'waiting'}${state.robotMotion.createdAnchor ? ' (new)' : ''}, step ${step}`);
+      const rotStep = Number.isFinite(state.robotMotion.stepRotationDeg) ? `, rot step ${Number(state.robotMotion.stepRotationDeg).toFixed(1)}deg` : '';
+      lines.push(`motion anchor: ${state.robotMotion.anchored ? 'set' : 'waiting'}${state.robotMotion.createdAnchor ? ' (new)' : ''}, step ${step}${rotStep}`);
     }
   }
   if (state.robotGripper) {
@@ -5630,8 +6383,18 @@ function renderRobotStatus(payload) {
   robotStatus.textContent = lines.join('\n');
 }
 
+function realsenseStreamText(stream) {
+  if (!stream) return 'n/a';
+  if (!stream.running) return stream.lastError ? `stopped (${stream.lastError})` : 'stopped';
+  const roles = Array.isArray(stream.roles) ? stream.roles.join(',') : 'n/a';
+  return `running ${roles} frames=${stream.frameCount ?? 0}`;
+}
+
 function robotMotionSummaryText(event) {
   if (!event) return 'n/a';
+  const mapping = event.motionMapping || event.motion_mapping;
+  const mappingText = mapping ? ` ${mapping}` : '';
+  const hold = robotTeleopHoldText(event);
   if (event.ok) {
     const offset = Array.isArray(event.offsetM)
       ? event.offsetM.map(v => Number(v).toFixed(3)).join(', ')
@@ -5639,9 +6402,36 @@ function robotMotionSummaryText(event) {
     const step = Array.isArray(event.stepOffsetM)
       ? ` step ${event.stepOffsetM.map(v => Number(v).toFixed(3)).join(', ')}`
       : '';
-    return `sent offset ${offset}${step}`;
+    const rotation = Number.isFinite(event.rotationDeg) ? ` rot ${Number(event.rotationDeg).toFixed(1)}deg` : '';
+    const rotationStep = Number.isFinite(event.stepRotationDeg) ? ` rotStep ${Number(event.stepRotationDeg).toFixed(1)}deg` : '';
+    return `sent offset ${offset}${step}${rotation}${rotationStep}${mappingText}${hold}`;
   }
-  return event.reason || event.error || 'skipped';
+  return `${event.reason || event.error || 'skipped'}${mappingText}${hold}`;
+}
+
+function robotTeleopHoldText(event) {
+  if (!event) return '';
+  const value = event.teleopHoldValue ?? event.teleop_hold_value;
+  const held = event.teleopHeld ?? event.teleop_held;
+  const parts = [];
+  if (Number.isFinite(Number(value))) parts.push(`hold ${Number(value).toFixed(2)}`);
+  if (typeof held === 'boolean') parts.push(`held=${held}`);
+  return parts.length ? ` (${parts.join(', ')})` : '';
+}
+
+function robotControllerInputText(controller) {
+  if (!controller) return '';
+  const input = controller.input || {};
+  if (!input.hasAny) return '';
+  const parts = [];
+  if (Number.isFinite(input.handTrigger)) parts.push(`hand=${Number(input.handTrigger).toFixed(2)}`);
+  if (input.handTriggerPressed !== undefined && input.handTriggerPressed !== null) parts.push(`handPressed=${Boolean(input.handTriggerPressed)}`);
+  if (Number.isFinite(input.indexTrigger)) parts.push(`index=${Number(input.indexTrigger).toFixed(2)}`);
+  if (input.indexTriggerPressed !== undefined && input.indexTriggerPressed !== null) parts.push(`indexPressed=${Boolean(input.indexTriggerPressed)}`);
+  if (input.aButton !== undefined && input.aButton !== null) parts.push(`A=${Boolean(input.aButton)}`);
+  if (input.bButton !== undefined && input.bButton !== null) parts.push(`B=${Boolean(input.bButton)}`);
+  if (input.teleopHeld !== undefined && input.teleopHeld !== null) parts.push(`hold=${Boolean(input.teleopHeld)}`);
+  return parts.join(', ');
 }
 
 function robotGripperSummaryText(event) {
@@ -5679,10 +6469,9 @@ function poseDiversityText(diversity) {
   if (!diversity || !Number.isFinite(diversity.eeTranslationSpanM)) return 'n/a';
   const mm = diversity.eeTranslationSpanM * 1000;
   const deg = Number(diversity.eeRotationSpanDeg || 0);
-  const minMm = Number(diversity.minTranslationSpanM || 0.02) * 1000;
   const minDeg = Number(diversity.minRotationSpanDeg || 2.0);
-  const ok = mm >= minMm || deg >= minDeg;
-  return `${ok ? 'ok' : 'need motion'} ${mm.toFixed(1)}mm / ${deg.toFixed(2)}deg`;
+  const ok = deg >= minDeg;
+  return `${ok ? 'ok' : 'need rotation'} ${mm.toFixed(1)}mm / ${deg.toFixed(2)}deg`;
 }
 
 function renderRobotDiagnostics(payload) {
@@ -5708,10 +6497,6 @@ function renderRobotDiagnostics(payload) {
 }
 
 function ingest(sample) {
-  if (!state.origin && sample.head?.ok && sample.head.p) {
-    state.origin = sample.head.p.slice();
-    state.target = [0, 0, 0];
-  }
   state.frames.push(sample);
   if (state.frames.length > state.maxFrames) {
     state.frames.splice(0, state.frames.length - state.maxFrames);
@@ -5803,7 +6588,7 @@ function renderCalibrationRejected(event) {
 function renderCalibrationStatusDetails(event) {
   const robot = event.robotStartStatus || state.calibration?.robotStartStatus;
   if (!robot) return;
-  const robotClass = robot.recording && robot.motionArmed && robot.controllerMotionEnabled ? 'calibration-ok' : 'calibration-alert';
+  const robotClass = robot.recording ? 'calibration-ok' : 'calibration-alert';
   calibrationDetails.innerHTML = `
     <div class="${robotClass}">${escapeHtml(event.message || 'PC calibration recording')}</div>
     <div class="calibration-kv">
@@ -5811,12 +6596,13 @@ function renderCalibrationStatusDetails(event) {
       <span>robot rec</span><span>${robot.recording ? 'yes' : 'no'}</span>
       <span>robot</span><span>${escapeHtml(robot.robotConnected ? `${robot.robotSn || 'connected'} ${robot.poseField || ''}` : 'not connected')}</span>
       <span>camera</span><span>${escapeHtml(robot.cameraSerial || 'n/a')}</span>
-      <span>motion</span><span>armed=${Boolean(robot.motionArmed)}, controller=${Boolean(robot.controllerMotionEnabled)}</span>
+      <span>teleop</span><span>hold right middle-finger trigger</span>
       <span>note</span><span>${escapeHtml(robot.reason || 'n/a')}</span>
     </div>`;
 }
 
 function updateCalibrationResult(event) {
+  state.latestCalibrationRecordId = event.recordId || event.rawRecordName || state.latestCalibrationRecordId;
   state.calibration = {
     ...(state.calibration || {}),
     result: event
@@ -5824,13 +6610,17 @@ function updateCalibrationResult(event) {
   const median = Number.isFinite(event.medianReprojectionPx) ? `${event.medianReprojectionPx.toFixed(2)}px` : 'n/a';
   mCalibration.textContent = `done ${median}`;
   mCalibrationFill.style.width = '100%';
-  if (event.T_world_board?.translation_m && !state.origin) {
+  if (event.T_world_board?.translation_m) {
     state.origin = event.T_world_board.translation_m.slice();
+    state.target = [0, 0, 0];
+    const bounds = computeBounds();
+    state.distance = Math.max(0.55, bounds.radius * 2.4);
   }
   renderCalibrationResult(event);
 }
 
 function updateCalibrationFailure(event) {
+  state.latestCalibrationRecordId = event.recordId || event.rawRecordName || state.latestCalibrationRecordId;
   state.calibration = {
     ...(state.calibration || {}),
     failure: event
@@ -5847,6 +6637,9 @@ function renderCalibrationResult(event) {
   const normalAngle = Number.isFinite(event.boardNormalAbsAngleToWorldYDeg)
     ? `${event.boardNormalAbsAngleToWorldYDeg.toFixed(1)} deg`
     : 'n/a';
+  const redAnchorFrames = Number.isFinite(event.redAnchorFrames)
+    ? `${event.redAnchorFrames} / ${event.keptFrames ?? 'n/a'}`
+    : 'n/a';
   calibrationDetails.innerHTML = `
     <div class="calibration-ok">Calibration succeeded</div>
     <div class="calibration-kv">
@@ -5854,6 +6647,8 @@ function renderCalibrationResult(event) {
       <span>image y</span><span>${escapeHtml(event.imageYAxis || 'n/a')}</span>
       <span>lag</span><span>${lag}</span>
       <span>kept frames</span><span>${event.keptFrames ?? 'n/a'} / ${event.inputFrames ?? 'n/a'}</span>
+      <span>red anchor</span><span>${redAnchorFrames}</span>
+      <span>rot180</span><span>${event.rot180Frames ?? 'n/a'}</span>
       <span>median / p90</span><span>${median} / ${p90}</span>
       <span>board Z vs world Y</span><span>${normalAngle}</span>
     </div>`;
@@ -5887,6 +6682,7 @@ function renderCalibrationDiagnostics(event) {
       <span>best lag</span><span>${lag}</span>
       <span>gate</span><span>${threshold}</span>
       <span>kept frames</span><span>${summary.kept_frames ?? 'n/a'} / ${summary.input_frames ?? 'n/a'}</span>
+      <span>red anchor</span><span>${summary.red_anchor_frames ?? 'n/a'} / ${summary.kept_frames ?? 'n/a'}</span>
       <span>best error</span><span>${bestStats}</span>
     </div>
     ${detectionsHtml}
@@ -5917,7 +6713,10 @@ function renderThresholdCounts(counts) {
 function renderFramePreview(rows) {
   if (!Array.isArray(rows) || !rows.length) return '';
   const text = rows.slice(0, 6).map(row =>
-    `${row.side} f${row.frame_index}: ${fmtPx(row.best_median_px)} ${row.best_order}`
+    `${row.side} f${row.frame_index}: ${fmtPx(row.best_median_px)} ${row.best_order} ${row.order_source || ''}` +
+    (Number.isFinite(row.red_anchor_observed_index) && row.red_anchor_observed_index >= 0
+      ? ` red ${row.red_anchor_observed_index}->${row.red_anchor_target_index}`
+      : '')
   ).join('<br>');
   return `<div><strong>Best frames</strong><br>${text}</div>`;
 }
@@ -5971,18 +6770,37 @@ function draw() {
 }
 
 function drawRobotLive() {
-  if (!state.robotWorldBase) return;
-  const pose = state.robotSample?.T_base_ee;
-  const matrix = pose?.matrix_4x4;
-  if (!matrix) return;
-  const worldMatrix = multiplyMatrix4(state.robotWorldBase, matrix);
-  drawRobotSkeleton(state.robotSample?.jointpose, state.robotWorldBase);
-  const p = relPoint(matrixTranslation(worldMatrix));
-  if (!p) return;
-  drawPoint(p, '#ffffff', 6, 'EE');
-  drawLine(p, relPoint(matrixPoint(worldMatrix, 0.08, 0, 0)), '#ff4545', 2.3);
-  drawLine(p, relPoint(matrixPoint(worldMatrix, 0, 0.08, 0)), '#42e875', 2.3);
-  drawLine(p, relPoint(matrixPoint(worldMatrix, 0, 0, 0.08)), '#4b7cff', 2.3);
+  const sample = state.robotSample;
+  if (!sample) return;
+  const baseMatrix = state.robotWorldBase;
+  if (baseMatrix) {
+    drawRobotMeshes(sample.jointpose, baseMatrix);
+    drawRobotSkeleton(sample.jointpose, baseMatrix);
+  }
+  let tcpMatrix = sample.T_world_tool_tcp?.matrix_4x4;
+  if (!tcpMatrix && baseMatrix) {
+    const baseTcp = sample.T_base_tool_tcp?.matrix_4x4 || sample.T_base_ee?.matrix_4x4;
+    if (baseTcp) tcpMatrix = multiplyMatrix4(baseMatrix, baseTcp);
+  }
+  let endCameraMatrix = sample.T_world_end_camera?.matrix_4x4;
+  if (!endCameraMatrix && baseMatrix && sample.T_base_end_camera?.matrix_4x4) {
+    endCameraMatrix = multiplyMatrix4(baseMatrix, sample.T_base_end_camera.matrix_4x4);
+  }
+  const p = relPoint(matrixTranslation(tcpMatrix));
+  if (p) {
+    drawPoint(p, '#ffffff', 6, 'TCP');
+    drawLine(p, relPoint(matrixPoint(tcpMatrix, 0.08, 0, 0)), '#ff4545', 2.3);
+    drawLine(p, relPoint(matrixPoint(tcpMatrix, 0, 0.08, 0)), '#42e875', 2.3);
+    drawLine(p, relPoint(matrixPoint(tcpMatrix, 0, 0, 0.08)), '#4b7cff', 2.3);
+  }
+  const cp = relPoint(matrixTranslation(endCameraMatrix));
+  if (cp) {
+    drawPoint(cp, '#82adff', 5, 'end cam');
+    drawLine(cp, relPoint(matrixPoint(endCameraMatrix, 0.06, 0, 0)), '#ff4545', 1.9);
+    drawLine(cp, relPoint(matrixPoint(endCameraMatrix, 0, 0.06, 0)), '#42e875', 1.9);
+    drawLine(cp, relPoint(matrixPoint(endCameraMatrix, 0, 0, 0.06)), '#4b7cff', 1.9);
+    if (p) drawLine(p, cp, 'rgba(130,173,255,.42)', 1.2);
+  }
 }
 
 function drawRobotSkeleton(jointpose, baseMatrix) {
@@ -5999,6 +6817,125 @@ function drawRobotSkeleton(jointpose, baseMatrix) {
     const p = relPoint(matrixTranslation(frames[i]));
     drawPoint(p, i === 0 ? '#cbd5df' : '#ffffff', i === 0 ? 4 : 3.5, i === frames.length - 1 ? 'flange' : '');
   }
+}
+
+function drawRobotMeshes(jointpose, baseMatrix) {
+  const model = state.robotModel;
+  if (!model || !Array.isArray(jointpose) || jointpose.length < 7 || !baseMatrix) return;
+  const linkFrames = robotLinkFrames(model, jointpose, baseMatrix);
+  const polygons = [];
+  for (const [linkName, link] of Object.entries(model.links || {})) {
+    const linkFrame = linkFrames[linkName];
+    if (!linkFrame) continue;
+    for (const visual of link.visuals || []) {
+      const assetPath = visual.mesh?.assetPath;
+      const mesh = assetPath ? state.robotMeshes[assetPath] : null;
+      if (!mesh) continue;
+      const visualFrame = multiplyMatrix4(linkFrame, xyzRpyMatrix(visual.xyz, visual.rpy));
+      collectMeshPolygons(polygons, mesh, visualFrame, visual.mesh?.scale, visual.name || linkName, relPoint);
+    }
+  }
+  renderMeshPolygons(polygons);
+}
+
+function preloadRobotMeshes(model) {
+  if (!model?.ok) return;
+  for (const link of Object.values(model.links || {})) {
+    for (const visual of link.visuals || []) {
+      const mesh = visual.mesh || {};
+      if (!mesh.exists || !mesh.assetPath || !mesh.url) continue;
+      if (state.robotMeshes[mesh.assetPath] || state.robotMeshPending[mesh.assetPath]) continue;
+      state.robotMeshPending[mesh.assetPath] = fetch(mesh.url, {cache: 'no-store'})
+        .then(response => response.ok ? response.text() : '')
+        .then(text => {
+          if (text) state.robotMeshes[mesh.assetPath] = parseObjMesh(text);
+        })
+        .catch(() => {})
+        .finally(() => { delete state.robotMeshPending[mesh.assetPath]; });
+    }
+  }
+}
+
+function parseObjMesh(text) {
+  const vertices = [];
+  const faces = [];
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line[0] === '#') continue;
+    const parts = line.split(/\s+/);
+    if (parts[0] === 'v' && parts.length >= 4) {
+      vertices.push([Number(parts[1]), Number(parts[2]), Number(parts[3])]);
+    } else if (parts[0] === 'f' && parts.length >= 4) {
+      const indices = parts.slice(1).map(token => objIndex(token, vertices.length)).filter(index => index !== null);
+      for (let i = 1; i + 1 < indices.length; i++) faces.push([indices[0], indices[i], indices[i + 1]]);
+    }
+  }
+  return {vertices, faces};
+}
+
+function objIndex(token, count) {
+  const raw = Number.parseInt(String(token).split('/')[0], 10);
+  if (!Number.isFinite(raw) || raw === 0) return null;
+  const index = raw > 0 ? raw - 1 : count + raw;
+  return index >= 0 && index < count ? index : null;
+}
+
+function collectMeshPolygons(polygons, mesh, matrix, scaleValue, visualName, pointMapper) {
+  const vertices = mesh.vertices || [];
+  const faces = mesh.faces || [];
+  if (!vertices.length || !faces.length) return;
+  const scale = Array.isArray(scaleValue) ? scaleValue : [1, 1, 1];
+  const stride = Math.max(1, Math.ceil(faces.length / 900));
+  const isRing = String(visualName || '').toLowerCase().includes('ring');
+  for (let i = 0; i < faces.length; i += stride) {
+    const face = faces[i];
+    const pts = [];
+    for (const index of face) {
+      const v = vertices[index];
+      const p = pointMapper(matrixPointScaled(matrix, v, scale));
+      if (!p) {
+        pts.length = 0;
+        break;
+      }
+      pts.push(p);
+    }
+    if (pts.length === 3) polygons.push({pts, ring: isRing});
+  }
+}
+
+function renderMeshPolygons(polygons) {
+  if (!polygons.length) return;
+  const projected = [];
+  for (const poly of polygons) {
+    const pts = poly.pts.map(project);
+    if (pts.some(p => !p.visible)) continue;
+    const area = Math.abs(
+      (pts[1].x - pts[0].x) * (pts[2].y - pts[0].y) -
+      (pts[2].x - pts[0].x) * (pts[1].y - pts[0].y)
+    );
+    if (area < 0.18) continue;
+    projected.push({
+      pts,
+      depth: (pts[0].z + pts[1].z + pts[2].z) / 3,
+      ring: poly.ring,
+      area
+    });
+  }
+  projected.sort((a, b) => b.depth - a.depth);
+  ctx.save();
+  ctx.lineWidth = 0.45;
+  for (const poly of projected) {
+    ctx.beginPath();
+    ctx.moveTo(poly.pts[0].x, poly.pts[0].y);
+    ctx.lineTo(poly.pts[1].x, poly.pts[1].y);
+    ctx.lineTo(poly.pts[2].x, poly.pts[2].y);
+    ctx.closePath();
+    ctx.fillStyle = poly.ring ? 'rgba(238,240,244,0.32)' : 'rgba(150,164,184,0.24)';
+    ctx.strokeStyle = poly.ring ? 'rgba(255,255,255,0.15)' : 'rgba(210,220,235,0.08)';
+    ctx.fill();
+    if (poly.area > 8) ctx.stroke();
+  }
+  ctx.restore();
 }
 
 function updateStatus(frame) {
@@ -6250,6 +7187,16 @@ function matrixPoint(m, x, y, z) {
   ];
 }
 
+function matrixPointScaled(m, v, scaleValue) {
+  const scale = Array.isArray(scaleValue) ? scaleValue : [1, 1, 1];
+  return matrixPoint(
+    m,
+    Number(v?.[0] || 0) * Number(scale[0] || 1),
+    Number(v?.[1] || 0) * Number(scale[1] || 1),
+    Number(v?.[2] || 0) * Number(scale[2] || 1)
+  );
+}
+
 function matrixTranslation(m) {
   if (!Array.isArray(m) || m.length < 3) return null;
   return [Number(m[0]?.[3]), Number(m[1]?.[3]), Number(m[2]?.[3])];
@@ -6281,6 +7228,21 @@ function robotFrames(model, jointpose, baseMatrix) {
       current = multiplyMatrix4(current, axisAngleMatrix(joint.axis, angle));
     }
     frames.push(current);
+  }
+  return frames;
+}
+
+function robotLinkFrames(model, jointpose, baseMatrix) {
+  const frames = {base_link: baseMatrix};
+  let jointIndex = 0;
+  for (const joint of model.joints || []) {
+    const parentFrame = frames[joint.parent] || baseMatrix;
+    let childFrame = multiplyMatrix4(parentFrame, xyzRpyMatrix(joint.xyz, joint.rpy));
+    if (joint.type !== 'fixed') {
+      const angle = Number(jointpose[jointIndex++] || 0);
+      childFrame = multiplyMatrix4(childFrame, axisAngleMatrix(joint.axis, angle));
+    }
+    if (joint.child) frames[joint.child] = childFrame;
   }
   return frames;
 }
@@ -6352,17 +7314,17 @@ clearButton.addEventListener('click', () => {
   state.frames = state.frames.slice(-1);
 });
 robotRefresh.addEventListener('click', refreshCameras);
+robotStreamStart.addEventListener('click', startRobotStream);
+robotStreamStop.addEventListener('click', stopRobotStream);
 robotBoardCheck.addEventListener('click', checkRobotBoard);
 robotDiagnostics.addEventListener('click', runRobotDiagnostics);
 robotConnect.addEventListener('click', connectRobot);
-robotArmMotion.addEventListener('click', armRobotMotion);
-robotDisarmMotion.addEventListener('click', disarmRobotMotion);
 robotDisconnect.addEventListener('click', disconnectRobot);
 preflightRefresh.addEventListener('click', loadPreflightStatus);
 questAdbRefresh.addEventListener('click', loadQuestAdbStatus);
 questCalibStart.addEventListener('click', () => sendQuestCalibrationCommand('calib_start'));
 questCalibStop.addEventListener('click', () => sendQuestCalibrationCommand('calib_stop'));
-for (const input of [robotCamera, robotSn, robotPoseField, robotNetworkInterfaces, robotInterval, robotHandEye, robotExposureMode, robotExposure, robotGain, robotBoardWarmup, robotMotionScale, robotMaxOffset, robotMaxStep]) {
+for (const input of [robotCamera, robotThirdCamera, robotSn, robotPoseField, robotNetworkInterfaces, robotInterval, robotHandEye, robotExposureMode, robotExposure, robotGain, robotBoardWarmup, robotMotionScale, robotMaxOffset, robotMaxStep, robotMaxRotation, robotMaxRotationStep]) {
   input.addEventListener('change', configureRobot);
 }
 document.getElementById('records').addEventListener('click', () => {
@@ -6370,9 +7332,49 @@ document.getElementById('records').addEventListener('click', () => {
 });
 window.addEventListener('resize', resize);
 
+function initSidebarResize(storageKey, minWidth, maxWidth, defaultWidth) {
+  const saved = Number(localStorage.getItem(storageKey));
+  setSidebarWidth(Number.isFinite(saved) ? saved : defaultWidth, minWidth, maxWidth, storageKey);
+  let active = false;
+  sidebarResizer.addEventListener('pointerdown', event => {
+    active = true;
+    sidebarResizer.classList.add('dragging');
+    sidebarResizer.setPointerCapture(event.pointerId);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    event.preventDefault();
+  });
+  sidebarResizer.addEventListener('pointermove', event => {
+    if (!active) return;
+    const width = window.innerWidth - event.clientX - 4;
+    setSidebarWidth(width, minWidth, maxWidth, storageKey);
+    resize();
+  });
+  const stop = event => {
+    if (!active) return;
+    active = false;
+    sidebarResizer.classList.remove('dragging');
+    try { sidebarResizer.releasePointerCapture(event.pointerId); } catch (_) {}
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+    resize();
+  };
+  sidebarResizer.addEventListener('pointerup', stop);
+  sidebarResizer.addEventListener('pointercancel', stop);
+}
+
+function setSidebarWidth(width, minWidth, maxWidth, storageKey) {
+  const viewportLimit = Math.max(minWidth, window.innerWidth - 360);
+  const clamped = Math.max(minWidth, Math.min(maxWidth, viewportLimit, Math.round(width)));
+  app.style.setProperty('--sidebar-width', `${clamped}px`);
+  localStorage.setItem(storageKey, String(clamped));
+}
+
+initSidebarResize('questLiveSidebarWidth', 300, 720, 330);
 resize();
 connect();
 loadLatestCalibration();
+setInterval(loadLatestCalibration, 2000);
 loadRobotStatus().then(refreshCameras);
 loadRobotModel();
 loadLatestBoardCheck();
@@ -6419,7 +7421,8 @@ body {
 }
 #app {
   display: grid;
-  grid-template-columns: 320px minmax(0, 1fr) 340px;
+  --detail-width: 340px;
+  grid-template-columns: 320px minmax(0, 1fr) 8px var(--detail-width);
   height: 100vh;
 }
 nav, aside {
@@ -6428,7 +7431,17 @@ nav, aside {
   padding: 12px;
 }
 nav { border-right: 1px solid var(--line); }
-aside { border-left: 1px solid var(--line); }
+.detail-resizer {
+  width: 8px;
+  border-left: 1px solid var(--line);
+  background: #101820;
+  cursor: col-resize;
+  touch-action: none;
+}
+.detail-resizer:hover,
+.detail-resizer.dragging {
+  background: #24344a;
+}
 canvas {
   width: 100%;
   height: 100%;
@@ -6523,6 +7536,7 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
 .rec { color: #ff8c96; font-weight: 700; }
 @media (max-width: 1050px) {
   #app { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr) auto; }
+  .detail-resizer { display: none; }
   nav, aside { max-height: 34vh; border: 0; border-bottom: 1px solid var(--line); }
   aside { border-top: 1px solid var(--line); }
 }
@@ -6541,6 +7555,7 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
     <div id="recordList" class="record-list"></div>
   </nav>
   <canvas id="view"></canvas>
+  <div id="detailResizer" class="detail-resizer" title="Drag to resize details"></div>
   <aside>
     <h1 id="recordTitle">Select a record</h1>
     <div class="sub" id="recordSub">Drag to orbit, wheel to zoom.</div>
@@ -6597,6 +7612,8 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
 <script>
 const canvas = document.getElementById('view');
 const ctx = canvas.getContext('2d');
+const app = document.getElementById('app');
+const detailResizer = document.getElementById('detailResizer');
 const recordList = document.getElementById('recordList');
 const rootLabel = document.getElementById('rootLabel');
 const search = document.getElementById('search');
@@ -6634,6 +7651,8 @@ const state = {
   dragging: false,
   lastPointer: [0,0],
   robotModel: null,
+  robotMeshes: {},
+  robotMeshPending: {},
   trails: {head: [], left: [], right: [], gaze: [], gazeFiltered: [], gazeBoardPlane: [], hit: [], robot: []}
 };
 
@@ -6659,6 +7678,7 @@ async function loadRobotModel() {
     const response = await fetch('/robot/model', {cache: 'no-store'});
     const payload = await response.json();
     state.robotModel = payload;
+    preloadRobotMeshes(payload);
   } catch (_) {
     state.robotModel = null;
   }
@@ -6879,17 +7899,19 @@ function updateDepthInfo() {
 
 function updateRobotInfo() {
   const rr = state.data?.robotRealSense;
+  const audit = state.data?.recordingAudit;
   if (!rr) {
     const start = state.data?.summary?.robotStartStatus;
+    const auditRows = renderAuditKvRows(audit);
     if (start) {
       robotKv.innerHTML = [
         ['status', 'no robot recording'],
         ['start', replayRobotStartText(start)],
         ['note', start.reason || 'n/a']
-      ].map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
+      ].map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('') + auditRows;
       return;
     }
-    robotKv.innerHTML = '<span>status</span><span>no robot recording</span>';
+    robotKv.innerHTML = '<span>status</span><span>no robot recording</span>' + auditRows;
     return;
   }
   const result = rr.result || {};
@@ -6922,11 +7944,25 @@ function updateRobotInfo() {
     ['quest-base', align.ok ? 'T_world_base ready' : (align.reason || 'n/a')]
   ];
   robotKv.innerHTML = kv.map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
+  robotKv.innerHTML += renderAuditKvRows(audit);
+}
+
+function renderAuditKvRows(audit) {
+  if (!audit) return '';
+  const rows = [];
+  if (audit.summary) rows.push(['audit', audit.summary]);
+  if (Array.isArray(audit.checks)) {
+    for (const check of audit.checks) {
+      const mark = check.ok ? 'ok' : 'missing';
+      rows.push([check.label || check.id, `${mark}: ${check.detail || ''}`]);
+    }
+  }
+  return rows.map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
 }
 
 function replayRobotStartText(start) {
   if (!start) return 'n/a';
-  return `recording=${Boolean(start.recording)}, connected=${Boolean(start.robotConnected)}, armed=${Boolean(start.motionArmed)}, controller=${Boolean(start.controllerMotionEnabled)}`;
+  return `recording=${Boolean(start.recording)}, connected=${Boolean(start.robotConnected)}, teleop=${start.teleopRequiresRightHandTrigger ? 'right middle trigger' : (start.teleopRequiresRightSideButton ? 'right side button' : 'legacy')}`;
 }
 
 function replayMotionSummaryText(session) {
@@ -6964,10 +8000,9 @@ function replayPoseDiversityText(diversity) {
   if (!diversity || !Number.isFinite(diversity.eeTranslationSpanM)) return 'n/a';
   const mm = diversity.eeTranslationSpanM * 1000;
   const deg = Number(diversity.eeRotationSpanDeg || 0);
-  const minMm = Number(diversity.minTranslationSpanM || 0.02) * 1000;
   const minDeg = Number(diversity.minRotationSpanDeg || 2.0);
-  const ok = mm >= minMm || deg >= minDeg;
-  return `${ok ? 'ok' : 'need motion'} ${mm.toFixed(1)}mm / ${deg.toFixed(2)}deg`;
+  const ok = deg >= minDeg;
+  return `${ok ? 'ok' : 'need rotation'} ${mm.toFixed(1)}mm / ${deg.toFixed(2)}deg`;
 }
 
 function statText(stats, unit) {
@@ -6993,6 +8028,7 @@ function updateLabels() {
   recordingLabel.className = s.isRecording ? 'rec' : 'ok';
   const robot = nearestRobotSample(s.recordingTimestampSeconds);
   const imageRoles = robot?.images ? Object.keys(robot.images).filter(role => robot.images[role]?.url) : [];
+  const videoRoles = robot?.videos ? Object.keys(robot.videos).filter(role => robot.videos[role]?.url) : [];
   const gripper = nearestGripperEvent(s.recordingTimestampSeconds);
   const kv = [
     ['gaze3D', s.gaze?.ok ? (s.gaze.source || 'ok') : 'missing'],
@@ -7002,9 +8038,11 @@ function updateLabels() {
     ['hit', s.gazeHit?.ok ? 'present' : 'missing'],
     ['left', s.left?.ok ? (s.left.source || 'ok') : (s.left?.source || 'missing')],
     ['right', s.right?.ok ? (s.right.source || 'ok') : (s.right?.source || 'missing')],
+    ['left input', robotControllerInputText(s.left) || 'n/a'],
+    ['right input', robotControllerInputText(s.right) || 'n/a'],
     ['head', s.head?.ok ? (s.head.source || 'ok') : 'missing'],
     ['robot sample', robot ? `${robot.sampleIndex ?? 'n/a'} / q${robot.questSampleIndex ?? 'n/a'}` : 'n/a'],
-    ['images', imageRoles.join(', ') || 'n/a'],
+    ['media', [...new Set([...imageRoles, ...videoRoles])].join(', ') || 'n/a'],
     ['gripper', gripper ? replayGripperText(gripper) : 'n/a']
   ];
   sampleKv.innerHTML = kv.map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
@@ -7013,16 +8051,44 @@ function updateLabels() {
 
 function renderCameraStrip(robot) {
   const images = robot?.images || {};
-  const entries = Object.entries(images).filter(([, item]) => item?.url);
+  const videos = robot?.videos || {};
+  const videoEntries = Object.entries(videos).filter(([, item]) => item?.url);
+  const imageEntries = Object.entries(images).filter(([role, item]) => item?.url && !videos[role]?.url);
+  const entries = [...videoEntries, ...imageEntries];
   if (!entries.length) {
     cameraStrip.innerHTML = '';
     return;
   }
-  cameraStrip.innerHTML = entries.map(([role, item]) => `
-    <a href="${escapeHtml(item.url)}" target="_blank">
-      <img src="${escapeHtml(item.url)}" alt="${escapeHtml(role)} camera">
-      <span>${escapeHtml(role)}</span>
-    </a>`).join('');
+  cameraStrip.innerHTML = entries.map(([role, item]) => {
+    const label = `${role}${Number.isFinite(item.frameIndex) ? ` #${item.frameIndex}` : ''}`;
+    if (String(item.url || '').toLowerCase().includes('.mp4')) {
+      return `
+        <a href="${escapeHtml(item.url)}" target="_blank">
+          <video src="${escapeHtml(item.url)}" controls preload="metadata"></video>
+          <span>${escapeHtml(label)}</span>
+        </a>`;
+    }
+    return `
+      <a href="${escapeHtml(item.url)}" target="_blank">
+        <img src="${escapeHtml(item.url)}" alt="${escapeHtml(role)} camera">
+        <span>${escapeHtml(label)}</span>
+      </a>`;
+  }).join('');
+}
+
+function robotControllerInputText(controller) {
+  if (!controller) return '';
+  const input = controller.input || {};
+  if (!input.hasAny) return '';
+  const parts = [];
+  if (Number.isFinite(input.handTrigger)) parts.push(`hand=${Number(input.handTrigger).toFixed(2)}`);
+  if (input.handTriggerPressed !== undefined && input.handTriggerPressed !== null) parts.push(`handPressed=${Boolean(input.handTriggerPressed)}`);
+  if (Number.isFinite(input.indexTrigger)) parts.push(`index=${Number(input.indexTrigger).toFixed(2)}`);
+  if (input.indexTriggerPressed !== undefined && input.indexTriggerPressed !== null) parts.push(`indexPressed=${Boolean(input.indexTriggerPressed)}`);
+  if (input.aButton !== undefined && input.aButton !== null) parts.push(`A=${Boolean(input.aButton)}`);
+  if (input.bButton !== undefined && input.bButton !== null) parts.push(`B=${Boolean(input.bButton)}`);
+  if (input.teleopHeld !== undefined && input.teleopHeld !== null) parts.push(`hold=${Boolean(input.teleopHeld)}`);
+  return parts.join(', ');
 }
 
 function nearestGripperEvent(t) {
@@ -7078,8 +8144,10 @@ function resetView() {
     }
   }
   for (const row of state.data?.robotRealSense?.samples || []) {
-    const p = matrixTranslation(row.T_display_ee?.matrix_4x4);
-    if (p) pts.push(p);
+    for (const key of ['T_display_tool_tcp', 'T_display_ee', 'T_display_end_camera']) {
+      const p = matrixTranslation(row[key]?.matrix_4x4);
+      if (p) pts.push(p);
+    }
   }
   if (!pts.length) {
     state.distance = 1.45;
@@ -7224,12 +8292,13 @@ function drawPose(pose, color, label, axisScale) {
 
 function drawRobotForSample(sample) {
   const robot = nearestRobotSample(sample.recordingTimestampSeconds);
-  const matrix = robot?.T_display_ee?.matrix_4x4;
+  const matrix = robot?.T_display_tool_tcp?.matrix_4x4 || robot?.T_display_ee?.matrix_4x4;
   if (!matrix) return;
+  drawRobotMeshes(robot);
   drawRobotSkeleton(robot);
   const p = matrixTranslation(matrix);
   if (!p) return;
-  drawPoint(p, '#ffffff', 6, 'EE');
+  drawPoint(p, '#ffffff', 6, 'TCP');
   drawLine(p, matrixPoint(matrix, 0.08, 0, 0), '#ff4545', 2.3);
   drawLine(p, matrixPoint(matrix, 0, 0.08, 0), '#42e875', 2.3);
   drawLine(p, matrixPoint(matrix, 0, 0, 0.08), '#4b7cff', 2.3);
@@ -7242,6 +8311,29 @@ function drawRobotForSample(sample) {
     drawLine(cp, matrixPoint(camMatrix, 0, 0, 0.06), '#4b7cff', 1.9);
     drawLine(p, cp, 'rgba(130,173,255,.42)', 1.2);
   }
+}
+
+function drawRobotMeshes(robot) {
+  const model = state.robotModel;
+  const jointpose = robot?.jointpose;
+  const result = state.data?.robotRealSense?.result;
+  const baseMatrix = result?.questAlignment?.T_world_base?.matrix_4x4;
+  if (!model || !Array.isArray(jointpose) || jointpose.length < 7 || !baseMatrix) return;
+  const displayBase = translateMatrixPayload(baseMatrix, state.data?.boardOriginWorld || [0,0,0]);
+  const linkFrames = robotLinkFrames(model, jointpose, displayBase);
+  const polygons = [];
+  for (const [linkName, link] of Object.entries(model.links || {})) {
+    const linkFrame = linkFrames[linkName];
+    if (!linkFrame) continue;
+    for (const visual of link.visuals || []) {
+      const assetPath = visual.mesh?.assetPath;
+      const mesh = assetPath ? state.robotMeshes[assetPath] : null;
+      if (!mesh) continue;
+      const visualFrame = multiplyMatrix4(linkFrame, xyzRpyMatrix(visual.xyz, visual.rpy));
+      collectMeshPolygons(polygons, mesh, visualFrame, visual.mesh?.scale, visual.name || linkName, p => p);
+    }
+  }
+  renderMeshPolygons(polygons);
 }
 
 function drawRobotSkeleton(robot) {
@@ -7259,6 +8351,106 @@ function drawRobotSkeleton(robot) {
   for (let i = 0; i < frames.length; i++) {
     drawPoint(matrixTranslation(frames[i]), i === 0 ? '#cbd5df' : '#ffffff', i === 0 ? 4 : 3.5, i === frames.length - 1 ? 'flange' : '');
   }
+}
+
+function preloadRobotMeshes(model) {
+  if (!model?.ok) return;
+  for (const link of Object.values(model.links || {})) {
+    for (const visual of link.visuals || []) {
+      const mesh = visual.mesh || {};
+      if (!mesh.exists || !mesh.assetPath || !mesh.url) continue;
+      if (state.robotMeshes[mesh.assetPath] || state.robotMeshPending[mesh.assetPath]) continue;
+      state.robotMeshPending[mesh.assetPath] = fetch(mesh.url, {cache: 'no-store'})
+        .then(response => response.ok ? response.text() : '')
+        .then(text => {
+          if (text) state.robotMeshes[mesh.assetPath] = parseObjMesh(text);
+        })
+        .catch(() => {})
+        .finally(() => { delete state.robotMeshPending[mesh.assetPath]; });
+    }
+  }
+}
+
+function parseObjMesh(text) {
+  const vertices = [];
+  const faces = [];
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line[0] === '#') continue;
+    const parts = line.split(/\s+/);
+    if (parts[0] === 'v' && parts.length >= 4) {
+      vertices.push([Number(parts[1]), Number(parts[2]), Number(parts[3])]);
+    } else if (parts[0] === 'f' && parts.length >= 4) {
+      const indices = parts.slice(1).map(token => objIndex(token, vertices.length)).filter(index => index !== null);
+      for (let i = 1; i + 1 < indices.length; i++) faces.push([indices[0], indices[i], indices[i + 1]]);
+    }
+  }
+  return {vertices, faces};
+}
+
+function objIndex(token, count) {
+  const raw = Number.parseInt(String(token).split('/')[0], 10);
+  if (!Number.isFinite(raw) || raw === 0) return null;
+  const index = raw > 0 ? raw - 1 : count + raw;
+  return index >= 0 && index < count ? index : null;
+}
+
+function collectMeshPolygons(polygons, mesh, matrix, scaleValue, visualName, pointMapper) {
+  const vertices = mesh.vertices || [];
+  const faces = mesh.faces || [];
+  if (!vertices.length || !faces.length) return;
+  const scale = Array.isArray(scaleValue) ? scaleValue : [1, 1, 1];
+  const stride = Math.max(1, Math.ceil(faces.length / 900));
+  const isRing = String(visualName || '').toLowerCase().includes('ring');
+  for (let i = 0; i < faces.length; i += stride) {
+    const face = faces[i];
+    const pts = [];
+    for (const index of face) {
+      const v = vertices[index];
+      const p = pointMapper(matrixPointScaled(matrix, v, scale));
+      if (!p) {
+        pts.length = 0;
+        break;
+      }
+      pts.push(p);
+    }
+    if (pts.length === 3) polygons.push({pts, ring: isRing});
+  }
+}
+
+function renderMeshPolygons(polygons) {
+  if (!polygons.length) return;
+  const projected = [];
+  for (const poly of polygons) {
+    const pts = poly.pts.map(project);
+    if (pts.some(p => !p.visible)) continue;
+    const area = Math.abs(
+      (pts[1].x - pts[0].x) * (pts[2].y - pts[0].y) -
+      (pts[2].x - pts[0].x) * (pts[1].y - pts[0].y)
+    );
+    if (area < 0.18) continue;
+    projected.push({
+      pts,
+      depth: (pts[0].z + pts[1].z + pts[2].z) / 3,
+      ring: poly.ring,
+      area
+    });
+  }
+  projected.sort((a, b) => b.depth - a.depth);
+  ctx.save();
+  ctx.lineWidth = 0.45;
+  for (const poly of projected) {
+    ctx.beginPath();
+    ctx.moveTo(poly.pts[0].x, poly.pts[0].y);
+    ctx.lineTo(poly.pts[1].x, poly.pts[1].y);
+    ctx.lineTo(poly.pts[2].x, poly.pts[2].y);
+    ctx.closePath();
+    ctx.fillStyle = poly.ring ? 'rgba(238,240,244,0.32)' : 'rgba(150,164,184,0.24)';
+    ctx.strokeStyle = poly.ring ? 'rgba(255,255,255,0.15)' : 'rgba(210,220,235,0.08)';
+    ctx.fill();
+    if (poly.area > 8) ctx.stroke();
+  }
+  ctx.restore();
 }
 
 function nearestRobotSample(t) {
@@ -7317,7 +8509,7 @@ function project(p) {
   const y2 = cp * y - sp * z1;
   const z2 = sp * y + cp * z1 + state.distance;
   const focal = Math.min(rect.width, rect.height) * 0.92;
-  return {x: rect.width * 0.5 + x1 * focal / Math.max(0.03, z2), y: rect.height * 0.5 - y2 * focal / Math.max(0.03, z2), visible: z2 > 0.03};
+  return {x: rect.width * 0.5 + x1 * focal / Math.max(0.03, z2), y: rect.height * 0.5 - y2 * focal / Math.max(0.03, z2), z: z2, visible: z2 > 0.03};
 }
 
 function boardPoint(m, x, y, z) {
@@ -7330,6 +8522,16 @@ function matrixPoint(m, x, y, z) {
     m[1][0]*x + m[1][1]*y + m[1][2]*z + m[1][3],
     m[2][0]*x + m[2][1]*y + m[2][2]*z + m[2][3]
   ];
+}
+
+function matrixPointScaled(m, v, scaleValue) {
+  const scale = Array.isArray(scaleValue) ? scaleValue : [1, 1, 1];
+  return matrixPoint(
+    m,
+    Number(v?.[0] || 0) * Number(scale[0] || 1),
+    Number(v?.[1] || 0) * Number(scale[1] || 1),
+    Number(v?.[2] || 0) * Number(scale[2] || 1)
+  );
 }
 
 function matrixTranslation(m) {
@@ -7369,6 +8571,21 @@ function robotFrames(model, jointpose, baseMatrix) {
       current = multiplyMatrix4(current, axisAngleMatrix(joint.axis, angle));
     }
     frames.push(current);
+  }
+  return frames;
+}
+
+function robotLinkFrames(model, jointpose, baseMatrix) {
+  const frames = {base_link: baseMatrix};
+  let jointIndex = 0;
+  for (const joint of model.joints || []) {
+    const parentFrame = frames[joint.parent] || baseMatrix;
+    let childFrame = multiplyMatrix4(parentFrame, xyzRpyMatrix(joint.xyz, joint.rpy));
+    if (joint.type !== 'fixed') {
+      const angle = Number(jointpose[jointIndex++] || 0);
+      childFrame = multiplyMatrix4(childFrame, axisAngleMatrix(joint.axis, angle));
+    }
+    if (joint.child) frames[joint.child] = childFrame;
   }
   return frames;
 }
@@ -7454,6 +8671,46 @@ scrub.oninput = () => {
 };
 window.addEventListener('resize', () => { resize(); resetView(); render(); });
 
+function initDetailResize(storageKey, minWidth, maxWidth, defaultWidth) {
+  const saved = Number(localStorage.getItem(storageKey));
+  setDetailWidth(Number.isFinite(saved) ? saved : defaultWidth, minWidth, maxWidth, storageKey);
+  let active = false;
+  detailResizer.addEventListener('pointerdown', event => {
+    active = true;
+    detailResizer.classList.add('dragging');
+    detailResizer.setPointerCapture(event.pointerId);
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    event.preventDefault();
+  });
+  detailResizer.addEventListener('pointermove', event => {
+    if (!active) return;
+    const width = window.innerWidth - event.clientX - 4;
+    setDetailWidth(width, minWidth, maxWidth, storageKey);
+    resize();
+    render();
+  });
+  const stop = event => {
+    if (!active) return;
+    active = false;
+    detailResizer.classList.remove('dragging');
+    try { detailResizer.releasePointerCapture(event.pointerId); } catch (_) {}
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+    resize();
+    render();
+  };
+  detailResizer.addEventListener('pointerup', stop);
+  detailResizer.addEventListener('pointercancel', stop);
+}
+
+function setDetailWidth(width, minWidth, maxWidth, storageKey) {
+  const viewportLimit = Math.max(minWidth, window.innerWidth - 520);
+  const clamped = Math.max(minWidth, Math.min(maxWidth, viewportLimit, Math.round(width)));
+  app.style.setProperty('--detail-width', `${clamped}px`);
+  localStorage.setItem(storageKey, String(clamped));
+}
+
 let lastFrame = performance.now();
 function tick(now) {
   const dt = (now - lastFrame) / 1000;
@@ -7475,6 +8732,7 @@ function tick(now) {
   requestAnimationFrame(tick);
 }
 
+initDetailResize('questReplayDetailWidth', 300, 760, 340);
 resize();
 loadRobotModel();
 loadRecords().catch(error => { rootLabel.textContent = String(error); });

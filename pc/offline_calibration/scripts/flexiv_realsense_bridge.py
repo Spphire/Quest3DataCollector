@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sys
 import threading
 import time
@@ -10,8 +11,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+os.environ.setdefault("OPENCV_OPENCL_RUNTIME", "disabled")
+
 import cv2
 import numpy as np
+
+try:
+    cv2.ocl.setUseOpenCL(False)
+except Exception:
+    pass
 
 
 DEFAULT_PATTERN_COLS = 11
@@ -29,6 +37,8 @@ MIN_HAND_EYE_EE_ROTATION_SPAN_DEG = 2.0
 DEFAULT_CONTROLLER_TRANSLATION_SCALE = 1.0
 DEFAULT_CONTROLLER_MAX_OFFSET_M = 0.18
 DEFAULT_CONTROLLER_MAX_STEP_M = 0.015
+DEFAULT_CONTROLLER_MAX_ROTATION_DEG = 30.0
+DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG = 2.0
 DEFAULT_GRIPPER_DEVICE = "gripper"
 DEFAULT_GRIPPER_OPEN_WIDTH_M = 0.08
 DEFAULT_GRIPPER_CLOSE_WIDTH_M = 0.0
@@ -36,6 +46,21 @@ DEFAULT_GRIPPER_SPEED_MPS = 0.04
 DEFAULT_GRIPPER_FORCE_N = 20.0
 DEFAULT_GRIPPER_TRIGGER_CLOSE_THRESHOLD = 0.65
 DEFAULT_GRIPPER_TRIGGER_OPEN_THRESHOLD = 0.25
+MAX_HAND_EYE_CAMERA_OFFSET_M = 0.50
+MAX_HAND_EYE_TRANSLATION_MEDIAN_RESIDUAL_MM = 15.0
+MAX_HAND_EYE_TRANSLATION_P95_RESIDUAL_MM = 35.0
+RED_ANCHOR_RADIUS_GRID_SPACING = 2.0
+RED_ANCHOR_MIN_PIXELS = 16
+RED_ANCHOR_MIN_RATIO = 0.002
+RED_ANCHOR_MIN_BEST_SECOND_RATIO = 1.8
+QUEST_TO_ROBOT_UNALIGNED_ROTATION = np.array(
+    [
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0],
+        [0.0, 1.0, 0.0],
+    ],
+    dtype=float,
+)
 
 
 class RobotHandEyeCalibrationError(RuntimeError):
@@ -46,11 +71,13 @@ class RobotHandEyeCalibrationError(RuntimeError):
         counts: dict[str, Any] | None = None,
         diversity: dict[str, Any] | None = None,
         observations: list[dict[str, Any]] | None = None,
+        diagnostics: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.counts = counts or {}
         self.diversity = diversity
         self.observations = observations
+        self.diagnostics = diagnostics
 
 
 @dataclass
@@ -79,6 +106,8 @@ class FlexivRealSenseConfig:
     controller_translation_scale: float = DEFAULT_CONTROLLER_TRANSLATION_SCALE
     controller_max_offset_m: float = DEFAULT_CONTROLLER_MAX_OFFSET_M
     controller_max_step_m: float = DEFAULT_CONTROLLER_MAX_STEP_M
+    controller_max_rotation_deg: float = DEFAULT_CONTROLLER_MAX_ROTATION_DEG
+    controller_max_rotation_step_deg: float = DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG
     gripper_enabled: bool = False
     gripper_device: str = DEFAULT_GRIPPER_DEVICE
     gripper_open_width_m: float = DEFAULT_GRIPPER_OPEN_WIDTH_M
@@ -419,6 +448,178 @@ class RealSenseColorCamera:
         return np.asanyarray(frame.get_data()).copy()
 
 
+class RealSenseStreamHub:
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.cameras: dict[str, RealSenseColorCamera] = {}
+        self.metadata: dict[str, dict[str, Any]] = {}
+        self.latest: dict[str, dict[str, Any]] = {}
+        self.signature: tuple[Any, ...] | None = None
+        self.stop_event: threading.Event | None = None
+        self.thread: threading.Thread | None = None
+        self.frame_count = 0
+        self.last_error: str | None = None
+
+    def start(self, config: FlexivRealSenseConfig) -> dict[str, Any]:
+        signature = self._signature(config)
+        with self.lock:
+            if self.thread is not None and self.thread.is_alive() and self.signature == signature:
+                return self.status_locked()
+        self.stop()
+
+        cameras: dict[str, RealSenseColorCamera] = {}
+        metadata: dict[str, dict[str, Any]] = {}
+        try:
+            for role, serial in self._camera_serials(config).items():
+                camera = RealSenseColorCamera()
+                current_metadata = camera.start(
+                    serial,
+                    int(config.width),
+                    int(config.height),
+                    int(config.fps),
+                    bool(config.realsense_auto_exposure),
+                    config.realsense_exposure,
+                    config.realsense_gain,
+                )
+                current_metadata["role"] = role
+                cameras[role] = camera
+                metadata[role] = current_metadata
+        except Exception:
+            for camera in cameras.values():
+                camera.stop()
+            raise
+        if not cameras:
+            raise RuntimeError("No RealSense camera serials are configured")
+
+        stop_event = threading.Event()
+        thread = threading.Thread(target=self._capture_loop, args=(stop_event,), name="realsense-stream", daemon=True)
+        with self.lock:
+            self.cameras = cameras
+            self.metadata = metadata
+            self.latest = {}
+            self.signature = signature
+            self.stop_event = stop_event
+            self.thread = thread
+            self.frame_count = 0
+            self.last_error = None
+        thread.start()
+        return self.status()
+
+    def stop(self) -> None:
+        with self.lock:
+            stop_event = self.stop_event
+            thread = self.thread
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        with self.lock:
+            cameras = self.cameras
+            self.cameras = {}
+            self.metadata = {}
+            self.latest = {}
+            self.signature = None
+            self.stop_event = None
+            self.thread = None
+        for camera in cameras.values():
+            camera.stop()
+
+    def status(self) -> dict[str, Any]:
+        with self.lock:
+            return self.status_locked()
+
+    def status_locked(self) -> dict[str, Any]:
+        running = self.thread is not None and self.thread.is_alive()
+        return {
+            "running": running,
+            "roles": sorted(self.cameras.keys()),
+            "metadata": self.metadata,
+            "frameCount": self.frame_count,
+            "latest": {
+                role: {
+                    "capturedAtUtc": frame.get("capturedAtUtc"),
+                    "serial": frame.get("serial"),
+                    "sequence": frame.get("sequence"),
+                }
+                for role, frame in self.latest.items()
+            },
+            "lastError": self.last_error,
+        }
+
+    def get_latest(self, role: str = "end", wait_timeout: float = 2.0) -> dict[str, Any]:
+        deadline = time.perf_counter() + max(0.0, float(wait_timeout))
+        while True:
+            with self.lock:
+                frame = self.latest.get(role)
+                running = self.thread is not None and self.thread.is_alive()
+                last_error = self.last_error
+            if frame is not None:
+                return {
+                    **frame,
+                    "rgb": frame["rgb"].copy(),
+                    "jpeg": bytes(frame["jpeg"]),
+                    "metadata": dict(frame["metadata"]),
+                }
+            if not running:
+                raise RuntimeError(last_error or "RealSense stream is not running")
+            if time.perf_counter() >= deadline:
+                raise RuntimeError(f"No {role} RealSense frame is available yet")
+            time.sleep(0.02)
+
+    def snapshot_roles(self, roles: list[str], wait_timeout: float = 2.0) -> dict[str, dict[str, Any]]:
+        return {role: self.get_latest(role, wait_timeout=wait_timeout) for role in roles}
+
+    def _capture_loop(self, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
+            with self.lock:
+                cameras = list(self.cameras.items())
+            for role, camera in cameras:
+                if stop_event.is_set():
+                    return
+                try:
+                    rgb = camera.capture_rgb(1)
+                    jpeg = encode_rgb_jpeg(rgb, quality=86)
+                    captured_at = datetime.now(timezone.utc).isoformat()
+                    with self.lock:
+                        self.frame_count += 1
+                        self.latest[role] = {
+                            "role": role,
+                            "serial": camera.serial,
+                            "metadata": self.metadata.get(role, {}),
+                            "rgb": rgb,
+                            "jpeg": jpeg,
+                            "capturedAtUtc": captured_at,
+                            "sequence": self.frame_count,
+                        }
+                        self.last_error = None
+                except Exception as exc:  # pragma: no cover - hardware path
+                    with self.lock:
+                        self.last_error = str(exc)
+                    time.sleep(0.1)
+
+    def _signature(self, config: FlexivRealSenseConfig) -> tuple[Any, ...]:
+        serials = tuple(sorted(self._camera_serials(config).items()))
+        return (
+            serials,
+            int(config.width),
+            int(config.height),
+            int(config.fps),
+            bool(config.realsense_auto_exposure),
+            config.realsense_exposure,
+            config.realsense_gain,
+        )
+
+    def _camera_serials(self, config: FlexivRealSenseConfig) -> dict[str, str]:
+        end = str(config.camera_serial or "").strip()
+        third = str(config.third_camera_serial or "").strip()
+        serials: dict[str, str] = {}
+        if end:
+            serials["end"] = end
+        if third and third != end:
+            serials["third"] = third
+        return serials
+
+
 class RobotRealsenseSession:
     def __init__(
         self,
@@ -426,6 +627,7 @@ class RobotRealsenseSession:
         record_id: str,
         config: FlexivRealSenseConfig,
         robot: FlexivRobotClient,
+        stream_hub: RealSenseStreamHub,
         publish_event: Callable[[dict[str, Any]], None] | None = None,
         robot_alignment_result: dict[str, Any] | None = None,
         require_controller_alignment: bool = False,
@@ -434,28 +636,34 @@ class RobotRealsenseSession:
         self.record_id = record_id
         self.config = config
         self.robot = robot
+        self.stream_hub = stream_hub
         self.publish_event = publish_event
         self.directory = self.root / "robot_realsense"
         self.image_dir = self.directory / "images"
+        self.video_dir = self.directory / "videos"
         self.samples_path = self.directory / "samples.jsonl"
         self.motion_path = self.directory / "controller_motion.jsonl"
         self.gripper_path = self.directory / "gripper_commands.jsonl"
+        self.video_frames_path = self.directory / "video_frames.jsonl"
         self.summary_path = self.directory / "session_summary.json"
-        self.cameras: dict[str, RealSenseColorCamera] = {"end": RealSenseColorCamera()}
-        if self.config.third_camera_serial:
-            self.cameras["third"] = RealSenseColorCamera()
         self.samples_handle: Any | None = None
         self.motion_handle: Any | None = None
         self.gripper_handle: Any | None = None
+        self.video_frames_handle: Any | None = None
+        self.video_writers: dict[str, cv2.VideoWriter] = {}
+        self.video_paths: dict[str, str] = {}
+        self.video_frame_counts: dict[str, int] = {}
         self.lock = threading.Lock()
         self.next_capture_perf = 0.0
         self.sample_count = 0
         self.image_count = 0
+        self.video_frame_count = 0
         self.error_count = 0
         self.closed = False
         self.last_error: str | None = None
         self.camera_metadata: dict[str, dict[str, Any]] = {}
         self.controller_anchor_world: np.ndarray | None = None
+        self.controller_anchor_rotation_world: np.ndarray | None = None
         self.robot_anchor_tcp_pose: list[float] | None = None
         self.motion_command_count = 0
         self.motion_skip_count = 0
@@ -475,27 +683,18 @@ class RobotRealsenseSession:
     def start(self) -> dict[str, Any]:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.image_dir.mkdir(parents=True, exist_ok=True)
+        self.video_dir.mkdir(parents=True, exist_ok=True)
         self.samples_handle = self.samples_path.open("a", encoding="utf-8", newline="\n")
         self.motion_handle = self.motion_path.open("a", encoding="utf-8", newline="\n")
         self.gripper_handle = self.gripper_path.open("a", encoding="utf-8", newline="\n")
+        self.video_frames_handle = self.video_frames_path.open("a", encoding="utf-8", newline="\n")
         config_payload = config_to_json(self.config)
         config_payload["recordId"] = self.record_id
         config_payload["startedAtUtc"] = datetime.now(timezone.utc).isoformat()
         write_json(config_payload, self.directory / "capture_config.json")
-        for role, serial in self.camera_serials().items():
-            if not serial:
-                continue
-            metadata = self.cameras[role].start(
-                serial,
-                self.config.width,
-                self.config.height,
-                self.config.fps,
-                self.config.realsense_auto_exposure,
-                self.config.realsense_exposure,
-                self.config.realsense_gain,
-            )
-            metadata["role"] = role
-            self.camera_metadata[role] = metadata
+        stream_status = self.stream_hub.start(self.config)
+        metadata = stream_status.get("metadata") if isinstance(stream_status, dict) else None
+        self.camera_metadata = metadata if isinstance(metadata, dict) else {}
         write_json(self.camera_metadata, self.directory / "cameras.json")
         if self.robot_alignment_result is not None:
             write_json(self.robot_alignment_result, self.directory / "robot_hand_eye_result.json")
@@ -506,8 +705,6 @@ class RobotRealsenseSession:
         return summary
 
     def update_controller_motion(self, quest_sample: dict[str, Any]) -> dict[str, Any] | None:
-        if not self.config.controller_motion_enabled:
-            return None
         with self.lock:
             if self.closed:
                 return None
@@ -617,8 +814,12 @@ class RobotRealsenseSession:
             if self.gripper_handle is not None:
                 self.gripper_handle.close()
                 self.gripper_handle = None
-            for camera in self.cameras.values():
-                camera.stop()
+            if self.video_frames_handle is not None:
+                self.video_frames_handle.close()
+                self.video_frames_handle = None
+            for writer in self.video_writers.values():
+                writer.release()
+            self.video_writers.clear()
             summary = self.summary("closed")
             write_json(summary, self.summary_path)
             self._publish({"type": "robot_status", "stage": "robot_realsense_closed", **summary})
@@ -635,6 +836,8 @@ class RobotRealsenseSession:
             "cameraRoles": sorted(self.camera_metadata.keys()),
             "samples": self.sample_count,
             "images": self.image_count,
+            "videos": self.video_paths,
+            "videoFrames": self.video_frame_count,
             "errors": self.error_count,
             "motionCommands": self.motion_command_count,
             "motionSkips": self.motion_skip_count,
@@ -655,18 +858,45 @@ class RobotRealsenseSession:
         sample_index = self.sample_count
         robot_state = self.robot.read_state()
         images: dict[str, str] = {}
-        for role, camera in self.cameras.items():
-            if camera.pipeline is None:
-                continue
-            rgb = camera.capture_rgb(self.config.warmup_frames)
-            serial = camera.serial or self.camera_serials().get(role) or role
-            image_rel_path = Path("images") / f"sample_{sample_index:06d}_{role}_{safe_filename(serial)}.jpg"
-            save_rgb_jpeg(rgb, self.directory / image_rel_path)
-            images[role] = str(image_rel_path).replace("\\", "/")
+        videos: dict[str, dict[str, Any]] = {}
+        video_frames: dict[str, dict[str, Any]] = {}
+        frames = self.stream_hub.snapshot_roles(sorted(self.camera_metadata.keys()), wait_timeout=2.0)
+        for role, frame in frames.items():
+            serial = frame.get("serial") or self.camera_serials().get(role) or role
+            frame_index = self._write_video_frame(role, serial, frame)
+            videos[role] = {
+                "path": self.video_paths.get(role),
+                "frameIndex": frame_index,
+                "serial": serial,
+            }
+            video_frames[role] = {
+                "role": role,
+                "serial": serial,
+                "frameIndex": frame_index,
+                "capturedAtUtc": frame.get("capturedAtUtc"),
+                "streamSequence": frame.get("sequence"),
+            }
         t_base_ee = transform_from_json(robot_state.get("endEffectorPose"))
+        t_base_tool_tcp = self._tool_tcp_transform(robot_state, t_base_ee)
         t_base_end_camera_payload = None
-        if t_base_ee is not None and self.t_ee_end_camera is not None:
-            t_base_end_camera_payload = transform_to_json(t_base_ee @ self.t_ee_end_camera)
+        t_world_tool_tcp_payload = None
+        t_world_end_camera_payload = None
+        t_display_tool_tcp_payload = None
+        t_display_end_camera_payload = None
+        if t_base_tool_tcp is not None:
+            if self.t_ee_end_camera is not None:
+                t_base_end_camera = t_base_tool_tcp @ self.t_ee_end_camera
+                t_base_end_camera_payload = transform_to_json(t_base_end_camera)
+            if self.t_base_world is not None:
+                t_world_tool_tcp = invert_transform(self.t_base_world) @ t_base_tool_tcp
+                t_world_tool_tcp_payload = transform_to_json(t_world_tool_tcp)
+                t_display_tool_tcp_payload = transform_to_json(t_world_tool_tcp)
+                if t_base_end_camera_payload is not None:
+                    t_base_end_camera_matrix = transform_from_json(t_base_end_camera_payload)
+                    if t_base_end_camera_matrix is not None:
+                        t_world_end_camera = invert_transform(self.t_base_world) @ t_base_end_camera_matrix
+                        t_world_end_camera_payload = transform_to_json(t_world_end_camera)
+                        t_display_end_camera_payload = transform_to_json(t_world_end_camera)
         return {
             "sample_index": sample_index,
             "record_id": self.record_id,
@@ -676,13 +906,70 @@ class RobotRealsenseSession:
             "quest_sample_index": quest_sample.get("sampleIndex"),
             "quest_recording_timestamp_seconds": quest_sample.get("recordingTimestampSeconds"),
             "quest_pc_receive_perf_counter_seconds": quest_sample.get("pcReceivePerfCounterSeconds"),
+            "quest_gaze3d_world": quest_sample.get("gazePoint3DWorld"),
+            "quest_gaze3d_source": quest_sample.get("gazePoint3DSource") or quest_sample.get("gazeSource"),
+            "right_controller": visualizer_controller_payload(quest_sample.get("rightController")),
             "robot_state": robot_state,
             "T_base_ee": robot_state.get("endEffectorPose"),
+            "T_base_tool_tcp": transform_to_json(t_base_tool_tcp) if t_base_tool_tcp is not None else None,
+            "T_world_tool_tcp": t_world_tool_tcp_payload,
+            "T_display_tool_tcp": t_display_tool_tcp_payload,
             "T_base_end_camera": t_base_end_camera_payload,
+            "T_world_end_camera": t_world_end_camera_payload,
+            "T_display_end_camera": t_display_end_camera_payload,
             "jointpose": robot_state.get("jointPose"),
             "images": images,
+            "videos": videos,
+            "videoFrames": video_frames,
             "gripper": self.robot.gripper_status(),
         }
+
+    def _write_video_frame(self, role: str, serial: str, frame: dict[str, Any]) -> int:
+        rgb = frame["rgb"]
+        if not isinstance(rgb, np.ndarray):
+            raise RuntimeError(f"{role} frame has no RGB image")
+        writer = self.video_writers.get(role)
+        if writer is None:
+            height, width = int(rgb.shape[0]), int(rgb.shape[1])
+            rel_path = Path("videos") / f"{role}_{safe_filename(serial)}.mp4"
+            path = self.directory / rel_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fps = max(1.0, 1.0 / max(1e-6, float(self.config.capture_interval_seconds)))
+            writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+            if not writer.isOpened():
+                raise RuntimeError(f"could not open robot camera video writer: {path}")
+            self.video_writers[role] = writer
+            self.video_paths[role] = str(rel_path).replace("\\", "/")
+            self.video_frame_counts[role] = 0
+        frame_index = int(self.video_frame_counts.get(role, 0))
+        writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        self.video_frame_counts[role] = frame_index + 1
+        self.video_frame_count += 1
+        row = {
+            "sample_index": self.sample_count,
+            "record_id": self.record_id,
+            "role": role,
+            "serial": serial,
+            "frame_index": frame_index,
+            "video": self.video_paths.get(role),
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "frame_captured_at_utc": frame.get("capturedAtUtc"),
+            "stream_sequence": frame.get("sequence"),
+        }
+        if self.video_frames_handle is not None:
+            self.video_frames_handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+            self.video_frames_handle.flush()
+        return frame_index
+
+    def _tool_tcp_transform(self, robot_state: dict[str, Any], fallback: np.ndarray | None) -> np.ndarray | None:
+        tcp = robot_state.get("tcp_pose")
+        if isinstance(tcp, dict):
+            matrix = transform_from_json(tcp.get("T_base_pose"))
+            if matrix is not None:
+                return matrix
+        if self.config.robot_pose_field == "tcp_pose" and fallback is not None:
+            return fallback
+        return fallback
 
     def _publish(self, event: dict[str, Any]) -> None:
         if self.publish_event is not None:
@@ -716,34 +1003,66 @@ class RobotRealsenseSession:
         self._publish(robot_gripper_event(event))
 
     def _update_controller_motion_unlocked(self, quest_sample: dict[str, Any]) -> dict[str, Any]:
-        if not self.robot.motion_armed:
-            return {
-                "ok": False,
-                "reason": "motion_not_armed",
-                "record_id": self.record_id,
-                "captured_at": datetime.now(timezone.utc).isoformat(),
-                "quest_sample_index": quest_sample.get("sampleIndex"),
-                "anchored": self.controller_anchor_world is not None and self.robot_anchor_tcp_pose is not None,
-            }
         controller = quest_sample.get("rightController")
+        input_summary = controller_input_summary(controller)
         if not isinstance(controller, dict) or not controller.get("hasPose"):
+            self.reset_controller_motion_anchor()
             return {
                 "ok": False,
                 "reason": "missing_right_controller",
                 "record_id": self.record_id,
                 "captured_at": datetime.now(timezone.utc).isoformat(),
                 "quest_sample_index": quest_sample.get("sampleIndex"),
-                "anchored": self.controller_anchor_world is not None and self.robot_anchor_tcp_pose is not None,
+                "anchored": self.controller_motion_anchor_ready(),
+                "right_controller_input": input_summary,
+                "teleopHeld": bool(input_summary.get("teleopHeld")),
+                "teleopHoldValue": input_summary.get("handTrigger"),
             }
+        side_pressed, side_value = right_controller_side_button_pressed(controller)
+        if not side_pressed:
+            self.reset_controller_motion_anchor()
+            return {
+                "ok": False,
+                "reason": "right_hand_trigger_not_held",
+                "record_id": self.record_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "quest_sample_index": quest_sample.get("sampleIndex"),
+                "quest_recording_timestamp_seconds": quest_sample.get("recordingTimestampSeconds"),
+                "anchored": self.controller_motion_anchor_ready(),
+                "teleopHeld": False,
+                "teleopHoldValue": side_value,
+                "right_controller_input": input_summary,
+            }
+        if not self.robot.motion_armed:
+            self.robot.arm_motion()
+            self.reset_controller_motion_anchor()
         position = vec3_array(controller.get("position"))
         if position is None:
+            self.reset_controller_motion_anchor()
             return {
                 "ok": False,
                 "reason": "missing_controller_position",
                 "record_id": self.record_id,
                 "captured_at": datetime.now(timezone.utc).isoformat(),
                 "quest_sample_index": quest_sample.get("sampleIndex"),
-                "anchored": self.controller_anchor_world is not None and self.robot_anchor_tcp_pose is not None,
+                "anchored": self.controller_motion_anchor_ready(),
+                "right_controller_input": input_summary,
+                "teleopHeld": True,
+                "teleopHoldValue": side_value,
+            }
+        rotation_world = quat_rotation_matrix(controller.get("rotation"))
+        if rotation_world is None:
+            self.reset_controller_motion_anchor()
+            return {
+                "ok": False,
+                "reason": "missing_controller_rotation",
+                "record_id": self.record_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "quest_sample_index": quest_sample.get("sampleIndex"),
+                "anchored": self.controller_motion_anchor_ready(),
+                "right_controller_input": input_summary,
+                "teleopHeld": True,
+                "teleopHoldValue": side_value,
             }
         if self.require_controller_alignment and self.t_base_world is None:
             return {
@@ -752,26 +1071,46 @@ class RobotRealsenseSession:
                 "record_id": self.record_id,
                 "captured_at": datetime.now(timezone.utc).isoformat(),
                 "quest_sample_index": quest_sample.get("sampleIndex"),
-                "anchored": self.controller_anchor_world is not None and self.robot_anchor_tcp_pose is not None,
+                "anchored": self.controller_motion_anchor_ready(),
+                "right_controller_input": input_summary,
+                "teleopHeld": True,
+                "teleopHoldValue": side_value,
             }
-        created_anchor = self.controller_anchor_world is None or self.robot_anchor_tcp_pose is None
+        created_anchor = not self.controller_motion_anchor_ready()
         if created_anchor:
             self.controller_anchor_world = position
+            self.controller_anchor_rotation_world = rotation_world
             self.robot_anchor_tcp_pose = self.robot.read_tcp_pose()
         raw_offset_world = (position - self.controller_anchor_world) * float(self.config.controller_translation_scale)
-        raw_offset = raw_offset_world
+        mapping_mode = "quest_alignment"
+        raw_rotation_world = rotation_world @ self.controller_anchor_rotation_world.T
         if self.t_base_world is not None:
-            raw_offset = self.t_base_world[:3, :3] @ raw_offset_world
+            mapping_rotation = self.t_base_world[:3, :3]
+            raw_offset = mapping_rotation @ raw_offset_world
+        else:
+            mapping_rotation = QUEST_TO_ROBOT_UNALIGNED_ROTATION
+            raw_offset = mapping_rotation @ raw_offset_world
+            mapping_mode = "unaligned_quest_y_to_robot_z"
+        raw_rotation = mapping_rotation @ raw_rotation_world @ mapping_rotation.T
         offset = clamp_vector_norm(raw_offset, float(self.config.controller_max_offset_m))
+        rotation_delta = clamp_rotation_angle(raw_rotation, float(self.config.controller_max_rotation_deg))
         target = list(self.robot_anchor_tcp_pose)
         target[:3] = [float(target[i] + offset[i]) for i in range(3)]
+        anchor_rotation = quaternion_wxyz_to_matrix(target[3:7])
+        target_rotation = rotation_delta @ anchor_rotation
         last = self.robot.motion_last_target_pose
         step_offset = np.zeros(3, dtype=float)
+        step_rotation = np.eye(3, dtype=float)
         if last is not None:
             step = np.asarray(target[:3], dtype=float) - np.asarray(last[:3], dtype=float)
             step = clamp_vector_norm(step, float(self.config.controller_max_step_m))
             step_offset = step
             target[:3] = [float(last[i] + step[i]) for i in range(3)]
+            last_rotation = quaternion_wxyz_to_matrix(last[3:7])
+            step_rotation = target_rotation @ last_rotation.T
+            step_rotation = clamp_rotation_angle(step_rotation, float(self.config.controller_max_rotation_step_deg))
+            target_rotation = step_rotation @ last_rotation
+        target[3:7] = matrix_to_quaternion_wxyz(target_rotation)
         self.robot.send_cartesian_target(target)
         return {
             "ok": True,
@@ -779,23 +1118,52 @@ class RobotRealsenseSession:
             "captured_at": datetime.now(timezone.utc).isoformat(),
             "quest_sample_index": quest_sample.get("sampleIndex"),
             "quest_recording_timestamp_seconds": quest_sample.get("recordingTimestampSeconds"),
+            "teleopHeld": True,
+            "teleopHoldValue": side_value,
+            "teleop_held": True,
+            "teleop_hold_value": side_value,
+            "right_controller_input": input_summary,
             "controller_position_world": [float(v) for v in position],
+            "controller_rotation_world_wxyz": matrix_to_quaternion_wxyz(rotation_world),
             "controller_anchor_world": [float(v) for v in self.controller_anchor_world],
+            "controller_anchor_rotation_world_wxyz": matrix_to_quaternion_wxyz(self.controller_anchor_rotation_world),
             "robot_anchor_tcp_pose_wxyz": [float(v) for v in self.robot_anchor_tcp_pose],
             "anchored": True,
             "created_anchor": created_anchor,
             "quest_alignment_used": self.t_base_world is not None,
+            "motion_mapping": mapping_mode,
+            "unaligned_rotation_robot_from_quest": QUEST_TO_ROBOT_UNALIGNED_ROTATION.tolist()
+            if self.t_base_world is None
+            else None,
             "raw_offset_world_m": [float(v) for v in raw_offset_world],
             "raw_offset_m": [float(v) for v in raw_offset],
             "offset_m": [float(v) for v in offset],
             "step_offset_m": [float(v) for v in step_offset],
+            "raw_rotation_angle_world_deg": rotation_angle_deg(raw_rotation_world),
+            "raw_rotation_angle_deg": rotation_angle_deg(raw_rotation),
+            "rotation_angle_deg": rotation_angle_deg(rotation_delta),
+            "step_rotation_deg": rotation_angle_deg(step_rotation),
             "target_tcp_pose_wxyz": target,
             "limits": {
                 "scale": self.config.controller_translation_scale,
                 "maxOffsetM": self.config.controller_max_offset_m,
                 "maxStepM": self.config.controller_max_step_m,
+                "maxRotationDeg": self.config.controller_max_rotation_deg,
+                "maxRotationStepDeg": self.config.controller_max_rotation_step_deg,
             },
         }
+
+    def controller_motion_anchor_ready(self) -> bool:
+        return (
+            self.controller_anchor_world is not None
+            and self.controller_anchor_rotation_world is not None
+            and self.robot_anchor_tcp_pose is not None
+        )
+
+    def reset_controller_motion_anchor(self) -> None:
+        self.controller_anchor_world = None
+        self.controller_anchor_rotation_world = None
+        self.robot_anchor_tcp_pose = None
 
     def _update_gripper_unlocked(self, quest_sample: dict[str, Any]) -> dict[str, Any]:
         controller = quest_sample.get("rightController")
@@ -883,6 +1251,7 @@ class FlexivRealSenseManager:
         self.config = config or FlexivRealSenseConfig()
         self.robot = FlexivRobotClient()
         self.lock = threading.Lock()
+        self.stream_hub = RealSenseStreamHub()
         self.active_session: RobotRealsenseSession | None = None
         self.last_calibration: dict[str, Any] | None = None
         self.last_error: str | None = None
@@ -896,6 +1265,7 @@ class FlexivRealSenseManager:
                 "config": config_to_json(self.config),
                 "robot": self.robot.status(),
                 "activeSession": active,
+                "realsenseStream": self.stream_hub.status(),
                 "lastCalibration": self.last_calibration,
                 "lastError": self.last_error,
             }
@@ -910,6 +1280,11 @@ class FlexivRealSenseManager:
                 self.config.camera_serial = str(payload.get("cameraSerial") or "").strip()
             if "thirdCameraSerial" in payload:
                 self.config.third_camera_serial = str(payload.get("thirdCameraSerial") or "").strip()
+            if (
+                self.config.third_camera_serial
+                and self.config.third_camera_serial == self.config.camera_serial
+            ):
+                self.config.third_camera_serial = ""
             if "networkInterfaces" in payload:
                 self.config.flexiv_network_interfaces = normalize_network_interfaces(payload.get("networkInterfaces"))
             for key, attr in (
@@ -945,6 +1320,10 @@ class FlexivRealSenseManager:
                 self.config.controller_max_offset_m = float(payload["controllerMaxOffsetM"])
             if "controllerMaxStepM" in payload and is_number(payload["controllerMaxStepM"]):
                 self.config.controller_max_step_m = float(payload["controllerMaxStepM"])
+            if "controllerMaxRotationDeg" in payload and is_number(payload["controllerMaxRotationDeg"]):
+                self.config.controller_max_rotation_deg = float(payload["controllerMaxRotationDeg"])
+            if "controllerMaxRotationStepDeg" in payload and is_number(payload["controllerMaxRotationStepDeg"]):
+                self.config.controller_max_rotation_step_deg = float(payload["controllerMaxRotationStepDeg"])
             if "gripperEnabled" in payload:
                 self.config.gripper_enabled = bool(payload["gripperEnabled"])
             if "gripperDevice" in payload:
@@ -984,6 +1363,9 @@ class FlexivRealSenseManager:
     def arm_motion(self) -> dict[str, Any]:
         try:
             state = self.robot.arm_motion()
+            with self.lock:
+                if self.active_session is not None:
+                    self.active_session.reset_controller_motion_anchor()
             self.config.controller_motion_enabled = True
             self.last_error = None
             return {"ok": True, "state": state, "status": self.status()}
@@ -994,6 +1376,9 @@ class FlexivRealSenseManager:
     def disarm_motion(self) -> dict[str, Any]:
         try:
             self.robot.disarm_motion()
+            with self.lock:
+                if self.active_session is not None:
+                    self.active_session.reset_controller_motion_anchor()
             self.config.controller_motion_enabled = False
             self.last_error = None
             return {"ok": True, "status": self.status()}
@@ -1007,23 +1392,69 @@ class FlexivRealSenseManager:
         except Exception as exc:  # pragma: no cover - hardware path
             return {"ok": False, "error": str(exc), "cameras": []}
 
+    def start_realsense_stream(self) -> dict[str, Any]:
+        try:
+            stream = self.stream_hub.start(self.config)
+            self.last_error = None
+            return {"ok": True, "stream": stream, "status": self.status()}
+        except Exception as exc:  # pragma: no cover - hardware path
+            self.last_error = str(exc)
+            return {"ok": False, "error": self.last_error, "status": self.status()}
+
+    def stop_realsense_stream(self) -> dict[str, Any]:
+        self.stream_hub.stop()
+        return {"ok": True, "status": self.status()}
+
+    def capture_end_camera_preview_jpeg(self) -> tuple[bytes, dict[str, Any]]:
+        return self.capture_camera_preview_jpeg("end")
+
+    def capture_camera_preview_jpeg(self, role: str = "end") -> tuple[bytes, dict[str, Any]]:
+        role = str(role or "end").strip().lower()
+        if role not in ("end", "third"):
+            raise RuntimeError(f"Unsupported RealSense camera role: {role}")
+        with self.lock:
+            configured_serial = self.config.third_camera_serial if role == "third" else self.config.camera_serial
+            serial = str(configured_serial or "").strip()
+        if not serial:
+            raise RuntimeError(f"RealSense {role} camera serial is empty")
+        frame = self.stream_hub.get_latest(role, wait_timeout=5.0)
+        return frame["jpeg"], {
+            "createdAtUtc": frame.get("capturedAtUtc") or datetime.now(timezone.utc).isoformat(),
+            "camera": frame.get("metadata"),
+            "sequence": frame.get("sequence"),
+            "role": role,
+            "stream": self.stream_hub.status(),
+        }
+
+    def capture_end_camera_overlay_jpeg(self) -> tuple[bytes, dict[str, Any]]:
+        with self.lock:
+            serial = str(self.config.camera_serial or "").strip()
+        if not serial:
+            raise RuntimeError("RealSense end camera serial is empty")
+        frame = self.stream_hub.get_latest("end", wait_timeout=5.0)
+        rgb = frame["rgb"]
+        overlay_rgb, board = checkerboard_overlay_rgb(
+            rgb,
+            self.config.pattern_cols,
+            self.config.pattern_rows,
+        )
+        meta = {
+            "createdAtUtc": frame.get("capturedAtUtc") or datetime.now(timezone.utc).isoformat(),
+            "camera": frame.get("metadata"),
+            "sequence": frame.get("sequence"),
+            "stream": self.stream_hub.status(),
+            "overlay": True,
+            "board": board,
+        }
+        return encode_rgb_jpeg(overlay_rgb, quality=86), meta
+
     def check_end_camera_board(self, output_root: Path) -> dict[str, Any]:
-        camera = RealSenseColorCamera()
         output_dir = output_root.resolve() / "end_camera"
         output_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            metadata = camera.start(
-                self.config.camera_serial,
-                self.config.width,
-                self.config.height,
-                self.config.fps,
-                self.config.realsense_auto_exposure,
-                self.config.realsense_exposure,
-                self.config.realsense_gain,
-            )
-            rgb = camera.capture_rgb(self.config.board_check_warmup_frames)
-        finally:
-            camera.stop()
+        self.stream_hub.start(self.config)
+        frame = self.stream_hub.get_latest("end", wait_timeout=2.0)
+        metadata = frame.get("metadata") or {}
+        rgb = frame["rgb"]
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         brightness = {
             "mean": float(np.mean(gray)),
@@ -1062,10 +1493,16 @@ class FlexivRealSenseManager:
             },
             "brightness": brightness,
             "imagePath": str(image_path),
+            "streamFrame": {
+                "capturedAtUtc": frame.get("capturedAtUtc"),
+                "sequence": frame.get("sequence"),
+                "serial": frame.get("serial"),
+            },
             "detectedCorners": self.config.pattern_cols * self.config.pattern_rows if observation is not None else 0,
             "method": observation.get("method") if observation is not None else None,
             "bestReprojectionRmsePx": None,
             "bestReprojectionMedianPx": None,
+            "redAnchor": observation.get("red_anchor") if observation is not None else None,
             "overlayPath": None,
             "message": board_check_message(observation is not None, brightness),
         }
@@ -1105,6 +1542,7 @@ class FlexivRealSenseManager:
                 record_id,
                 self.config,
                 self.robot,
+                self.stream_hub,
                 publish_event,
                 robot_alignment_result=robot_alignment_result,
                 require_controller_alignment=require_controller_alignment,
@@ -1117,8 +1555,26 @@ class FlexivRealSenseManager:
                 if publish_event is not None:
                     publish_event({"type": "robot_status", "ok": False, "stage": "start_failed", "error": self.last_error})
                 return None
+            try:
+                self.robot.arm_motion()
+                self.config.controller_motion_enabled = True
+                self.last_error = None
+                if publish_event is not None:
+                    publish_event({"type": "robot_status", "stage": "motion_armed", **self.status()})
+            except Exception as exc:  # pragma: no cover - hardware path
+                self.config.controller_motion_enabled = False
+                self.last_error = str(exc)
+                if publish_event is not None:
+                    publish_event(
+                        {
+                            "type": "robot_status",
+                            "ok": False,
+                            "stage": "arm_motion_failed",
+                            "error": self.last_error,
+                            "status": self.status(),
+                        }
+                    )
             self.active_session = session
-            self.last_error = None
             return session
 
     def stop_session(self, session: RobotRealsenseSession | None) -> dict[str, Any] | None:
@@ -1163,6 +1619,7 @@ class FlexivRealSenseManager:
             counts = exc.counts if isinstance(exc, RobotHandEyeCalibrationError) else None
             diversity = exc.diversity if isinstance(exc, RobotHandEyeCalibrationError) else None
             observations = exc.observations if isinstance(exc, RobotHandEyeCalibrationError) else None
+            diagnostics = exc.diagnostics if isinstance(exc, RobotHandEyeCalibrationError) else None
             failure = {
                 "type": "robot_calibration_failure",
                 "ok": False,
@@ -1171,6 +1628,7 @@ class FlexivRealSenseManager:
                 "createdAtUtc": datetime.now(timezone.utc).isoformat(),
                 "counts": counts,
                 "diversity": diversity,
+                "diagnostics": diagnostics,
                 "observations": observations_to_json(observations) if observations is not None else None,
             }
             write_json(failure, session_dir / "robot_hand_eye_failure.json")
@@ -1335,28 +1793,35 @@ def calibrate_robot_realsense_run(
     observations = []
     overlay_dir = run_dir / "detections"
     overlay_dir.mkdir(parents=True, exist_ok=True)
-    for sample in samples:
-        if not sample.get("ok"):
-            continue
-        t_base_ee = transform_from_json(sample.get("T_base_ee"))
-        image_rel = (sample.get("images") or {}).get("end")
-        if t_base_ee is None or not image_rel:
-            continue
-        image_path = (run_dir / image_rel).resolve()
-        if not image_path.exists():
-            continue
-        obs = detect_end_observation(
-            image_path=image_path,
-            sample=sample,
-            t_base_ee=t_base_ee,
-            camera=camera,
-            cols=cols,
-            rows=rows,
-            square_size_m=square_size_m,
-            overlay_dir=overlay_dir,
-        )
-        if obs is not None:
-            observations.append(obs)
+    video_cache: dict[str, cv2.VideoCapture] = {}
+    try:
+        for sample in samples:
+            if not sample.get("ok"):
+                continue
+            t_base_ee = transform_from_json(sample.get("T_base_tool_tcp"))
+            if t_base_ee is None:
+                t_base_ee = transform_from_json(sample.get("T_base_ee"))
+            if t_base_ee is None:
+                continue
+            frame_payload = load_end_observation_frame(run_dir, sample, video_cache)
+            if frame_payload is None:
+                continue
+            obs = detect_end_observation(
+                image=frame_payload["image"],
+                image_label=frame_payload["label"],
+                sample=sample,
+                t_base_ee=t_base_ee,
+                camera=camera,
+                cols=cols,
+                rows=rows,
+                square_size_m=square_size_m,
+                overlay_dir=overlay_dir,
+            )
+            if obs is not None:
+                observations.append(obs)
+    finally:
+        for cap in video_cache.values():
+            cap.release()
 
     counts = {
         "samples": len(samples),
@@ -1369,6 +1834,8 @@ def calibrate_robot_realsense_run(
             counts=counts,
             observations=observations,
         )
+    red_anchor_global = infer_observation_red_anchor_target(observations, cols, rows)
+    apply_global_red_anchor_target(observations, red_anchor_global, cols, rows)
 
     diversity = observation_pose_diversity(observations)
     try:
@@ -1381,6 +1848,7 @@ def calibrate_robot_realsense_run(
             observations=observations,
         ) from exc
     solution = solve_end_hand_eye(observations)
+    validate_hand_eye_solution(solution, counts, diversity, observations)
     result = {
         "ok": True,
         "record_id": samples[0].get("record_id") if samples else None,
@@ -1389,7 +1857,13 @@ def calibrate_robot_realsense_run(
         "description": "Flexiv end-mounted RealSense hand-eye calibration. T_A_B maps coordinates from B into A.",
         "pattern": {"cols": cols, "rows": rows, "square_size_m": square_size_m},
         "camera": camera,
-        "counts": {**counts, "rot180_selected": int(sum(obs["selected"] == 1 for obs in observations))},
+        "counts": {
+            **counts,
+            "rot180_selected": int(sum(obs["selected"] == 1 for obs in observations)),
+            "red_anchor_ok": int(sum(bool((obs.get("red_anchor") or {}).get("ok")) for obs in observations)),
+            "red_anchor_rot180": int(sum((obs.get("red_anchor") or {}).get("order") == "rot180" for obs in observations)),
+            "red_anchor_global": red_anchor_global,
+        },
         "diversity": diversity,
         "end_camera": {
             "T_ee_realsense": transform_to_json(solution["T_ee_camera"]),
@@ -1406,8 +1880,96 @@ def calibrate_robot_realsense_run(
     return result
 
 
+def load_end_observation_frame(
+    run_dir: Path,
+    sample: dict[str, Any],
+    video_cache: dict[str, cv2.VideoCapture],
+) -> dict[str, Any] | None:
+    image_rel = (sample.get("images") or {}).get("end")
+    if isinstance(image_rel, str) and image_rel:
+        image_path = (run_dir / image_rel).resolve()
+        if image_path.exists():
+            image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            if image is not None:
+                return {"image": image, "label": str(image_path)}
+
+    videos = sample.get("videos") if isinstance(sample.get("videos"), dict) else {}
+    end_video = videos.get("end")
+    if not isinstance(end_video, dict):
+        return None
+    rel_video = end_video.get("path")
+    frame_index = end_video.get("frameIndex")
+    if not isinstance(rel_video, str) or not is_number(frame_index):
+        return None
+    video_path = (run_dir / rel_video).resolve()
+    if not video_path.exists():
+        return None
+    key = str(video_path)
+    cap = video_cache.get(key)
+    if cap is None:
+        cap = cv2.VideoCapture(key)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        video_cache[key] = cap
+    index = int(frame_index)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+    ok, image = cap.read()
+    if not ok or image is None:
+        return None
+    return {"image": image, "label": f"{video_path}#frame={index}"}
+
+
+def validate_hand_eye_solution(
+    solution: dict[str, Any],
+    counts: dict[str, Any],
+    diversity: dict[str, Any],
+    observations: list[dict[str, Any]],
+) -> None:
+    t_ee_camera = np.asarray(solution["T_ee_camera"], dtype=float)
+    offset_m = float(np.linalg.norm(t_ee_camera[:3, 3]))
+    residual = solution.get("residual_summary") if isinstance(solution, dict) else {}
+    translation = residual.get("translation_mm") if isinstance(residual, dict) else {}
+    median_mm = float(translation.get("median") or 0.0) if isinstance(translation, dict) else 0.0
+    p95_mm = float(translation.get("p95") or 0.0) if isinstance(translation, dict) else 0.0
+    diagnostics = {
+        "cameraOffsetM": offset_m,
+        "maxCameraOffsetM": MAX_HAND_EYE_CAMERA_OFFSET_M,
+        "translationResidualMedianMm": median_mm,
+        "maxTranslationResidualMedianMm": MAX_HAND_EYE_TRANSLATION_MEDIAN_RESIDUAL_MM,
+        "translationResidualP95Mm": p95_mm,
+        "maxTranslationResidualP95Mm": MAX_HAND_EYE_TRANSLATION_P95_RESIDUAL_MM,
+        "hint": (
+            "Check that the end camera serial is the camera mounted on the robot end-effector, "
+            "and that the end-camera checkerboard view is not coming from the third/static camera."
+        ),
+    }
+    reasons = []
+    if offset_m > MAX_HAND_EYE_CAMERA_OFFSET_M:
+        reasons.append(f"end-camera extrinsic offset {offset_m:.3f}m > {MAX_HAND_EYE_CAMERA_OFFSET_M:.3f}m")
+    if median_mm > MAX_HAND_EYE_TRANSLATION_MEDIAN_RESIDUAL_MM:
+        reasons.append(
+            f"translation residual median {median_mm:.1f}mm > {MAX_HAND_EYE_TRANSLATION_MEDIAN_RESIDUAL_MM:.1f}mm"
+        )
+    if p95_mm > MAX_HAND_EYE_TRANSLATION_P95_RESIDUAL_MM:
+        reasons.append(
+            f"translation residual p95 {p95_mm:.1f}mm > {MAX_HAND_EYE_TRANSLATION_P95_RESIDUAL_MM:.1f}mm"
+        )
+    if reasons:
+        raise RobotHandEyeCalibrationError(
+            "Implausible Flexiv/RealSense hand-eye result: " + "; ".join(reasons),
+            counts=counts,
+            diversity=diversity,
+            observations=observations,
+            diagnostics=diagnostics,
+        )
+
+
 def detect_end_observation(
-    image_path: Path,
+    *,
+    image: np.ndarray | None = None,
+    image_label: str | None = None,
+    image_path: Path | None = None,
     sample: dict[str, Any],
     t_base_ee: np.ndarray,
     camera: dict[str, Any],
@@ -1416,7 +1978,9 @@ def detect_end_observation(
     square_size_m: float,
     overlay_dir: Path,
 ) -> dict[str, Any] | None:
-    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if image is None and image_path is not None:
+        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        image_label = str(image_path)
     if image is None:
         return None
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -1437,6 +2001,8 @@ def detect_end_observation(
     if not ok or corners is None:
         return None
     corners = np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2)
+    red_anchor = detect_red_corner_anchor(image, corners.reshape(-1, 2), cols, rows)
+    anchor_order = red_anchor.get("order") if red_anchor.get("ok") else None
     camera_matrix, distortion = camera_intrinsics(camera)
     candidates = []
     for order, obj in (
@@ -1454,6 +2020,7 @@ def detect_end_observation(
                 "T_camera_board": transform_to_json(transform_from_rvec_tvec(rvec, tvec)),
                 "reprojection_rmse_px": float(np.sqrt(np.mean(error * error))),
                 "reprojection_median_px": float(np.median(error)),
+                "matches_red_anchor": bool(order == anchor_order) if anchor_order in ("identity", "rot180") else None,
             }
         )
     if not candidates:
@@ -1461,24 +2028,82 @@ def detect_end_observation(
     overlay_path = overlay_dir / f"sample_{int(sample.get('sample_index', 0)):06d}_end_overlay.jpg"
     overlay = image.copy()
     cv2.drawChessboardCorners(overlay, pattern, corners, True)
+    draw_red_anchor_overlay(overlay, corners.reshape(-1, 2), red_anchor, cols, rows)
     cv2.imwrite(str(overlay_path), overlay, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
     return {
         "sample_index": int(sample.get("sample_index", 0)),
         "quest_sample_index": sample.get("quest_sample_index"),
         "quest_recording_timestamp_seconds": sample.get("quest_recording_timestamp_seconds"),
-        "image": str(image_path),
+        "image": image_label or (str(image_path) if image_path is not None else None),
         "overlay": str(overlay_path),
         "method": method,
         "T_base_ee": t_base_ee,
+        "red_anchor": red_anchor,
         "candidates": candidates,
         "selected": 0,
+    }
+
+
+def checkerboard_overlay_rgb(rgb: np.ndarray, cols: int, rows: int) -> tuple[np.ndarray, dict[str, Any]]:
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    overlay = bgr.copy()
+    pattern = (int(cols), int(rows))
+    ok = False
+    corners = None
+    method = "findChessboardCorners"
+    try:
+        scale = min(1.0, 640.0 / max(1, max(rgb.shape[0], rgb.shape[1])))
+        if scale < 1.0:
+            small = cv2.resize(bgr, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        else:
+            small = bgr
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        ok, corners = cv2.findChessboardCorners(
+            gray,
+            pattern,
+            cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE,
+        )
+        method = "findChessboardCorners"
+        if ok and corners is not None:
+            cv2.cornerSubPix(
+                gray,
+                corners,
+                (7, 7),
+                (-1, -1),
+                (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-4),
+            )
+            if scale < 1.0:
+                corners = corners / scale
+    except Exception as exc:
+        ok = False
+        corners = None
+        method = f"overlay_error:{type(exc).__name__}"
+    if ok and corners is not None:
+        corners = np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2)
+        red_anchor = detect_red_corner_anchor(bgr, corners.reshape(-1, 2), int(cols), int(rows))
+        cv2.drawChessboardCorners(overlay, pattern, corners, True)
+        draw_red_anchor_overlay(overlay, corners.reshape(-1, 2), red_anchor, int(cols), int(rows))
+        status = f"checkerboard detected: {len(corners)}/{int(cols) * int(rows)}"
+        color = (80, 220, 120)
+    else:
+        red_anchor = None
+        status = "checkerboard not detected"
+        color = (80, 120, 255)
+    cv2.rectangle(overlay, (10, 10), (min(520, overlay.shape[1] - 10), 46), (20, 24, 28), -1)
+    cv2.putText(overlay, status, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+    return cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB), {
+        "ok": bool(ok and corners is not None),
+        "detectedCorners": int(len(corners)) if ok and corners is not None else 0,
+        "expectedCorners": int(cols) * int(rows),
+        "method": method,
+        "redAnchor": red_anchor,
     }
 
 
 def solve_end_hand_eye(observations: list[dict[str, Any]]) -> dict[str, Any]:
     from scipy.optimize import least_squares
 
-    selected = [0 for _ in observations]
+    selected = [initial_candidate_index(obs) for obs in observations]
     x0 = np.eye(4, dtype=float)
     x0[:3, 3] = np.array([0.0, 0.0, 0.08], dtype=float)
     b0 = average_transforms([obs["T_base_ee"] @ x0 @ candidate_matrix(obs, 0) for obs in observations])
@@ -1520,6 +2145,88 @@ def solve_end_hand_eye(observations: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def initial_candidate_index(obs: dict[str, Any]) -> int:
+    red_anchor = obs.get("red_anchor") if isinstance(obs.get("red_anchor"), dict) else {}
+    anchor_order = red_anchor.get("order") if red_anchor.get("ok") else None
+    if anchor_order in ("identity", "rot180"):
+        for index, candidate in enumerate(obs.get("candidates") or []):
+            if candidate.get("order") == anchor_order:
+                return int(index)
+    return 0
+
+
+def infer_observation_red_anchor_target(observations: list[dict[str, Any]], cols: int, rows: int) -> dict[str, Any]:
+    total = int(cols) * int(rows)
+    order_180 = np.arange(total).reshape(int(rows), int(cols))[::-1, ::-1].reshape(-1)
+    counts: dict[int, int] = {}
+    observed_counts: dict[int, int] = {}
+    score_sum: dict[int, float] = {}
+    for obs in observations:
+        anchor = obs.get("red_anchor") if isinstance(obs.get("red_anchor"), dict) else {}
+        if not anchor.get("ok"):
+            continue
+        observed = int(anchor.get("observedIndex", -1))
+        if observed < 0 or observed >= total:
+            continue
+        target = int(min(observed, int(order_180[observed])))
+        counts[target] = counts.get(target, 0) + 1
+        observed_counts[observed] = observed_counts.get(observed, 0) + 1
+        score_sum[target] = score_sum.get(target, 0.0) + float(anchor.get("bestScore") or 0.0)
+    if not counts:
+        return {
+            "target_index": None,
+            "source": "none_detected",
+            "ok_frames": 0,
+            "counts": {},
+            "observed_counts": {},
+            "note": "Red anchor is optional; observations without red use identity/rot180 hand-eye residual matching.",
+        }
+    target = max(counts, key=lambda idx: (counts[idx], score_sum.get(idx, 0.0)))
+    return {
+        "target_index": int(target),
+        "source": "auto_from_any_reliable_red_anchor",
+        "ok_frames": int(sum(counts.values())),
+        "counts": {str(key): int(value) for key, value in sorted(counts.items())},
+        "observed_counts": {str(key): int(value) for key, value in sorted(observed_counts.items())},
+        "score_sum": {str(key): float(value) for key, value in sorted(score_sum.items())},
+        "note": "A reliable red anchor frame orients the global 180-degree pair; observations without red remain valid and fall back to residual matching.",
+    }
+
+
+def apply_global_red_anchor_target(observations: list[dict[str, Any]], summary: dict[str, Any], cols: int, rows: int) -> None:
+    target = summary.get("target_index") if isinstance(summary, dict) else None
+    if target is None:
+        return
+    total = int(cols) * int(rows)
+    order_180 = np.arange(total).reshape(int(rows), int(cols))[::-1, ::-1].reshape(-1)
+    for obs in observations:
+        anchor = obs.get("red_anchor") if isinstance(obs.get("red_anchor"), dict) else {}
+        if not anchor.get("ok"):
+            continue
+        observed = int(anchor.get("observedIndex", -1))
+        if observed < 0 or observed >= total:
+            anchor["targetIndex"] = int(target)
+            anchor["order"] = None
+            anchor["orderReason"] = "observed_index_out_of_range"
+            continue
+        if observed == int(target):
+            order = "identity"
+        elif int(order_180[observed]) == int(target):
+            order = "rot180"
+        else:
+            anchor["targetIndex"] = int(target)
+            anchor["order"] = None
+            anchor["orderReason"] = "observed_corner_not_in_global_target_180_pair"
+            for candidate in obs.get("candidates") or []:
+                candidate["matches_red_anchor"] = None
+            continue
+        anchor["targetIndex"] = int(target)
+        anchor["order"] = order
+        anchor["orderReason"] = "global_red_anchor_target"
+        for candidate in obs.get("candidates") or []:
+            candidate["matches_red_anchor"] = bool(candidate.get("order") == order)
+
+
 def observation_pose_diversity(observations: list[dict[str, Any]]) -> dict[str, Any]:
     return ee_pose_diversity([np.asarray(obs["T_base_ee"], dtype=float) for obs in observations])
 
@@ -1550,17 +2257,14 @@ def ee_pose_diversity(poses: list[np.ndarray]) -> dict[str, Any]:
 def require_hand_eye_pose_diversity(diversity: dict[str, Any]) -> None:
     translation_span = float(diversity.get("eeTranslationSpanM") or 0.0)
     rotation_span = float(diversity.get("eeRotationSpanDeg") or 0.0)
-    if (
-        translation_span >= MIN_HAND_EYE_EE_TRANSLATION_SPAN_M
-        or rotation_span >= MIN_HAND_EYE_EE_ROTATION_SPAN_DEG
-    ):
+    if rotation_span >= MIN_HAND_EYE_EE_ROTATION_SPAN_DEG:
         return
     raise ValueError(
         "Need robot/end-camera pose diversity for hand-eye calibration: "
-        f"max EE translation span {translation_span * 1000.0:.1f} mm "
-        f"(need >= {MIN_HAND_EYE_EE_TRANSLATION_SPAN_M * 1000.0:.1f} mm) or "
         f"rotation span {rotation_span:.2f} deg "
-        f"(need >= {MIN_HAND_EYE_EE_ROTATION_SPAN_DEG:.2f} deg)."
+        f"(need >= {MIN_HAND_EYE_EE_ROTATION_SPAN_DEG:.2f} deg). "
+        f"Translation span was {translation_span * 1000.0:.1f} mm, but translation alone "
+        "does not constrain the end-camera hand-eye transform well enough."
     )
 
 
@@ -1576,6 +2280,12 @@ def hand_eye_residual_vector(params: np.ndarray, observations: list[dict[str, An
 
 
 def choose_candidate(obs: dict[str, Any], t_ee_camera: np.ndarray, t_base_board: np.ndarray) -> int:
+    red_anchor = obs.get("red_anchor") if isinstance(obs.get("red_anchor"), dict) else {}
+    anchor_order = red_anchor.get("order") if red_anchor.get("ok") else None
+    if anchor_order in ("identity", "rot180"):
+        for index, candidate in enumerate(obs.get("candidates") or []):
+            if candidate.get("order") == anchor_order:
+                return int(index)
     scores = []
     for index in range(len(obs["candidates"])):
         predicted = obs["T_base_ee"] @ t_ee_camera @ candidate_matrix(obs, index)
@@ -1633,9 +2343,17 @@ def robot_sample_event(row: dict[str, Any]) -> dict[str, Any]:
         "questSampleIndex": row.get("quest_sample_index"),
         "capturedAt": row.get("captured_at"),
         "T_base_ee": row.get("T_base_ee"),
+        "T_base_tool_tcp": row.get("T_base_tool_tcp"),
+        "T_world_tool_tcp": row.get("T_world_tool_tcp"),
         "T_base_end_camera": row.get("T_base_end_camera"),
+        "T_world_end_camera": row.get("T_world_end_camera"),
         "jointpose": row.get("jointpose"),
         "images": row.get("images"),
+        "videos": row.get("videos"),
+        "videoFrames": row.get("videoFrames"),
+        "questGaze3DWorld": row.get("quest_gaze3d_world"),
+        "questGaze3DSource": row.get("quest_gaze3d_source"),
+        "rightController": row.get("right_controller"),
         "gripper": row.get("gripper"),
         "poseDiversity": row.get("poseDiversity"),
         "poseField": state.get("poseField"),
@@ -1653,9 +2371,18 @@ def robot_motion_event(row: dict[str, Any]) -> dict[str, Any]:
         "targetTcpPose": row.get("target_tcp_pose_wxyz"),
         "offsetM": row.get("offset_m"),
         "stepOffsetM": row.get("step_offset_m"),
+        "rotationDeg": row.get("rotation_angle_deg"),
+        "stepRotationDeg": row.get("step_rotation_deg"),
+        "rawRotationWorldDeg": row.get("raw_rotation_angle_world_deg"),
         "anchored": row.get("anchored"),
         "createdAnchor": row.get("created_anchor"),
         "questAlignmentUsed": row.get("quest_alignment_used"),
+        "motionMapping": row.get("motion_mapping"),
+        "teleopHeld": row.get("teleopHeld") if row.get("teleopHeld") is not None else row.get("teleop_held"),
+        "teleopHoldValue": row.get("teleopHoldValue")
+        if row.get("teleopHoldValue") is not None
+        else row.get("teleop_hold_value"),
+        "rightControllerInput": row.get("right_controller_input"),
         "reason": row.get("reason"),
         "error": row.get("error"),
     }
@@ -1679,13 +2406,21 @@ def robot_gripper_event(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def controller_trigger_value(controller: dict[str, Any]) -> float | None:
+    summary = controller_input_summary(controller)
+    value = summary.get("indexTrigger") if isinstance(summary, dict) else None
+    if is_number(value):
+        return max(0.0, min(1.0, float(value)))
+    pressed = summary.get("indexTriggerPressed") if isinstance(summary, dict) else None
+    if isinstance(pressed, bool):
+        return 1.0 if pressed else 0.0
+    if not isinstance(controller, dict):
+        return None
     for key in (
         "indexTrigger",
         "rightIndexTrigger",
         "trigger",
         "primaryIndexTrigger",
         "primaryTrigger",
-        "gripTrigger",
     ):
         value = controller.get(key)
         if is_number(value):
@@ -1696,7 +2431,124 @@ def controller_trigger_value(controller: dict[str, Any]) -> float | None:
             value = buttons.get(key)
             if is_number(value):
                 return max(0.0, min(1.0, float(value)))
+        for key in ("indexTriggerPressed", "triggerPressed", "primaryIndexTriggerPressed"):
+            value = buttons.get(key)
+            if isinstance(value, bool):
+                return 1.0 if value else 0.0
+    for key in ("indexTriggerPressed", "triggerPressed", "primaryIndexTriggerPressed"):
+        value = controller.get(key)
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
     return None
+
+
+def right_controller_side_button_pressed(controller: dict[str, Any], threshold: float = 0.65) -> tuple[bool, float | None]:
+    summary = controller_input_summary(controller, threshold=threshold)
+    value = summary.get("handTrigger") if isinstance(summary, dict) else None
+    pressed = summary.get("handTriggerPressed") if isinstance(summary, dict) else None
+    if isinstance(pressed, bool) and pressed:
+        return True, 1.0 if not is_number(value) else max(0.0, min(1.0, float(value)))
+    if is_number(value):
+        clamped = max(0.0, min(1.0, float(value)))
+        return clamped >= float(threshold), clamped
+    return bool(summary.get("teleopHeld")) if isinstance(summary, dict) else False, None
+
+
+def controller_input_summary(controller: dict[str, Any] | None, threshold: float = 0.65) -> dict[str, Any]:
+    if not isinstance(controller, dict):
+        return {
+            "hasAny": False,
+            "handTrigger": None,
+            "indexTrigger": None,
+            "handTriggerPressed": None,
+            "indexTriggerPressed": None,
+            "aButton": None,
+            "bButton": None,
+            "teleopHeld": False,
+            "teleopThreshold": float(threshold),
+        }
+    nested_input = controller.get("input")
+    buttons = controller.get("buttons")
+    if not isinstance(nested_input, dict):
+        nested_input = {}
+    if not isinstance(buttons, dict):
+        buttons = {}
+
+    def first_float(*keys: str) -> float | None:
+        for source in (controller, nested_input, buttons):
+            for key in keys:
+                value = source.get(key)
+                if is_number(value):
+                    return max(0.0, min(1.0, float(value)))
+        return None
+
+    def first_bool(*keys: str) -> bool | None:
+        for source in (controller, nested_input, buttons):
+            for key in keys:
+                value = source.get(key)
+                if isinstance(value, bool):
+                    return value
+        return None
+
+    hand_trigger = first_float("handTrigger", "rightHandTrigger", "grip", "primaryHandTrigger")
+    index_trigger = first_float(
+        "indexTrigger",
+        "rightIndexTrigger",
+        "trigger",
+        "primaryIndexTrigger",
+        "primaryTrigger",
+    )
+    hand_pressed = first_bool("handTriggerPressed", "rightHandTriggerPressed", "gripPressed", "gripButton")
+    index_pressed = first_bool(
+        "indexTriggerPressed",
+        "rightIndexTriggerPressed",
+        "triggerPressed",
+        "triggerButton",
+        "primaryIndexTriggerPressed",
+    )
+    a_button = first_bool("aButton", "buttonA", "primaryButton")
+    b_button = first_bool("bButton", "buttonB", "secondaryButton")
+    has_any = bool(nested_input.get("hasAny")) or any(
+        value is not None
+        for value in (hand_trigger, index_trigger, hand_pressed, index_pressed, a_button, b_button)
+    )
+    teleop_held = bool(hand_pressed) or (hand_trigger is not None and hand_trigger >= float(threshold))
+    if nested_input.get("teleopHeld") is not None:
+        teleop_held = bool(nested_input.get("teleopHeld")) or teleop_held
+    return {
+        "hasAny": has_any,
+        "handTrigger": hand_trigger,
+        "indexTrigger": index_trigger,
+        "handTriggerPressed": hand_pressed,
+        "indexTriggerPressed": index_pressed,
+        "aButton": a_button,
+        "bButton": b_button,
+        "teleopHeld": teleop_held,
+        "teleopThreshold": float(threshold),
+    }
+
+
+def visualizer_controller_payload(controller: Any) -> dict[str, Any]:
+    input_summary = controller_input_summary(controller)
+    if not isinstance(controller, dict):
+        return {"ok": False, "source": "missing_controller_payload", "input": input_summary}
+    position = vec3_array(controller.get("position"))
+    rotation = controller.get("rotation")
+    q = None
+    if isinstance(rotation, list) and len(rotation) >= 4:
+        try:
+            q = [float(rotation[index]) for index in range(4)]
+        except (TypeError, ValueError):
+            q = None
+    if not q or not all(math.isfinite(item) for item in q):
+        q = [1.0, 0.0, 0.0, 0.0]
+    return {
+        "ok": bool(controller.get("hasPose") and position is not None),
+        "source": controller.get("source") or controller.get("missingReason") or "right",
+        "p": [float(v) for v in position] if position is not None else None,
+        "q": q,
+        "input": input_summary,
+    }
 
 
 def flexiv_pose_to_transform(pose: np.ndarray) -> np.ndarray:
@@ -1722,6 +2574,18 @@ def matrix_to_quaternion_wxyz(matrix: np.ndarray) -> list[float]:
 
     qx, qy, qz, qw = Rotation.from_matrix(matrix[:3, :3]).as_quat()
     return normalize_quaternion([float(qw), float(qx), float(qy), float(qz)])
+
+
+def quat_rotation_matrix(value: Any) -> np.ndarray | None:
+    if not isinstance(value, list) or len(value) < 4:
+        return None
+    try:
+        quat = [float(value[index]) for index in range(4)]
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(item) for item in quat):
+        return None
+    return quaternion_wxyz_to_matrix(quat)
 
 
 def make_transform(rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
@@ -1816,6 +2680,21 @@ def rotation_angle_deg(rotation: np.ndarray) -> float:
     return float(math.degrees(math.acos(cosine)))
 
 
+def clamp_rotation_angle(rotation: np.ndarray, max_angle_deg: float) -> np.ndarray:
+    if max_angle_deg <= 0:
+        return np.eye(3, dtype=float)
+    from scipy.spatial.transform import Rotation
+
+    rotvec = Rotation.from_matrix(rotation[:3, :3]).as_rotvec()
+    angle = float(np.linalg.norm(rotvec))
+    if not math.isfinite(angle) or angle <= 1e-12:
+        return np.eye(3, dtype=float)
+    max_angle_rad = math.radians(float(max_angle_deg))
+    if angle <= max_angle_rad:
+        return np.asarray(rotation[:3, :3], dtype=float)
+    return Rotation.from_rotvec(rotvec * (max_angle_rad / angle)).as_matrix()
+
+
 def residual_summary(residuals: list[dict[str, np.ndarray]]) -> dict[str, Any]:
     translation_mm = np.asarray([np.linalg.norm(r["translation"]) * 1000.0 for r in residuals], dtype=float)
     rotation_deg = np.asarray([np.linalg.norm(r["rotation"]) * 180.0 / math.pi for r in residuals], dtype=float)
@@ -1849,6 +2728,136 @@ def camera_intrinsics(camera: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
     )
     coeffs = np.asarray(camera.get("distortion_coeffs") or [0, 0, 0, 0, 0], dtype=float).reshape(-1, 1)
     return matrix, coeffs
+
+
+def checkerboard_corner_indices(cols: int, rows: int) -> list[int]:
+    return [0, cols - 1, (rows - 1) * cols, rows * cols - 1]
+
+
+def red_anchor_order_for_observed(observed_index: int, target_index: int, order_180: np.ndarray) -> str | None:
+    if observed_index < 0 or target_index < 0:
+        return None
+    if int(observed_index) == int(target_index):
+        return "identity"
+    if int(order_180[int(observed_index)]) == int(target_index):
+        return "rot180"
+    return None
+
+
+def red_anchor_target_index_for_observed(observed_index: int, cols: int, rows: int) -> int | None:
+    total = int(cols) * int(rows)
+    if observed_index < 0 or observed_index >= total:
+        return None
+    order_180 = np.arange(total).reshape(int(rows), int(cols))[::-1, ::-1].reshape(-1)
+    paired = int(order_180[int(observed_index)])
+    return int(min(int(observed_index), paired))
+
+
+def corner_grid_spacing_px(corners: np.ndarray, cols: int, rows: int) -> float:
+    points = np.asarray(corners, dtype=float).reshape(rows, cols, 2)
+    diffs: list[np.ndarray] = []
+    if cols >= 2:
+        diffs.append(np.linalg.norm(np.diff(points, axis=1), axis=2).reshape(-1))
+    if rows >= 2:
+        diffs.append(np.linalg.norm(np.diff(points, axis=0), axis=2).reshape(-1))
+    if not diffs:
+        return 12.0
+    values = np.concatenate(diffs)
+    values = values[np.isfinite(values) & (values > 1.0)]
+    return float(np.median(values)) if values.size else 12.0
+
+
+def red_mask_bgr(image: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    hsv_mask = (((h <= 10) | (h >= 170)) & (s >= 70) & (v >= 45))
+    b, g, r = cv2.split(image)
+    rgb_mask = (r >= 80) & (r.astype(np.float32) >= 1.25 * g.astype(np.float32)) & (r.astype(np.float32) >= 1.25 * b.astype(np.float32))
+    return (hsv_mask | rgb_mask).astype(np.uint8)
+
+
+def detect_red_corner_anchor(image: np.ndarray, corners: np.ndarray, cols: int, rows: int) -> dict[str, Any]:
+    points = np.asarray(corners, dtype=float).reshape(-1, 2)
+    corner_indices = checkerboard_corner_indices(cols, rows)
+    spacing = corner_grid_spacing_px(points, cols, rows)
+    radius = max(8.0, RED_ANCHOR_RADIUS_GRID_SPACING * spacing)
+    radius = min(radius, 0.35 * float(min(image.shape[:2])))
+    mask = red_mask_bgr(image)
+    height, width = mask.shape[:2]
+    scores: dict[str, float] = {}
+    red_pixels: dict[str, int] = {}
+    areas: dict[str, int] = {}
+    centers: dict[str, list[float]] = {}
+    for index in corner_indices:
+        x, y = points[index]
+        centers[str(index)] = [float(x), float(y)]
+        x0 = max(0, int(np.floor(x - radius)))
+        x1 = min(width, int(np.ceil(x + radius + 1)))
+        y0 = max(0, int(np.floor(y - radius)))
+        y1 = min(height, int(np.ceil(y + radius + 1)))
+        if x0 >= x1 or y0 >= y1:
+            scores[str(index)] = 0.0
+            red_pixels[str(index)] = 0
+            areas[str(index)] = 0
+            continue
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        circle = (xx - x) * (xx - x) + (yy - y) * (yy - y) <= radius * radius
+        roi = mask[y0:y1, x0:x1]
+        area = int(np.count_nonzero(circle))
+        count = int(np.count_nonzero(roi[circle]))
+        scores[str(index)] = float(count / max(1, area))
+        red_pixels[str(index)] = count
+        areas[str(index)] = area
+    ranked = sorted(corner_indices, key=lambda idx: (scores[str(idx)], red_pixels[str(idx)]), reverse=True)
+    best = ranked[0]
+    second = ranked[1] if len(ranked) > 1 else best
+    best_score = float(scores[str(best)])
+    second_score = float(scores[str(second)]) if second != best else 0.0
+    score_ratio = float(best_score / max(second_score, 1e-9))
+    ok = (
+        red_pixels[str(best)] >= RED_ANCHOR_MIN_PIXELS
+        and best_score >= RED_ANCHOR_MIN_RATIO
+        and score_ratio >= RED_ANCHOR_MIN_BEST_SECOND_RATIO
+    )
+    target = red_anchor_target_index_for_observed(int(best), cols, rows) if ok else None
+    order_180 = np.arange(int(cols) * int(rows)).reshape(int(rows), int(cols))[::-1, ::-1].reshape(-1)
+    order = red_anchor_order_for_observed(int(best), int(target), order_180) if target is not None else None
+    return {
+        "ok": bool(ok),
+        "observedIndex": int(best) if ok else -1,
+        "targetIndex": int(target) if target is not None else -1,
+        "order": order,
+        "bestIndex": int(best),
+        "secondIndex": int(second),
+        "bestScore": best_score,
+        "secondScore": second_score,
+        "scoreRatio": score_ratio,
+        "redPixels": red_pixels,
+        "areas": areas,
+        "scoresByCorner": scores,
+        "centersByCorner": centers,
+        "radiusPx": float(radius),
+        "gridSpacingPx": float(spacing),
+        "cornerIndices": [int(v) for v in corner_indices],
+        "reason": "ok" if ok else "weak_or_ambiguous_red_corner",
+    }
+
+
+def draw_red_anchor_overlay(out: np.ndarray, corners: np.ndarray, anchor: dict[str, Any] | None, cols: int, rows: int) -> None:
+    if not anchor:
+        return
+    points = np.asarray(corners, dtype=float).reshape(-1, 2)
+    radius = int(round(float(anchor.get("radiusPx") or 0.0)))
+    scores = anchor.get("scoresByCorner") if isinstance(anchor.get("scoresByCorner"), dict) else {}
+    observed = int(anchor.get("observedIndex", -1))
+    best = int(anchor.get("bestIndex", -1))
+    for index in checkerboard_corner_indices(cols, rows):
+        x, y = points[index]
+        color = (0, 0, 255) if index == observed else ((0, 180, 255) if index == best else (200, 200, 200))
+        if radius > 0:
+            cv2.circle(out, (int(round(x)), int(round(y))), radius, color, 2, cv2.LINE_AA)
+        label = f"{index}:{float(scores.get(str(index), 0.0)):.3f}"
+        cv2.putText(out, label, (int(round(x)) + 6, int(round(y)) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
 
 def object_points(cols: int, rows: int, square_size_m: float) -> np.ndarray:
@@ -1891,6 +2900,7 @@ def observations_to_json(observations: list[dict[str, Any]]) -> list[dict[str, A
                 "overlay": obs.get("overlay"),
                 "method": obs.get("method"),
                 "selected": obs.get("selected"),
+                "red_anchor": obs.get("red_anchor"),
                 "candidates": obs.get("candidates"),
             }
         )
@@ -1912,9 +2922,15 @@ def first_numeric_state_list(states: Any, names: list[str]) -> list[float] | Non
 
 def save_rgb_jpeg(rgb: np.ndarray, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(encode_rgb_jpeg(rgb, quality=92))
+
+
+def encode_rgb_jpeg(rgb: np.ndarray, quality: int = 92) -> bytes:
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    if not cv2.imwrite(str(path), bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
-        raise RuntimeError(f"could not write image: {path}")
+    ok, buffer = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    if not ok:
+        raise RuntimeError("could not encode image")
+    return bytes(buffer)
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -1959,6 +2975,8 @@ def config_to_json(config: FlexivRealSenseConfig) -> dict[str, Any]:
         "controllerTranslationScale": config.controller_translation_scale,
         "controllerMaxOffsetM": config.controller_max_offset_m,
         "controllerMaxStepM": config.controller_max_step_m,
+        "controllerMaxRotationDeg": config.controller_max_rotation_deg,
+        "controllerMaxRotationStepDeg": config.controller_max_rotation_step_deg,
         "gripperEnabled": config.gripper_enabled,
         "gripperDevice": config.gripper_device,
         "gripperOpenWidthM": config.gripper_open_width_m,

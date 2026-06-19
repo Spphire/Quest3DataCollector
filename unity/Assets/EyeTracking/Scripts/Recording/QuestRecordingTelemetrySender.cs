@@ -260,27 +260,32 @@ namespace EyeTracking.Recording
             if (TryGetOvrControllerPose(node, out Pose pose, out bool positionTracked, out bool rotationTracked))
             {
                 FillTrackedPose(telemetry, "OVRInput", pose, positionTracked, rotationTracked);
+                FillControllerInputTelemetry(telemetry, node);
                 return telemetry;
             }
 
             if (TryGetXrControllerPose(node, out pose, out positionTracked, out rotationTracked))
             {
                 FillTrackedPose(telemetry, "XRInputDevice", pose, positionTracked, rotationTracked);
+                FillControllerInputTelemetry(telemetry, node);
                 return telemetry;
             }
 
             if (TryGetInteractionControllerRefPose(node, out pose, out positionTracked, out rotationTracked))
             {
                 FillTrackedPose(telemetry, "InteractionSDKControllerRef", pose, positionTracked, rotationTracked);
+                FillControllerInputTelemetry(telemetry, node);
                 return telemetry;
             }
 
             if (TryGetAnchorControllerPose(node, out pose, out positionTracked, out rotationTracked))
             {
                 FillTrackedPose(telemetry, "OVRCameraRigAnchor", pose, positionTracked, rotationTracked);
+                FillControllerInputTelemetry(telemetry, node);
                 return telemetry;
             }
 
+            FillControllerInputTelemetry(telemetry, node);
             telemetry.hasPose = false;
             telemetry.source = "missing";
             telemetry.missingReason = BuildControllerMissingReason(node);
@@ -307,6 +312,62 @@ namespace EyeTracking.Recording
             telemetry.position = Vector3ToArray(pose.position);
             telemetry.rotation = QuaternionToArray(pose.rotation);
             telemetry.pose = PoseToArray(pose);
+        }
+
+        private static void FillControllerInputTelemetry(ControllerTelemetry telemetry, XRNode node)
+        {
+            OVRInput.Controller controller = OvrControllerForNode(node);
+            bool isRight = node == XRNode.RightHand;
+            OVRInput.RawButton rawIndex = isRight ? OVRInput.RawButton.RIndexTrigger : OVRInput.RawButton.LIndexTrigger;
+            OVRInput.RawButton rawHand = isRight ? OVRInput.RawButton.RHandTrigger : OVRInput.RawButton.LHandTrigger;
+            OVRInput.RawAxis1D rawIndexAxis = isRight ? OVRInput.RawAxis1D.RIndexTrigger : OVRInput.RawAxis1D.LIndexTrigger;
+            OVRInput.RawAxis1D rawHandAxis = isRight ? OVRInput.RawAxis1D.RHandTrigger : OVRInput.RawAxis1D.LHandTrigger;
+            telemetry.indexTrigger = Mathf.Clamp01(OVRInput.Get(OVRInput.Axis1D.PrimaryIndexTrigger, controller));
+            telemetry.handTrigger = Mathf.Clamp01(OVRInput.Get(OVRInput.Axis1D.PrimaryHandTrigger, controller));
+            telemetry.indexTrigger = Mathf.Clamp01(Mathf.Max(telemetry.indexTrigger, OVRInput.Get(rawIndexAxis, controller)));
+            telemetry.handTrigger = Mathf.Clamp01(Mathf.Max(telemetry.handTrigger, OVRInput.Get(rawHandAxis, controller)));
+            telemetry.indexTriggerPressed =
+                OVRInput.Get(rawIndex, controller) ||
+                OVRInput.Get(OVRInput.Button.PrimaryIndexTrigger, controller);
+            telemetry.handTriggerPressed =
+                OVRInput.Get(rawHand, controller) ||
+                OVRInput.Get(OVRInput.Button.PrimaryHandTrigger, controller);
+            telemetry.aButton =
+                isRight &&
+                (OVRInput.Get(OVRInput.RawButton.A, controller) || OVRInput.Get(OVRInput.Button.One, controller));
+            telemetry.bButton =
+                isRight &&
+                (OVRInput.Get(OVRInput.RawButton.B, controller) || OVRInput.Get(OVRInput.Button.Two, controller));
+
+            InputDevice device = InputDevices.GetDeviceAtXRNode(node);
+            if (device.isValid)
+            {
+                if (device.TryGetFeatureValue(CommonUsages.trigger, out float xrTrigger))
+                {
+                    telemetry.indexTrigger = Mathf.Clamp01(Mathf.Max(telemetry.indexTrigger, xrTrigger));
+                }
+                if (device.TryGetFeatureValue(CommonUsages.grip, out float xrGrip))
+                {
+                    telemetry.handTrigger = Mathf.Clamp01(Mathf.Max(telemetry.handTrigger, xrGrip));
+                }
+                if (device.TryGetFeatureValue(CommonUsages.triggerButton, out bool xrTriggerButton))
+                {
+                    telemetry.indexTriggerPressed |= xrTriggerButton;
+                }
+                if (device.TryGetFeatureValue(CommonUsages.gripButton, out bool xrGripButton))
+                {
+                    telemetry.handTriggerPressed |= xrGripButton;
+                }
+                if (node == XRNode.RightHand && device.TryGetFeatureValue(CommonUsages.primaryButton, out bool xrPrimaryButton))
+                {
+                    telemetry.aButton |= xrPrimaryButton;
+                }
+                if (node == XRNode.RightHand && device.TryGetFeatureValue(CommonUsages.secondaryButton, out bool xrSecondaryButton))
+                {
+                    telemetry.bButton |= xrSecondaryButton;
+                }
+            }
+
         }
 
         private void LogSampleStatusIfNeeded(TelemetrySampleMessage message)
@@ -941,6 +1002,12 @@ namespace EyeTracking.Recording
             public double[] position;
             public double[] rotation;
             public double[] pose;
+            public float indexTrigger;
+            public float handTrigger;
+            public bool indexTriggerPressed;
+            public bool handTriggerPressed;
+            public bool aButton;
+            public bool bButton;
         }
     }
 }
