@@ -144,7 +144,9 @@ Useful options:
 - `--no-robot-hand-eye` records robot/RealSense data but skips the automatic hand-eye solve.
 - `--controller-motion-scale 1.0` scales right-controller displacement into TCP displacement.
 - `--controller-motion-max-offset 0.18` limits the TCP offset from the arm anchor.
-- `--controller-motion-max-step 0.015` limits each target update step.
+- `--controller-motion-max-step 0.025` limits each target update step.
+- `--controller-joint-limit-buffer 0.08` stops controller TCP commands when any joint is within the buffer around the URDF soft joint limits.
+- `--disable-controller-joint-limit-guard` disables that teleop joint-limit guard for debugging only.
 
 Read-only hardware diagnostics:
 

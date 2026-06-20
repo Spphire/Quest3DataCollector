@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,9 +37,10 @@ MIN_HAND_EYE_EE_TRANSLATION_SPAN_M = 0.02
 MIN_HAND_EYE_EE_ROTATION_SPAN_DEG = 2.0
 DEFAULT_CONTROLLER_TRANSLATION_SCALE = 1.0
 DEFAULT_CONTROLLER_MAX_OFFSET_M = 0.18
-DEFAULT_CONTROLLER_MAX_STEP_M = 0.015
+DEFAULT_CONTROLLER_MAX_STEP_M = 0.025
 DEFAULT_CONTROLLER_MAX_ROTATION_DEG = 30.0
 DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG = 2.0
+DEFAULT_CONTROLLER_JOINT_LIMIT_BUFFER_RAD = 0.08
 DEFAULT_HAND_EYE_MAX_DIVERSE_SAMPLES = 120
 DEFAULT_HAND_EYE_MIN_DIVERSE_SAMPLES = 20
 DEFAULT_HAND_EYE_DIVERSE_TRANSLATION_SCALE_M = 0.02
@@ -119,6 +121,8 @@ class FlexivRealSenseConfig:
     controller_max_step_m: float = DEFAULT_CONTROLLER_MAX_STEP_M
     controller_max_rotation_deg: float = DEFAULT_CONTROLLER_MAX_ROTATION_DEG
     controller_max_rotation_step_deg: float = DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG
+    controller_joint_limit_buffer_rad: float = DEFAULT_CONTROLLER_JOINT_LIMIT_BUFFER_RAD
+    controller_joint_limit_guard_enabled: bool = True
     gripper_enabled: bool = False
     gripper_device: str = DEFAULT_GRIPPER_DEVICE
     gripper_open_width_m: float = DEFAULT_GRIPPER_OPEN_WIDTH_M
@@ -142,6 +146,7 @@ class FlexivRobotClient:
         self.gripper_enabled = False
         self.gripper_device: str | None = None
         self.gripper_last_error: str | None = None
+        self.joint_limits = default_rizon4_joint_limits()
 
     def connect(
         self,
@@ -227,6 +232,12 @@ class FlexivRobotClient:
                 ],
             ),
         }
+        payload["jointLimitGuard"] = joint_limit_guard_state(
+            payload.get("jointPose"),
+            self.joint_limits,
+            0.0,
+            True,
+        )
         for field in ("flange_pose", "tcp_pose"):
             if field == self.pose_field or not hasattr(states, field):
                 continue
@@ -298,17 +309,56 @@ class FlexivRobotClient:
                 payload["lastError"] = self.last_error
         return payload
 
-    def send_cartesian_target(self, target_pose_wxyz: list[float]) -> None:
+    def send_cartesian_target(
+        self,
+        target_pose_wxyz: list[float],
+        joint_limit_buffer_rad: float,
+        joint_limit_guard_enabled: bool,
+    ) -> dict[str, Any]:
         with self.lock:
             if self.robot is None:
                 raise RuntimeError("Flexiv robot is not connected")
             if not self.motion_armed:
-                return
+                return {"enabled": bool(joint_limit_guard_enabled), "ok": False, "reason": "motion_not_armed"}
             if len(target_pose_wxyz) < 7:
                 raise ValueError("target pose must be [x,y,z,qw,qx,qy,qz]")
             target = [float(v) for v in target_pose_wxyz[:7]]
+            joint_pose = self.read_joint_pose_locked()
+            guard = joint_limit_guard_state(
+                joint_pose,
+                self.joint_limits,
+                joint_limit_buffer_rad,
+                joint_limit_guard_enabled,
+            )
+            if not bool(guard.get("ok")):
+                return guard
             self.robot.SendCartesianMotionForce(target)
             self.motion_last_target_pose = target
+            return guard
+
+    def joint_limit_guard(self, buffer_rad: float, enabled: bool) -> dict[str, Any]:
+        with self.lock:
+            if self.robot is None:
+                return {"enabled": bool(enabled), "ok": False, "reason": "robot_not_connected"}
+            joint_pose = self.read_joint_pose_locked()
+            return joint_limit_guard_state(joint_pose, self.joint_limits, buffer_rad, enabled)
+
+    def read_joint_pose_locked(self) -> list[float] | None:
+        if self.robot is None:
+            raise RuntimeError("Flexiv robot is not connected")
+        states = self.robot.states()
+        return first_numeric_state_list(
+            states,
+            [
+                "q",
+                "theta",
+                "joint_pos",
+                "joint_position",
+                "joint_positions",
+                "jointPosition",
+                "actual_q",
+            ],
+        )
 
     def enable_gripper(self, device_name: str) -> dict[str, Any]:
         with self.lock:
@@ -868,6 +918,10 @@ class RobotRealsenseSession:
     def _capture_row(self, quest_sample: dict[str, Any]) -> dict[str, Any]:
         sample_index = self.sample_count
         robot_state = self.robot.read_state()
+        robot_state["jointLimitGuard"] = self.robot.joint_limit_guard(
+            self.config.controller_joint_limit_buffer_rad,
+            self.config.controller_joint_limit_guard_enabled,
+        )
         images: dict[str, str] = {}
         videos: dict[str, dict[str, Any]] = {}
         video_frames: dict[str, dict[str, Any]] = {}
@@ -1122,7 +1176,51 @@ class RobotRealsenseSession:
             step_rotation = clamp_rotation_angle(step_rotation, float(self.config.controller_max_rotation_step_deg))
             target_rotation = step_rotation @ last_rotation
         target[3:7] = matrix_to_quaternion_wxyz(target_rotation)
-        self.robot.send_cartesian_target(target)
+        joint_guard = self.robot.send_cartesian_target(
+            target,
+            self.config.controller_joint_limit_buffer_rad,
+            self.config.controller_joint_limit_guard_enabled,
+        )
+        if not bool(joint_guard.get("ok")):
+            self.reset_controller_motion_anchor()
+            return {
+                "ok": False,
+                "reason": joint_guard.get("reason") or "joint_limit_guard",
+                "record_id": self.record_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "quest_sample_index": quest_sample.get("sampleIndex"),
+                "quest_recording_timestamp_seconds": quest_sample.get("recordingTimestampSeconds"),
+                "teleopHeld": True,
+                "teleopHoldValue": side_value,
+                "teleop_held": True,
+                "teleop_hold_value": side_value,
+                "right_controller_input": input_summary,
+                "controller_position_world": [float(v) for v in position],
+                "controller_rotation_world_wxyz": matrix_to_quaternion_wxyz(rotation_world),
+                "anchored": False,
+                "created_anchor": created_anchor,
+                "quest_alignment_used": self.t_base_world is not None,
+                "motion_mapping": mapping_mode,
+                "raw_offset_world_m": [float(v) for v in raw_offset_world],
+                "raw_offset_m": [float(v) for v in raw_offset],
+                "offset_m": [float(v) for v in offset],
+                "step_offset_m": [float(v) for v in step_offset],
+                "raw_rotation_angle_world_deg": rotation_angle_deg(raw_rotation_world),
+                "raw_rotation_angle_deg": rotation_angle_deg(raw_rotation),
+                "rotation_angle_deg": rotation_angle_deg(rotation_delta),
+                "step_rotation_deg": rotation_angle_deg(step_rotation),
+                "target_tcp_pose_wxyz": target,
+                "joint_limit_guard": joint_guard,
+                "limits": {
+                    "scale": self.config.controller_translation_scale,
+                    "maxOffsetM": self.config.controller_max_offset_m,
+                    "maxStepM": self.config.controller_max_step_m,
+                    "maxRotationDeg": self.config.controller_max_rotation_deg,
+                    "maxRotationStepDeg": self.config.controller_max_rotation_step_deg,
+                    "jointLimitBufferRad": self.config.controller_joint_limit_buffer_rad,
+                    "jointLimitGuardEnabled": self.config.controller_joint_limit_guard_enabled,
+                },
+            }
         return {
             "ok": True,
             "record_id": self.record_id,
@@ -1155,12 +1253,15 @@ class RobotRealsenseSession:
             "rotation_angle_deg": rotation_angle_deg(rotation_delta),
             "step_rotation_deg": rotation_angle_deg(step_rotation),
             "target_tcp_pose_wxyz": target,
+            "joint_limit_guard": joint_guard,
             "limits": {
                 "scale": self.config.controller_translation_scale,
                 "maxOffsetM": self.config.controller_max_offset_m,
                 "maxStepM": self.config.controller_max_step_m,
                 "maxRotationDeg": self.config.controller_max_rotation_deg,
                 "maxRotationStepDeg": self.config.controller_max_rotation_step_deg,
+                "jointLimitBufferRad": self.config.controller_joint_limit_buffer_rad,
+                "jointLimitGuardEnabled": self.config.controller_joint_limit_guard_enabled,
             },
         }
 
@@ -1270,11 +1371,18 @@ class FlexivRealSenseManager:
     def status(self) -> dict[str, Any]:
         with self.lock:
             active = self.active_session.summary("recording") if self.active_session is not None else None
+            robot_status = self.robot.status()
+            state = robot_status.get("state") if isinstance(robot_status, dict) else None
+            if isinstance(state, dict) and robot_status.get("connected"):
+                state["jointLimitGuard"] = self.robot.joint_limit_guard(
+                    self.config.controller_joint_limit_buffer_rad,
+                    self.config.controller_joint_limit_guard_enabled,
+                )
             return {
                 "ok": True,
                 "enabled": True,
                 "config": config_to_json(self.config),
-                "robot": self.robot.status(),
+                "robot": robot_status,
                 "activeSession": active,
                 "realsenseStream": self.stream_hub.status(),
                 "lastCalibration": self.last_calibration,
@@ -1346,6 +1454,10 @@ class FlexivRealSenseManager:
                 self.config.controller_max_rotation_deg = float(payload["controllerMaxRotationDeg"])
             if "controllerMaxRotationStepDeg" in payload and is_number(payload["controllerMaxRotationStepDeg"]):
                 self.config.controller_max_rotation_step_deg = float(payload["controllerMaxRotationStepDeg"])
+            if "controllerJointLimitBufferRad" in payload and is_number(payload["controllerJointLimitBufferRad"]):
+                self.config.controller_joint_limit_buffer_rad = max(0.0, float(payload["controllerJointLimitBufferRad"]))
+            if "controllerJointLimitGuardEnabled" in payload:
+                self.config.controller_joint_limit_guard_enabled = bool(payload["controllerJointLimitGuardEnabled"])
             if "gripperEnabled" in payload:
                 self.config.gripper_enabled = bool(payload["gripperEnabled"])
             if "gripperDevice" in payload:
@@ -2536,6 +2648,7 @@ def robot_sample_event(row: dict[str, Any]) -> dict[str, Any]:
         "questGaze3DSource": row.get("quest_gaze3d_source"),
         "rightController": row.get("right_controller"),
         "gripper": row.get("gripper"),
+        "jointLimitGuard": (state.get("jointLimitGuard") if isinstance(state, dict) else None),
         "poseDiversity": row.get("poseDiversity"),
         "poseField": state.get("poseField"),
         "robotSn": state.get("robotSn"),
@@ -2564,6 +2677,7 @@ def robot_motion_event(row: dict[str, Any]) -> dict[str, Any]:
         if row.get("teleopHoldValue") is not None
         else row.get("teleop_hold_value"),
         "rightControllerInput": row.get("right_controller_input"),
+        "jointLimitGuard": row.get("joint_limit_guard"),
         "reason": row.get("reason"),
         "error": row.get("error"),
     }
@@ -3101,6 +3215,136 @@ def first_numeric_state_list(states: Any, names: list[str]) -> list[float] | Non
     return None
 
 
+def default_rizon4_joint_limits() -> list[dict[str, Any]]:
+    urdf_path = Path(__file__).resolve().parents[1] / "assets" / "urdf" / "flexiv_Rizon4_kinematics.urdf"
+    limits = parse_urdf_joint_limits(urdf_path)
+    if limits:
+        return limits
+    return [
+        {"name": "joint1", "lower": -2.7925, "upper": 2.7925, "hardLower": -2.8798, "hardUpper": 2.8798},
+        {"name": "joint2", "lower": -2.2689, "upper": 2.2689, "hardLower": -2.3562, "hardUpper": 2.3562},
+        {"name": "joint3", "lower": -2.9671, "upper": 2.9671, "hardLower": -3.0543, "hardUpper": 3.0543},
+        {"name": "joint4", "lower": -1.8675, "upper": 2.6878, "hardLower": -1.9548, "hardUpper": 2.7751},
+        {"name": "joint5", "lower": -2.9671, "upper": 2.9671, "hardLower": -3.0543, "hardUpper": 3.0543},
+        {"name": "joint6", "lower": -1.3963, "upper": 4.5379, "hardLower": -1.4835, "hardUpper": 4.6251},
+        {"name": "joint7", "lower": -2.9671, "upper": 2.9671, "hardLower": -3.0543, "hardUpper": 3.0543},
+    ]
+
+
+def parse_urdf_joint_limits(urdf_path: Path) -> list[dict[str, Any]]:
+    try:
+        root = ET.fromstring(urdf_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    limits: list[dict[str, Any]] = []
+    for joint in root.findall("joint"):
+        if str(joint.attrib.get("type") or "") == "fixed":
+            continue
+        limit = joint.find("limit")
+        if limit is None:
+            continue
+        hard_lower = safe_float(limit.attrib.get("lower"))
+        hard_upper = safe_float(limit.attrib.get("upper"))
+        if hard_lower is None or hard_upper is None:
+            continue
+        safety = joint.find("safety_controller")
+        soft_lower = safe_float(safety.attrib.get("soft_lower_limit")) if safety is not None else None
+        soft_upper = safe_float(safety.attrib.get("soft_upper_limit")) if safety is not None else None
+        lower = soft_lower if soft_lower is not None else hard_lower
+        upper = soft_upper if soft_upper is not None else hard_upper
+        limits.append(
+            {
+                "name": str(joint.attrib.get("name") or f"joint{len(limits) + 1}"),
+                "lower": float(lower),
+                "upper": float(upper),
+                "hardLower": float(hard_lower),
+                "hardUpper": float(hard_upper),
+            }
+        )
+    return limits
+
+
+def joint_limit_guard_state(
+    joint_pose: list[float] | None,
+    joint_limits: list[dict[str, Any]],
+    buffer_rad: float,
+    enabled: bool,
+) -> dict[str, Any]:
+    if not enabled:
+        return {"enabled": False, "ok": True, "reason": "disabled"}
+    buffer = max(0.0, float(buffer_rad))
+    if not isinstance(joint_pose, list) or len(joint_pose) < len(joint_limits):
+        return {
+            "enabled": True,
+            "ok": False,
+            "reason": "missing_joint_pose",
+            "bufferRad": buffer,
+            "jointCount": len(joint_pose) if isinstance(joint_pose, list) else 0,
+            "limitCount": len(joint_limits),
+        }
+    rows = []
+    violations = []
+    min_margin = math.inf
+    for index, limit in enumerate(joint_limits):
+        value = float(joint_pose[index])
+        if not math.isfinite(value):
+            return {
+                "enabled": True,
+                "ok": False,
+                "reason": "invalid_joint_pose",
+                "bufferRad": buffer,
+                "jointIndex": index,
+                "jointName": limit.get("name") or f"joint{index + 1}",
+                "value": value,
+            }
+        lower = float(limit["lower"])
+        upper = float(limit["upper"])
+        safe_lower = lower + buffer
+        safe_upper = upper - buffer
+        if safe_lower > safe_upper:
+            return {
+                "enabled": True,
+                "ok": False,
+                "reason": "invalid_joint_limit_buffer",
+                "bufferRad": buffer,
+                "jointIndex": index,
+                "jointName": limit.get("name") or f"joint{index + 1}",
+                "lower": lower,
+                "upper": upper,
+                "safeLower": safe_lower,
+                "safeUpper": safe_upper,
+            }
+        lower_margin = value - safe_lower
+        upper_margin = safe_upper - value
+        margin = min(lower_margin, upper_margin)
+        min_margin = min(min_margin, margin)
+        row = {
+            "index": index,
+            "name": limit.get("name") or f"joint{index + 1}",
+            "value": value,
+            "lower": lower,
+            "upper": upper,
+            "hardLower": limit.get("hardLower"),
+            "hardUpper": limit.get("hardUpper"),
+            "safeLower": safe_lower,
+            "safeUpper": safe_upper,
+            "marginRad": float(margin),
+        }
+        if value < safe_lower or value > safe_upper:
+            row["violation"] = "lower" if value < safe_lower else "upper"
+            violations.append(row)
+        rows.append(row)
+    return {
+        "enabled": True,
+        "ok": not violations,
+        "reason": "ok" if not violations else "joint_limit_buffer",
+        "bufferRad": buffer,
+        "minMarginRad": float(min_margin) if math.isfinite(min_margin) else None,
+        "joints": rows,
+        "violations": violations,
+    }
+
+
 def save_rgb_jpeg(rgb: np.ndarray, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(encode_rgb_jpeg(rgb, quality=92))
@@ -3164,6 +3408,8 @@ def config_to_json(config: FlexivRealSenseConfig) -> dict[str, Any]:
         "controllerMaxStepM": config.controller_max_step_m,
         "controllerMaxRotationDeg": config.controller_max_rotation_deg,
         "controllerMaxRotationStepDeg": config.controller_max_rotation_step_deg,
+        "controllerJointLimitBufferRad": config.controller_joint_limit_buffer_rad,
+        "controllerJointLimitGuardEnabled": config.controller_joint_limit_guard_enabled,
         "gripperEnabled": config.gripper_enabled,
         "gripperDevice": config.gripper_device,
         "gripperOpenWidthM": config.gripper_open_width_m,

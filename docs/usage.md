@@ -34,7 +34,9 @@ Useful receiver options:
 
 Robot motion is gated by the right hand side/grip trigger. Moving the right
 controller without holding that trigger records controller poses but does not
-command the robot.
+command the robot. Controller TCP commands also pass through a joint-limit guard:
+by default the PC stops sending teleop commands when any Flexiv joint enters the
+configured buffer around the URDF soft joint limits.
 
 ## Live Viewer
 
@@ -136,5 +138,6 @@ third-camera video when those artifacts exist in the record.
 - No Quest data in live view: check the Quest app is running and sending UDP to the PC receiver host/port.
 - A/B buttons do not start recording: confirm Touch controllers are active; hand tracking alone does not fire these hotkeys.
 - Robot connected but does not move: hold the right side/grip trigger during the active recording/session.
+- Robot motion skips with `joint_limit_buffer`: move the arm away from the reported joint limit or reduce the teleop target direction; the guard is intentionally stopping TCP commands before Flexiv reaches its own limit stop.
 - Hand-eye fails with too few detections: move the end camera so the checkerboard is visible in at least the required number of selected samples.
 - Calibration is slow: lower the max diverse frame/sample limits, or disable automatic calibration and run the script manually.

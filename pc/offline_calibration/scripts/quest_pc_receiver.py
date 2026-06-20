@@ -46,6 +46,8 @@ from flexiv_realsense_bridge import (
     DEFAULT_HAND_EYE_DIVERSE_TRANSLATION_SCALE_M,
     DEFAULT_HAND_EYE_MAX_DIVERSE_SAMPLES,
     DEFAULT_HAND_EYE_MIN_DIVERSE_SAMPLES,
+    DEFAULT_CONTROLLER_JOINT_LIMIT_BUFFER_RAD,
+    DEFAULT_CONTROLLER_MAX_STEP_M,
     DEFAULT_CONTROLLER_MAX_ROTATION_DEG,
     DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG,
     FlexivRealSenseConfig,
@@ -379,8 +381,8 @@ def main() -> int:
     receive_parser.add_argument(
         "--controller-motion-max-step",
         type=float,
-        default=0.015,
-        help="Maximum TCP target position change per received sample, in meters. Default: 0.015",
+        default=DEFAULT_CONTROLLER_MAX_STEP_M,
+        help=f"Maximum TCP target position change per received sample, in meters. Default: {DEFAULT_CONTROLLER_MAX_STEP_M:g}",
     )
     receive_parser.add_argument(
         "--controller-motion-max-rotation",
@@ -396,6 +398,20 @@ def main() -> int:
             "Maximum TCP target rotation change per received sample, in degrees. "
             f"Default: {DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG}"
         ),
+    )
+    receive_parser.add_argument(
+        "--controller-joint-limit-buffer",
+        type=float,
+        default=DEFAULT_CONTROLLER_JOINT_LIMIT_BUFFER_RAD,
+        help=(
+            "Stop controller TCP commands when any robot joint is within this many radians of the URDF soft limit. "
+            f"Default: {DEFAULT_CONTROLLER_JOINT_LIMIT_BUFFER_RAD:g}"
+        ),
+    )
+    receive_parser.add_argument(
+        "--disable-controller-joint-limit-guard",
+        action="store_true",
+        help="Disable the controller teleop joint-limit buffer guard.",
     )
     receive_parser.add_argument(
         "--enable-gripper",
@@ -2073,6 +2089,8 @@ def receive(args: argparse.Namespace) -> int:
                 controller_max_step_m=args.controller_motion_max_step,
                 controller_max_rotation_deg=args.controller_motion_max_rotation,
                 controller_max_rotation_step_deg=args.controller_motion_max_rotation_step,
+                controller_joint_limit_buffer_rad=args.controller_joint_limit_buffer,
+                controller_joint_limit_guard_enabled=not args.disable_controller_joint_limit_guard,
                 gripper_enabled=args.enable_gripper,
                 gripper_device=args.gripper_device,
                 gripper_open_width_m=args.gripper_open_width,
@@ -5705,6 +5723,17 @@ label {
         </label>
       </div>
       <div class="robot-grid">
+        <label>Joint buffer rad
+          <input id="robotJointLimitBuffer" type="number" min="0" step="0.01">
+        </label>
+        <label>Joint guard
+          <select id="robotJointLimitGuard">
+            <option value="true">on</option>
+            <option value="false">off</option>
+          </select>
+        </label>
+      </div>
+      <div class="robot-grid">
         <label>Gripper
           <select id="robotGripperEnabled">
             <option value="false">off</option>
@@ -5813,6 +5842,8 @@ const robotMaxOffset = document.getElementById('robotMaxOffset');
 const robotMaxStep = document.getElementById('robotMaxStep');
 const robotMaxRotation = document.getElementById('robotMaxRotation');
 const robotMaxRotationStep = document.getElementById('robotMaxRotationStep');
+const robotJointLimitBuffer = document.getElementById('robotJointLimitBuffer');
+const robotJointLimitGuard = document.getElementById('robotJointLimitGuard');
 const robotGripperEnabled = document.getElementById('robotGripperEnabled');
 const robotGripperDevice = document.getElementById('robotGripperDevice');
 const robotGripperOpen = document.getElementById('robotGripperOpen');
@@ -6247,9 +6278,11 @@ function robotPayloadFromControls() {
     runHandEye: robotHandEye.value === 'true',
     controllerTranslationScale: Number(robotMotionScale.value || 1.0),
     controllerMaxOffsetM: Number(robotMaxOffset.value || 0.18),
-    controllerMaxStepM: Number(robotMaxStep.value || 0.015),
+    controllerMaxStepM: Number(robotMaxStep.value || 0.025),
     controllerMaxRotationDeg: Number(robotMaxRotation.value || 30.0),
     controllerMaxRotationStepDeg: Number(robotMaxRotationStep.value || 2.0),
+    controllerJointLimitBufferRad: Number(robotJointLimitBuffer.value || 0.08),
+    controllerJointLimitGuardEnabled: robotJointLimitGuard.value !== 'false',
     gripperEnabled: robotGripperEnabled.value === 'true',
     gripperDevice: robotGripperDevice.value.trim(),
     gripperOpenWidthM: Number(robotGripperOpen.value || 0.08),
@@ -6431,6 +6464,8 @@ function applyRobotStatus(payload) {
   if (Number.isFinite(config.controllerMaxStepM)) robotMaxStep.value = config.controllerMaxStepM;
   if (Number.isFinite(config.controllerMaxRotationDeg)) robotMaxRotation.value = config.controllerMaxRotationDeg;
   if (Number.isFinite(config.controllerMaxRotationStepDeg)) robotMaxRotationStep.value = config.controllerMaxRotationStepDeg;
+  if (Number.isFinite(config.controllerJointLimitBufferRad)) robotJointLimitBuffer.value = config.controllerJointLimitBufferRad;
+  if (typeof config.controllerJointLimitGuardEnabled === 'boolean') robotJointLimitGuard.value = config.controllerJointLimitGuardEnabled ? 'true' : 'false';
   if (typeof config.gripperEnabled === 'boolean') robotGripperEnabled.value = config.gripperEnabled ? 'true' : 'false';
   if (config.gripperDevice && !robotGripperDevice.value) robotGripperDevice.value = config.gripperDevice;
   if (Number.isFinite(config.gripperOpenWidthM)) robotGripperOpen.value = config.gripperOpenWidthM;
@@ -6456,6 +6491,7 @@ function renderRobotStatus(payload) {
     `robot: ${robot.connected ? 'connected' : 'not connected'} ${robot.robotSn || ''}`.trim(),
     `teleop: hold right middle-finger trigger${robot.motionArmed ? ' (motion mode active)' : ' (motion not armed)'}`,
     `controller motion: ${payload.config?.controllerMotionEnabled ? 'enabled' : 'disabled'}`,
+    `joint guard: ${robotJointGuardText(robot.state?.jointLimitGuard, payload.config)}`,
     `pose: ${robot.poseField || 'n/a'}`,
     `rdk iface: ${(payload.config?.networkInterfaces || []).join(', ') || 'default'}`,
     `camera: ${payload.config?.cameraSerial || 'n/a'}`,
@@ -6472,6 +6508,7 @@ function renderRobotStatus(payload) {
     lines.push(`hand-eye motion: ${poseDiversityText(state.robotSample.poseDiversity)}`);
     const rightInput = robotControllerInputText(state.robotSample.rightController);
     if (rightInput) lines.push(`right input: ${rightInput}`);
+    if (state.robotSample.jointLimitGuard) lines.push(`sample joint guard: ${robotJointGuardText(state.robotSample.jointLimitGuard, payload.config)}`);
   } else if (active.poseDiversity) {
     lines.push(`hand-eye motion: ${poseDiversityText(active.poseDiversity)}`);
   }
@@ -6480,6 +6517,7 @@ function renderRobotStatus(payload) {
     lines.push(`gripper counts: cmd ${active.gripperCommands ?? 0}, skip ${active.gripperSkips ?? 0}, err ${active.gripperErrors ?? 0}`);
     if (active.lastMotion) {
       lines.push(`last motion: ${robotMotionSummaryText(active.lastMotion)}`);
+      if (active.lastMotion.jointLimitGuard) lines.push(`motion joint guard: ${robotJointGuardText(active.lastMotion.jointLimitGuard, payload.config)}`);
     }
     if (active.lastGripper) {
       lines.push(`last gripper: ${robotGripperSummaryText(active.lastGripper)}`);
@@ -6494,6 +6532,9 @@ function renderRobotStatus(payload) {
       const step = Array.isArray(state.robotMotion.stepOffsetM) ? state.robotMotion.stepOffsetM.map(v => Number(v).toFixed(3)).join(', ') : 'n/a';
       const rotStep = Number.isFinite(state.robotMotion.stepRotationDeg) ? `, rot step ${Number(state.robotMotion.stepRotationDeg).toFixed(1)}deg` : '';
       lines.push(`motion anchor: ${state.robotMotion.anchored ? 'set' : 'waiting'}${state.robotMotion.createdAnchor ? ' (new)' : ''}, step ${step}${rotStep}`);
+    }
+    if (state.robotMotion.jointLimitGuard) {
+      lines.push(`motion joint guard: ${robotJointGuardText(state.robotMotion.jointLimitGuard, payload.config)}`);
     }
   }
   if (state.robotGripper) {
@@ -6532,6 +6573,26 @@ function robotMotionSummaryText(event) {
     return `sent offset ${offset}${step}${rotation}${rotationStep}${mappingText}${hold}`;
   }
   return `${event.reason || event.error || 'skipped'}${mappingText}${hold}`;
+}
+
+function robotJointGuardText(guard, config) {
+  const enabled = guard?.enabled ?? config?.controllerJointLimitGuardEnabled;
+  if (enabled === false) return 'off';
+  if (!guard) {
+    const buffer = Number(config?.controllerJointLimitBufferRad);
+    return Number.isFinite(buffer) ? `on buffer ${buffer.toFixed(2)}rad` : 'on';
+  }
+  const buffer = Number(guard.bufferRad);
+  const margin = Number(guard.minMarginRad);
+  const suffix = [
+    Number.isFinite(buffer) ? `buffer ${buffer.toFixed(2)}rad` : '',
+    Number.isFinite(margin) ? `margin ${margin.toFixed(2)}rad` : ''
+  ].filter(Boolean).join(', ');
+  if (guard.ok) return `ok${suffix ? ` (${suffix})` : ''}`;
+  const violations = Array.isArray(guard.violations)
+    ? guard.violations.map(row => `${row.name || `j${Number(row.index) + 1}`}:${row.violation || 'limit'}`).join(', ')
+    : '';
+  return `${guard.reason || 'limit'}${violations ? ` ${violations}` : ''}${suffix ? ` (${suffix})` : ''}`;
 }
 
 function robotTeleopHoldText(event) {
@@ -7449,7 +7510,7 @@ preflightRefresh.addEventListener('click', loadPreflightStatus);
 questAdbRefresh.addEventListener('click', loadQuestAdbStatus);
 questCalibStart.addEventListener('click', () => sendQuestCalibrationCommand('calib_start'));
 questCalibStop.addEventListener('click', () => sendQuestCalibrationCommand('calib_stop'));
-for (const input of [robotCamera, robotThirdCamera, robotSn, robotPoseField, robotNetworkInterfaces, robotInterval, robotHandEye, robotExposureMode, robotExposure, robotGain, robotBoardWarmup, robotMotionScale, robotMaxOffset, robotMaxStep, robotMaxRotation, robotMaxRotationStep]) {
+for (const input of [robotCamera, robotThirdCamera, robotSn, robotPoseField, robotNetworkInterfaces, robotInterval, robotHandEye, robotExposureMode, robotExposure, robotGain, robotBoardWarmup, robotMotionScale, robotMaxOffset, robotMaxStep, robotMaxRotation, robotMaxRotationStep, robotJointLimitBuffer, robotJointLimitGuard]) {
   input.addEventListener('change', configureRobot);
 }
 document.getElementById('records').addEventListener('click', () => {
