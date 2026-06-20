@@ -22,6 +22,16 @@ try:
 except Exception:
     pass
 
+from quest_coordinate_frames import (
+    PC_WORLD_FRAME,
+    UNITY_WORLD_FRAME,
+    WORLD_FRAME_CONVERSION,
+    ensure_pc_transform_payload,
+    matrix_from_transform_payload,
+    unity_quaternion_wxyz_to_pc,
+    unity_vec3_to_pc,
+)
+
 
 DEFAULT_PATTERN_COLS = 11
 DEFAULT_PATTERN_ROWS = 8
@@ -954,27 +964,32 @@ class RobotRealsenseSession:
                 t_base_end_camera_payload = transform_to_json(t_base_end_camera)
             if self.t_base_world is not None:
                 t_world_tool_tcp = invert_transform(self.t_base_world) @ t_base_tool_tcp
-                t_world_tool_tcp_payload = transform_to_json(t_world_tool_tcp)
-                t_display_tool_tcp_payload = transform_to_json(t_world_tool_tcp)
+                t_world_tool_tcp_payload = transform_to_json(t_world_tool_tcp, PC_WORLD_FRAME)
+                t_display_tool_tcp_payload = transform_to_json(t_world_tool_tcp, PC_WORLD_FRAME)
                 if t_base_end_camera_payload is not None:
                     t_base_end_camera_matrix = transform_from_json(t_base_end_camera_payload)
                     if t_base_end_camera_matrix is not None:
                         t_world_end_camera = invert_transform(self.t_base_world) @ t_base_end_camera_matrix
-                        t_world_end_camera_payload = transform_to_json(t_world_end_camera)
-                        t_display_end_camera_payload = transform_to_json(t_world_end_camera)
+                        t_world_end_camera_payload = transform_to_json(t_world_end_camera, PC_WORLD_FRAME)
+                        t_display_end_camera_payload = transform_to_json(t_world_end_camera, PC_WORLD_FRAME)
         joint_pose = robot_state.get("jointPose")
+        quest_gaze3d_pc_world = unity_vec3_to_pc(quest_sample.get("gazePoint3DWorld"))
+        right_controller_pc = controller_payload_to_pc_world(quest_sample.get("rightController"))
         return {
             "sample_index": sample_index,
             "record_id": self.record_id,
             "captured_at": datetime.now(timezone.utc).isoformat(),
             "ok": True,
+            "coordinate_frame": PC_WORLD_FRAME,
             "pose_source": f"flexiv:{self.config.robot_pose_field}:{self.config.robot_sn}",
             "quest_sample_index": quest_sample.get("sampleIndex"),
             "quest_recording_timestamp_seconds": quest_sample.get("recordingTimestampSeconds"),
             "quest_pc_receive_perf_counter_seconds": quest_sample.get("pcReceivePerfCounterSeconds"),
             "quest_gaze3d_world": quest_sample.get("gazePoint3DWorld"),
+            "quest_gaze3d_pc_world": quest_gaze3d_pc_world,
             "quest_gaze3d_source": quest_sample.get("gazePoint3DSource") or quest_sample.get("gazeSource"),
-            "right_controller": visualizer_controller_payload(quest_sample.get("rightController")),
+            "right_controller": visualizer_controller_payload(right_controller_pc),
+            "right_controller_unity": visualizer_controller_payload(quest_sample.get("rightController")),
             "robot_state": robot_state,
             "T_base_ee": robot_state.get("endEffectorPose"),
             "T_base_tool_tcp": transform_to_json(t_base_tool_tcp) if t_base_tool_tcp is not None else None,
@@ -1070,9 +1085,10 @@ class RobotRealsenseSession:
         self._publish(robot_gripper_event(event))
 
     def _update_controller_motion_unlocked(self, quest_sample: dict[str, Any]) -> dict[str, Any]:
-        controller = quest_sample.get("rightController")
-        input_summary = controller_input_summary(controller)
-        if not isinstance(controller, dict) or not controller.get("hasPose"):
+        raw_controller = quest_sample.get("rightController")
+        input_summary = controller_input_summary(raw_controller)
+        controller = controller_payload_to_pc_world(raw_controller)
+        if not isinstance(raw_controller, dict) or not raw_controller.get("hasPose"):
             self.reset_controller_motion_anchor()
             return {
                 "ok": False,
@@ -1085,7 +1101,7 @@ class RobotRealsenseSession:
                 "teleopHeld": bool(input_summary.get("teleopHeld")),
                 "teleopHoldValue": input_summary.get("handTrigger"),
             }
-        side_pressed, side_value = right_controller_side_button_pressed(controller)
+        side_pressed, side_value = right_controller_side_button_pressed(raw_controller)
         if not side_pressed:
             self.reset_controller_motion_anchor()
             return {
@@ -1103,7 +1119,7 @@ class RobotRealsenseSession:
         if not self.robot.motion_armed:
             self.robot.arm_motion()
             self.reset_controller_motion_anchor()
-        position = vec3_array(controller.get("position"))
+        position = vec3_array(controller.get("position") if isinstance(controller, dict) else None)
         if position is None:
             self.reset_controller_motion_anchor()
             return {
@@ -1117,7 +1133,7 @@ class RobotRealsenseSession:
                 "teleopHeld": True,
                 "teleopHoldValue": side_value,
             }
-        rotation_world = quat_rotation_matrix(controller.get("rotation"))
+        rotation_world = quat_rotation_matrix(controller.get("rotation") if isinstance(controller, dict) else None)
         if rotation_world is None:
             self.reset_controller_motion_anchor()
             return {
@@ -1198,6 +1214,7 @@ class RobotRealsenseSession:
                 "teleop_hold_value": side_value,
                 "right_controller_input": input_summary,
                 "controller_position_world": [float(v) for v in position],
+                "controller_world_frame": PC_WORLD_FRAME,
                 "controller_rotation_world_wxyz": matrix_to_quaternion_wxyz(rotation_world),
                 "anchored": False,
                 "created_anchor": created_anchor,
@@ -1235,6 +1252,7 @@ class RobotRealsenseSession:
             "teleop_hold_value": side_value,
             "right_controller_input": input_summary,
             "controller_position_world": [float(v) for v in position],
+            "controller_world_frame": PC_WORLD_FRAME,
             "controller_rotation_world_wxyz": matrix_to_quaternion_wxyz(rotation_world),
             "controller_anchor_world": [float(v) for v in self.controller_anchor_world],
             "controller_anchor_rotation_world_wxyz": matrix_to_quaternion_wxyz(self.controller_anchor_rotation_world),
@@ -2603,7 +2621,9 @@ def build_quest_robot_alignment(
 ) -> dict[str, Any]:
     if not quest_calibration_event:
         return {"ok": False, "reason": "missing_quest_calibration"}
-    t_world_board = transform_from_json(quest_calibration_event.get("T_world_board"))
+    frame = quest_calibration_event.get("coordinateFrame") or quest_calibration_event.get("coordinate_frame")
+    t_world_board_payload = ensure_pc_transform_payload(quest_calibration_event.get("T_world_board"), frame)
+    t_world_board = matrix_from_transform_payload(t_world_board_payload)
     board_payload = robot_result.get("board") if isinstance(robot_result.get("board"), dict) else {}
     t_base_board = transform_from_json(board_payload.get("T_base_board"))
     if t_world_board is None or t_base_board is None:
@@ -2611,8 +2631,11 @@ def build_quest_robot_alignment(
     t_world_base = t_world_board @ invert_transform(t_base_board)
     return {
         "ok": True,
-        "T_world_base": transform_to_json(t_world_base),
-        "T_base_world": transform_to_json(invert_transform(t_world_base)),
+        "coordinateFrame": PC_WORLD_FRAME,
+        "sourceQuestFrame": frame or UNITY_WORLD_FRAME,
+        "worldFrameConversion": WORLD_FRAME_CONVERSION,
+        "T_world_base": transform_to_json(t_world_base, PC_WORLD_FRAME),
+        "T_base_world": transform_to_json(invert_transform(t_world_base), PC_WORLD_FRAME),
     }
 
 
@@ -2633,6 +2656,7 @@ def robot_sample_event(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "robot_sample",
         "ok": bool(row.get("ok")),
+        "coordinateFrame": PC_WORLD_FRAME,
         "recordId": row.get("record_id"),
         "sampleIndex": row.get("sample_index"),
         "questSampleIndex": row.get("quest_sample_index"),
@@ -2647,7 +2671,8 @@ def robot_sample_event(row: dict[str, Any]) -> dict[str, Any]:
         "images": row.get("images"),
         "videos": row.get("videos"),
         "videoFrames": row.get("videoFrames"),
-        "questGaze3DWorld": row.get("quest_gaze3d_world"),
+        "questGaze3DWorld": row.get("quest_gaze3d_pc_world") or row.get("quest_gaze3d_world"),
+        "questGaze3DUnityWorld": row.get("quest_gaze3d_world"),
         "questGaze3DSource": row.get("quest_gaze3d_source"),
         "rightController": row.get("right_controller"),
         "gripper": row.get("gripper"),
@@ -2849,6 +2874,27 @@ def visualizer_controller_payload(controller: Any) -> dict[str, Any]:
     }
 
 
+def controller_payload_to_pc_world(controller: Any) -> dict[str, Any] | None:
+    if not isinstance(controller, dict):
+        return None
+    result = dict(controller)
+    position = unity_vec3_to_pc(controller.get("position"))
+    rotation = unity_quaternion_wxyz_to_pc(controller.get("rotation"))
+    pose = controller.get("pose")
+    if isinstance(pose, list) and len(pose) >= 7:
+        pose_position = unity_vec3_to_pc(pose[:3])
+        pose_rotation = unity_quaternion_wxyz_to_pc(pose[3:7])
+        if pose_position is not None and pose_rotation is not None:
+            result["pose"] = [*pose_position, *pose_rotation]
+    if position is not None:
+        result["position"] = position
+    if rotation is not None:
+        result["rotation"] = rotation
+    result["coordinateFrame"] = PC_WORLD_FRAME
+    result["sourceCoordinateFrame"] = controller.get("coordinateFrame") or UNITY_WORLD_FRAME
+    return result
+
+
 def flexiv_pose_to_transform(pose: np.ndarray) -> np.ndarray:
     x, y, z, qw, qx, qy, qz = [float(v) for v in pose]
     rotation = quaternion_wxyz_to_matrix([qw, qx, qy, qz])
@@ -2905,12 +2951,18 @@ def invert_transform(matrix: np.ndarray) -> np.ndarray:
     return result
 
 
-def transform_to_json(matrix: np.ndarray) -> dict[str, Any]:
-    return {
+def transform_to_json(matrix: np.ndarray, coordinate_frame: str | None = None) -> dict[str, Any]:
+    quat = matrix_to_quaternion_wxyz(matrix)
+    payload = {
         "matrix_4x4": [[float(value) for value in row] for row in matrix[:4, :4]],
         "translation_m": [float(value) for value in matrix[:3, 3]],
-        "quaternion_wxyz": matrix_to_quaternion_wxyz(matrix),
+        "quaternion_wxyz": quat,
+        "quaternion_xyzw": [quat[1], quat[2], quat[3], quat[0]],
+        "rotation_matrix": [[float(value) for value in row] for row in matrix[:3, :3]],
     }
+    if coordinate_frame:
+        payload["coordinateFrame"] = coordinate_frame
+    return payload
 
 
 def transform_from_json(payload: Any) -> np.ndarray | None:

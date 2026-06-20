@@ -38,6 +38,11 @@ command the robot. Controller TCP commands also pass through a joint-limit guard
 by default the PC stops sending teleop commands when any Flexiv joint enters the
 configured buffer around the URDF soft joint limits.
 
+Before a robot hand-eye calibration is available, controller teleoperation uses
+the converted PC frame and maps Quest/PC `y` up to the robot base `z` up. After
+hand-eye succeeds, controller offsets are mapped through the calibrated
+Quest-world-to-robot-base transform.
+
 ## Live Viewer
 
 The live page shows Quest head pose, left/right controllers, gaze point, robot
@@ -50,9 +55,12 @@ Before recording:
 3. Confirm both camera streams are available if they are needed for the run.
 4. Confirm the preflight panel has no blocking failures.
 
-The 3D view can be dragged to orbit and scrolled to zoom. The display frame keeps
-Quest world rotation and translates the calibrated checkerboard near the origin
-after a calibration result is available.
+The 3D view can be dragged to orbit and scrolled to zoom. Unity/Quest telemetry
+arrives in raw Unity world coordinates (`x` right, `y` up, `z` forward). The PC
+viewer, replay, and robot bridge display a derived right-handed frame with
+`pc = [unity.x, unity.y, -unity.z]`; raw Unity samples are still stored for audit.
+After calibration, the display translates the checkerboard near the origin while
+keeping the converted world axes.
 
 ## Calibration Recording
 

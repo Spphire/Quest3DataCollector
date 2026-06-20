@@ -264,13 +264,15 @@ This unifies Quest world, checkerboard, and robot base in the live/replay visual
 ### Implementation notes
 
 - `flexiv_realsense_bridge.py` is intentionally PC-only; Unity does not need to know about Flexiv or RealSense.
+- Unity sends raw Unity world telemetry (`unity_world_lh_y_up_z_forward`). PC code keeps those raw samples for traceability and derives a canonical display/robot frame (`pc_world_rh_y_up_z_back`) with `pc = [unity.x, unity.y, -unity.z]`. Apply that conversion only at PC boundaries: live visualization, replay payloads, robot alignment, and controller teleoperation.
+- Calibration fitting stays in the raw Unity trajectory frame so the video reprojection model remains unchanged. Exported Quest calibration snapshots include PC-frame `T_world_board`/`T_board_world` plus raw `T_unity_world_board`/`T_board_unity_world` for diagnostics. Legacy snapshots without frame metadata are treated as raw Unity and converted when loaded.
 - The bridge uses `flexivrdk.Robot(sn).states()` and records the configured `flange_pose` or `tcp_pose` as `[x, y, z, qw, qx, qy, qz]`.
-- Right-controller motion uses Flexiv RDK v1.7 non-real-time Cartesian motion-force mode with all force-control axes disabled. It holds TCP orientation and commands only bounded position offsets from the arm-time anchor.
+- Right-controller motion uses Flexiv RDK v1.7 non-real-time Cartesian motion-force mode with all force-control axes disabled. It reads the controller in the canonical PC frame, maps PC `y` up to robot `z` up before hand-eye exists, and maps through `T_base_world` after hand-eye succeeds.
 - RealSense intrinsics come from `pyrealsense2` color stream metadata.
 - The board is fixed at 11x8 inner corners, 25 mm square size.
 - Hand-eye calibration solves `T_ee_realsense` and `T_base_board` from repeated end-camera observations of the fixed board.
 - A red marker near one of the four corner squares is treated as an optional global orientation hint to resolve the 180-degree checkerboard ambiguity. If no red anchor is present in a frame, the solver may still use the frame by trying the identity and 180-degree corner orderings. A single reliable red-anchored frame can orient the whole record.
-- Replay keeps Quest axes and translates the view near the board origin; robot EE samples are drawn as white points with local RGB axes.
+- Replay uses the canonical PC frame and translates the view near the board origin; robot EE samples are drawn as white points with local RGB axes.
 - A Flexiv Rizon4 URDF asset is stored at `pc/offline_calibration/assets/urdf/flexiv_Rizon4_kinematics.urdf` and served by the live viewer at `/robot/urdf`. The live and replay viewers parse the URDF joint chain, draw the robot as a line skeleton from recorded `jointpose`, and report the URDF FK-vs-`flange_pose` translation error when a robot sample is available.
 
 ### 2026-06-18 smoke result

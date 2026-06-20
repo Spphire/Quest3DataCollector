@@ -16,6 +16,13 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation, Slerp
 
+from quest_coordinate_frames import (
+    PC_WORLD_FRAME,
+    UNITY_WORLD_FRAME,
+    WORLD_FRAME_CONVERSION,
+    unity_transform_matrix_to_pc,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RAW = ROOT / "raw"
@@ -393,13 +400,17 @@ def main() -> int:
         raise SystemExit(f"Calibration failed: {diagnostics.get('reason')}")
     result["description"] = (
         "Per-record calibration from recorded passthrough videos and recorded passthrough camera poses. "
-        "Each recording may have its own Unity world origin, so each record gets its own T_world_board."
+        "The fit runs in the raw Unity trajectory frame, then T_world_board is exported in the PC "
+        "right-handed world frame; T_unity_world_board preserves the raw Unity result."
     )
     result["records"] = records
     result["pattern"] = [args.pattern_cols, args.pattern_rows]
     result["square_size_m"] = args.square_size
     result["detection_summary"] = detection_summary
     result["red_anchor_global"] = red_anchor_global
+    result["coordinate_frame"] = PC_WORLD_FRAME
+    result["raw_trajectory_frame"] = UNITY_WORLD_FRAME
+    result["world_frame_conversion"] = WORLD_FRAME_CONVERSION
 
     emit_progress("writing", 0.95, records=records)
     stale_failure_path = output_root / "calibration_failure_25mm.json"
@@ -1678,11 +1689,24 @@ def _fit_per_record_fixed_y_axis(records: list[str], raw_root: Path, detections_
     per_record = {}
     for record in records:
         pose = parsed["records"][record]
-        twb, tbw = pose_to_matrices(pose["board_rvec"], pose["board_t"])
+        t_unity_world_board = pose_to_matrix(pose["board_rvec"], pose["board_t"])
+        t_board_unity_world = np.linalg.inv(t_unity_world_board)
+        t_world_board = unity_transform_matrix_to_pc(t_unity_world_board)
+        t_board_world = np.linalg.inv(t_world_board)
+        twb = transform_doc(t_world_board, PC_WORLD_FRAME)
+        tbw = transform_doc(t_board_world, PC_WORLD_FRAME)
+        twb_unity = transform_doc(t_unity_world_board, UNITY_WORLD_FRAME)
+        tbw_unity = transform_doc(t_board_unity_world, UNITY_WORLD_FRAME)
         per_record[record] = {
+            "coordinate_frame": PC_WORLD_FRAME,
+            "raw_trajectory_frame": UNITY_WORLD_FRAME,
+            "world_frame_conversion": WORLD_FRAME_CONVERSION,
             "T_world_board": twb,
             "T_board_world": tbw,
             "quest_world_origin_in_board_m": tbw["translation_m"],
+            "T_unity_world_board": twb_unity,
+            "T_board_unity_world": tbw_unity,
+            "unity_quest_world_origin_in_board_m": tbw_unity["translation_m"],
         }
 
     final_order_summary.update(
@@ -1694,6 +1718,9 @@ def _fit_per_record_fixed_y_axis(records: list[str], raw_root: Path, detections_
     )
     return {
         "model": args.model,
+        "coordinate_frame": PC_WORLD_FRAME,
+        "raw_trajectory_frame": UNITY_WORLD_FRAME,
+        "world_frame_conversion": WORLD_FRAME_CONVERSION,
         "image_y_axis": getattr(args, "image_y_axis", "down"),
         "image_y_projection": (
             "pixel_y = -camera_y / camera_z for top-left/y-down video rows"
@@ -1925,23 +1952,33 @@ def compact_failure(failure: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def pose_to_matrices(rvec: np.ndarray, t: np.ndarray) -> tuple[dict[str, Any], dict[str, Any]]:
+def pose_to_matrix(rvec: np.ndarray, t: np.ndarray) -> np.ndarray:
     rot = Rotation.from_rotvec(rvec)
     t_world_board = np.eye(4)
     t_world_board[:3, :3] = rot.as_matrix()
     t_world_board[:3, 3] = t
+    return t_world_board
+
+
+def pose_to_matrices(rvec: np.ndarray, t: np.ndarray) -> tuple[dict[str, Any], dict[str, Any]]:
+    t_world_board = pose_to_matrix(rvec, t)
     t_board_world = np.linalg.inv(t_world_board)
-    return transform_doc(t_world_board), transform_doc(t_board_world)
+    return transform_doc(t_world_board, UNITY_WORLD_FRAME), transform_doc(t_board_world, UNITY_WORLD_FRAME)
 
 
-def transform_doc(mat: np.ndarray) -> dict[str, Any]:
+def transform_doc(mat: np.ndarray, coordinate_frame: str | None = None) -> dict[str, Any]:
     rotation = Rotation.from_matrix(mat[:3, :3])
-    return {
+    qx, qy, qz, qw = [float(value) for value in rotation.as_quat()]
+    payload = {
         "matrix_4x4": mat.tolist(),
         "translation_m": mat[:3, 3].tolist(),
-        "quaternion_xyzw": rotation.as_quat().tolist(),
+        "quaternion_xyzw": [qx, qy, qz, qw],
+        "quaternion_wxyz": [qw, qx, qy, qz],
         "rotation_matrix": mat[:3, :3].tolist(),
     }
+    if coordinate_frame:
+        payload["coordinateFrame"] = coordinate_frame
+    return payload
 
 
 def stats(values: np.ndarray) -> dict[str, float | None]:
@@ -2023,7 +2060,16 @@ def write_report(final: dict[str, Any], path: Path) -> None:
             )
         lines.append("")
     lines += [
+        "## Coordinate Frame",
+        "",
+        f"- Exported world frame: `{final.get('coordinate_frame') or PC_WORLD_FRAME}`",
+        f"- Raw trajectory frame: `{final.get('raw_trajectory_frame') or UNITY_WORLD_FRAME}`",
+        "- Conversion: `pc = [unity.x, unity.y, -unity.z]`",
+        "",
         "## Per-Record T_world_board",
+        "",
+        "`T_world_board` is in the exported PC right-handed world frame. "
+        "`T_unity_world_board` keeps the raw Unity fit for diagnostics.",
         "",
     ]
     for record, row in final["per_record_calibration"].items():
@@ -2043,6 +2089,9 @@ def compact_result(final: dict[str, Any]) -> dict[str, Any]:
         "records": final["records"],
         "square_size_m": final["square_size_m"],
         "model": final["model"],
+        "coordinate_frame": final.get("coordinate_frame"),
+        "raw_trajectory_frame": final.get("raw_trajectory_frame"),
+        "world_frame_conversion": final.get("world_frame_conversion"),
         "image_y_axis": final.get("image_y_axis"),
         "best_lag_seconds": final["best_lag_seconds"],
         "left_intrinsics_fxfycxcy": final["left_intrinsics_fxfycxcy"],

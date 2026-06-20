@@ -5,6 +5,20 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
+from quest_coordinate_frames import (
+    PC_WORLD_FRAME,
+    UNITY_WORLD_FRAME,
+    WORLD_FRAME_CONVERSION,
+    ensure_pc_transform_payload,
+    matrix_from_transform_payload,
+    transform_payload_from_matrix,
+    unity_quaternion_wxyz_to_pc,
+    unity_pose_array_to_pc,
+    unity_vec3_to_pc,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -59,14 +73,19 @@ def average_quat(a: list[float] | None, b: list[float] | None) -> list[float] | 
 
 
 def pose_from_list(value: Any) -> dict[str, Any]:
-    position = vec3(value[:3]) if isinstance(value, list) and len(value) >= 3 else None
-    rotation = quat(value[3:7]) if isinstance(value, list) and len(value) >= 7 else None
+    converted = unity_pose_array_to_pc(value)
+    position = vec3(converted[:3]) if isinstance(converted, list) and len(converted) >= 3 else None
+    rotation = quat(converted[3:7]) if isinstance(converted, list) and len(converted) >= 7 else None
     return {
         "ok": position is not None,
         "p": position,
         "q": rotation,
         "source": "recorded",
     }
+
+
+def controller_rotation(controller: dict[str, Any]) -> list[float] | None:
+    return quat(unity_quaternion_wxyz_to_pc(controller.get("rotation")))
 
 
 def subtract_origin(p: list[float] | None, origin: list[float]) -> list[float] | None:
@@ -98,7 +117,19 @@ def load_session(session_dir: Path) -> dict[str, Any]:
     if not isinstance(snapshot, dict) or not snapshot.get("T_world_board"):
         raise SystemExit(f"Missing calibration snapshot in {session_dir}")
 
-    board_matrix_world = snapshot["T_world_board"]["matrix_4x4"]
+    frame = snapshot.get("coordinateFrame") or snapshot.get("coordinate_frame")
+    t_world_board = ensure_pc_transform_payload(snapshot.get("T_world_board"), frame)
+    if t_world_board is None:
+        raise SystemExit(f"Calibration snapshot has no usable T_world_board in {session_dir}")
+    board_matrix_world = t_world_board["matrix_4x4"]
+    board_matrix = matrix_from_transform_payload(t_world_board)
+    if board_matrix is not None:
+        snapshot = dict(snapshot)
+        snapshot["coordinateFrame"] = PC_WORLD_FRAME
+        snapshot["rawTrajectoryFrame"] = snapshot.get("rawTrajectoryFrame") or UNITY_WORLD_FRAME
+        snapshot["worldFrameConversion"] = snapshot.get("worldFrameConversion") or WORLD_FRAME_CONVERSION
+        snapshot["T_world_board"] = t_world_board
+        snapshot["T_board_world"] = transform_payload_from_matrix(np.linalg.inv(board_matrix), PC_WORLD_FRAME)
     board_origin_world = [
         float(board_matrix_world[0][3]),
         float(board_matrix_world[1][3]),
@@ -130,9 +161,9 @@ def load_session(session_dir: Path) -> dict[str, Any]:
 
         left_controller = row.get("leftController") if isinstance(row.get("leftController"), dict) else {}
         right_controller = row.get("rightController") if isinstance(row.get("rightController"), dict) else {}
-        left_controller_p = vec3(left_controller.get("position"))
-        right_controller_p = vec3(right_controller.get("position"))
-        gaze = vec3(row.get("gazePoint3DWorld"))
+        left_controller_p = unity_vec3_to_pc(left_controller.get("position"))
+        right_controller_p = unity_vec3_to_pc(right_controller.get("position"))
+        gaze = unity_vec3_to_pc(row.get("gazePoint3DWorld"))
 
         display_samples.append(
             {
@@ -160,13 +191,13 @@ def load_session(session_dir: Path) -> dict[str, Any]:
                 },
                 "left": {
                     "p": subtract_origin(left_controller_p, board_origin_world),
-                    "q": quat(left_controller.get("rotation")),
+                    "q": controller_rotation(left_controller),
                     "ok": bool(left_controller.get("hasPose")) and left_controller_p is not None,
                     "source": left_controller.get("source") or "missing",
                 },
                 "right": {
                     "p": subtract_origin(right_controller_p, board_origin_world),
-                    "q": quat(right_controller.get("rotation")),
+                    "q": controller_rotation(right_controller),
                     "ok": bool(right_controller.get("hasPose")) and right_controller_p is not None,
                     "source": right_controller.get("source") or "missing",
                 },
@@ -182,7 +213,10 @@ def load_session(session_dir: Path) -> dict[str, Any]:
         "sessionDir": str(session_dir),
         "summary": summary,
         "snapshot": snapshot,
-        "coordinateMode": "quest_world_axes_translated_to_board_origin",
+        "coordinateMode": "pc_right_handed_world_axes_translated_to_board_origin",
+        "coordinateFrame": PC_WORLD_FRAME,
+        "rawTrajectoryFrame": UNITY_WORLD_FRAME,
+        "worldFrameConversion": WORLD_FRAME_CONVERSION,
         "boardOriginWorld": board_origin_world,
         "boardMatrix": board_matrix_display,
         "samples": display_samples,

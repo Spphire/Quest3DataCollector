@@ -66,6 +66,18 @@ from flexiv_realsense_diagnostics import (
     network_info,
 )
 from flexiv_realsense_diagnostics import probe_hosts, realsense_info, robot_connection_info
+from quest_coordinate_frames import (
+    PC_WORLD_FRAME,
+    UNITY_WORLD_FRAME,
+    WORLD_FRAME_CONVERSION,
+    ensure_pc_transform_payload,
+    is_pc_world_frame,
+    matrix_from_transform_payload,
+    transform_payload_from_matrix as coordinate_transform_payload_from_matrix,
+    unity_pose_array_to_pc,
+    unity_quaternion_wxyz_to_pc,
+    unity_vec3_to_pc,
+)
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
@@ -674,6 +686,9 @@ class SessionWriter:
             compact["robot"] = robot_compact
             compact["robotJointPose"] = robot_compact.get("jointpose")
             compact["robotJointPos"] = robot_compact.get("jointpos")
+        pc_world = pc_world_sample_payload(message)
+        if pc_world is not None:
+            compact["pcWorld"] = pc_world
         self.samples_file.write(json_line(compact))
         self._write_controller_csv_row(wrapper, message, "left")
         self._write_controller_csv_row(wrapper, message, "right")
@@ -704,6 +719,7 @@ class SessionWriter:
             "capturedAt": row.get("captured_at"),
             "ok": bool(row.get("ok")),
             "error": row.get("error"),
+            "coordinateFrame": row.get("coordinate_frame") or PC_WORLD_FRAME,
             "poseSource": row.get("pose_source"),
             "questSampleIndex": row.get("quest_sample_index"),
             "questRecordingTimestampSeconds": row.get("quest_recording_timestamp_seconds"),
@@ -3388,9 +3404,15 @@ def recording_snapshot_from_calibration_result(record_id: str, result: dict[str,
         "pattern": event.get("pattern"),
         "squareSizeM": event.get("squareSizeM"),
         "imageYAxis": event.get("imageYAxis"),
+        "coordinateFrame": event.get("coordinateFrame"),
+        "rawTrajectoryFrame": event.get("rawTrajectoryFrame"),
+        "worldFrameConversion": event.get("worldFrameConversion"),
         "T_world_board": event.get("T_world_board"),
         "T_board_world": event.get("T_board_world"),
+        "T_unity_world_board": event.get("T_unity_world_board"),
+        "T_board_unity_world": event.get("T_board_unity_world"),
         "questWorldOriginInBoardM": event.get("questWorldOriginInBoardM"),
+        "unityQuestWorldOriginInBoardM": event.get("unityQuestWorldOriginInBoardM"),
         "boardNormalWorld": event.get("boardNormalWorld"),
         "boardNormalAbsAngleToWorldYDeg": event.get("boardNormalAbsAngleToWorldYDeg"),
         "bestLagSeconds": event.get("bestLagSeconds"),
@@ -3399,6 +3421,34 @@ def recording_snapshot_from_calibration_result(record_id: str, result: dict[str,
         "medianReprojectionPx": event.get("medianReprojectionPx"),
         "p90ReprojectionPx": event.get("p90ReprojectionPx"),
     }
+
+
+def canonicalize_calibration_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        return {}
+    result = dict(snapshot)
+    frame = result.get("coordinateFrame") or result.get("coordinate_frame")
+    legacy_unity = not is_pc_world_frame(frame)
+    if legacy_unity:
+        result.setdefault("T_unity_world_board", result.get("T_world_board"))
+        result.setdefault("T_board_unity_world", result.get("T_board_world"))
+    t_world_board = ensure_pc_transform_payload(result.get("T_world_board"), frame)
+    if t_world_board is not None:
+        result["T_world_board"] = t_world_board
+        matrix = matrix_from_transform_payload(t_world_board)
+        if matrix is not None:
+            result["T_board_world"] = coordinate_transform_payload_from_matrix(np.linalg.inv(matrix), PC_WORLD_FRAME)
+    else:
+        t_board_world = ensure_pc_transform_payload(result.get("T_board_world"), frame)
+        if t_board_world is not None:
+            result["T_board_world"] = t_board_world
+            matrix = matrix_from_transform_payload(t_board_world)
+            if matrix is not None:
+                result["T_world_board"] = coordinate_transform_payload_from_matrix(np.linalg.inv(matrix), PC_WORLD_FRAME)
+    result["coordinateFrame"] = PC_WORLD_FRAME
+    result.setdefault("rawTrajectoryFrame", UNITY_WORLD_FRAME)
+    result.setdefault("worldFrameConversion", WORLD_FRAME_CONVERSION)
+    return result
 
 
 def replay_session_dir_for_record(
@@ -3452,7 +3502,7 @@ def build_recording_replay_payload(
     summary = replay_summary(session_dir, resolved_source)
     if not isinstance(summary, dict) or not summary:
         raise FileNotFoundError(f"recording summary not found for {safe_id}")
-    snapshot = replay_snapshot(session_dir, summary, resolved_source, calibration_output_root)
+    snapshot = canonicalize_calibration_snapshot(replay_snapshot(session_dir, summary, resolved_source, calibration_output_root))
     calibration_failure = replay_calibration_failure(session_dir, summary, resolved_source, calibration_output_root)
 
     board_matrix_world = matrix_from_snapshot(snapshot)
@@ -3485,7 +3535,10 @@ def build_recording_replay_payload(
         "summary": summary if isinstance(summary, dict) else {},
         "snapshot": snapshot,
         "calibrationFailure": calibration_failure,
-        "coordinateMode": "quest_world_axes_translated_to_board_origin",
+        "coordinateMode": "pc_right_handed_world_axes_translated_to_board_origin",
+        "coordinateFrame": PC_WORLD_FRAME,
+        "rawTrajectoryFrame": snapshot.get("rawTrajectoryFrame") or UNITY_WORLD_FRAME,
+        "worldFrameConversion": snapshot.get("worldFrameConversion") or WORLD_FRAME_CONVERSION,
         "boardOriginWorld": board_origin_world,
         "boardMatrix": board_matrix_display,
         "gazeDepthDiagnostics": gaze_diagnostics.get("summary", {}),
@@ -3753,7 +3806,8 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
                     "images": robot_image_artifacts(robot_dir, images),
                     "videos": robot_video_artifacts(robot_dir, videos),
                     "videoFrames": row.get("videoFrames"),
-                    "questGaze3DWorld": row.get("quest_gaze3d_world"),
+                    "questGaze3DWorld": row.get("quest_gaze3d_pc_world") or pc_world_vec3(row.get("quest_gaze3d_world")),
+                    "questGaze3DUnityWorld": row.get("quest_gaze3d_world"),
                     "questGaze3DSource": row.get("quest_gaze3d_source"),
                     "gripper": row.get("gripper"),
                     "error": row.get("error"),
@@ -3964,9 +4018,9 @@ def build_gaze_depth_diagnostics(rows: list[dict[str, Any]], snapshot: dict[str,
 
     for row in rows:
         sample_index = row.get("sampleIndex")
-        gaze_point = vec3_list(row.get("gazePoint3DWorld"))
-        ray_origin = vec3_list(row.get("gazeRayOrigin"))
-        ray_direction_list = vec3_list(row.get("gazeRayDirection"))
+        gaze_point = pc_world_vec3(row.get("gazePoint3DWorld"))
+        ray_origin = pc_world_vec3(row.get("gazeRayOrigin"))
+        ray_direction_list = pc_world_direction(row.get("gazeRayDirection"))
         source = str(row.get("gazePoint3DSource") or row.get("gazeSource") or "unknown")
         sources[source] = sources.get(source, 0) + 1
         if gaze_point is None or ray_origin is None or ray_direction_list is None:
@@ -4175,15 +4229,92 @@ def translate_vec3_list(value: Any, origin: list[float]) -> list[float] | None:
     return [point[0] - origin[0], point[1] - origin[1], point[2] - origin[2]]
 
 
+def translate_pc_vec3_list(value: Any, origin: list[float]) -> list[float] | None:
+    point = pc_world_vec3(value)
+    if point is None:
+        return None
+    return [point[0] - origin[0], point[1] - origin[1], point[2] - origin[2]]
+
+
+def pc_world_vec3(value: Any) -> list[float] | None:
+    return unity_vec3_to_pc(value)
+
+
+def pc_world_direction(value: Any) -> list[float] | None:
+    direction = unity_vec3_to_pc(value)
+    if direction is None:
+        return None
+    norm = math.sqrt(sum(item * item for item in direction))
+    if norm <= 1e-12:
+        return None
+    return [item / norm for item in direction]
+
+
+def pc_world_pose_array(value: Any) -> list[float] | None:
+    return unity_pose_array_to_pc(value)
+
+
+def pc_world_controller_payload(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    result = dict(value)
+    position = unity_vec3_to_pc(value.get("position"))
+    rotation = unity_quaternion_wxyz_to_pc(value.get("rotation"))
+    pose = unity_pose_array_to_pc(value.get("pose"))
+    if position is not None:
+        result["position"] = position
+    if rotation is not None:
+        result["rotation"] = rotation
+    if pose is not None:
+        result["pose"] = pose
+    result["coordinateFrame"] = PC_WORLD_FRAME
+    result["sourceCoordinateFrame"] = value.get("coordinateFrame") or UNITY_WORLD_FRAME
+    return result
+
+
+def pc_world_sample_payload(message: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(message, dict):
+        return None
+    payload: dict[str, Any] = {
+        "coordinateFrame": PC_WORLD_FRAME,
+        "sourceCoordinateFrame": UNITY_WORLD_FRAME,
+        "worldFrameConversion": WORLD_FRAME_CONVERSION,
+    }
+    mappings = {
+        "gazePointWorld": pc_world_vec3,
+        "gazePoint3DWorld": pc_world_vec3,
+        "gazeRayOrigin": pc_world_vec3,
+        "gazeRayDirection": pc_world_direction,
+        "gazeFallbackPointWorld": pc_world_vec3,
+        "leftCameraPose": pc_world_pose_array,
+        "rightCameraPose": pc_world_pose_array,
+        "leftPassthroughCameraPose": pc_world_pose_array,
+        "rightPassthroughCameraPose": pc_world_pose_array,
+        "leftEyePose": pc_world_pose_array,
+        "rightEyePose": pc_world_pose_array,
+        "leftEyePosition": pc_world_vec3,
+        "rightEyePosition": pc_world_vec3,
+    }
+    for key, converter in mappings.items():
+        converted = converter(message.get(key))
+        if converted is not None:
+            payload[key] = converted
+    for key in ("leftController", "rightController"):
+        converted_controller = pc_world_controller_payload(message.get(key))
+        if converted_controller is not None:
+            payload[key] = converted_controller
+    return payload if len(payload) > 3 else None
+
+
 def replay_pose_from_array(value: Any, source: str, origin: list[float]) -> dict[str, Any]:
-    pose = pose_from_pose_array(value, source)
+    pose = pose_from_pose_array(pc_world_pose_array(value), source)
     if pose["ok"] and pose["p"] is not None:
         pose["p"] = [pose["p"][0] - origin[0], pose["p"][1] - origin[1], pose["p"][2] - origin[2]]
     return pose
 
 
 def replay_pose_from_controller(value: Any, handedness: str, origin: list[float]) -> dict[str, Any]:
-    pose = visualizer_controller_pose(value, handedness)
+    pose = visualizer_controller_pose(pc_world_controller_payload(value), handedness)
     if pose["ok"] and pose["p"] is not None:
         pose["p"] = [pose["p"][0] - origin[0], pose["p"][1] - origin[1], pose["p"][2] - origin[2]]
     return pose
@@ -4212,34 +4343,37 @@ def recording_replay_sample(row: dict[str, Any], origin: list[float]) -> dict[st
         "left": replay_pose_from_controller(row.get("leftController"), "left", origin),
         "right": replay_pose_from_controller(row.get("rightController"), "right", origin),
         "gaze": {
-            "ok": translate_vec3_list(row.get("gazePoint3DWorld"), origin) is not None,
-            "p": translate_vec3_list(row.get("gazePoint3DWorld"), origin),
+            "ok": translate_pc_vec3_list(row.get("gazePoint3DWorld"), origin) is not None,
+            "p": translate_pc_vec3_list(row.get("gazePoint3DWorld"), origin),
             "source": row.get("gazePoint3DSource") or row.get("gazeSource"),
         },
         "gazeHit": {
-            "ok": translate_vec3_list(row.get("gazePointWorld"), origin) is not None,
-            "p": translate_vec3_list(row.get("gazePointWorld"), origin),
+            "ok": translate_pc_vec3_list(row.get("gazePointWorld"), origin) is not None,
+            "p": translate_pc_vec3_list(row.get("gazePointWorld"), origin),
             "source": "gazePointWorld",
         },
-        "gazeRayOrigin": translate_vec3_list(row.get("gazeRayOrigin"), origin),
-        "gazeRayDirection": vec3_list(row.get("gazeRayDirection")),
+        "gazeRayOrigin": translate_pc_vec3_list(row.get("gazeRayOrigin"), origin),
+        "gazeRayDirection": pc_world_direction(row.get("gazeRayDirection")),
     }
 
 
 def visualizer_event_from_sample(message: dict[str, Any], wrapper: dict[str, Any]) -> dict[str, Any]:
-    left_camera = pose_from_pose_array(message.get("leftCameraPose"), "leftCamera")
-    right_camera = pose_from_pose_array(message.get("rightCameraPose"), "rightCamera")
-    left_eye = pose_from_pose_array(message.get("leftEyePose"), "leftEye")
-    right_eye = pose_from_pose_array(message.get("rightEyePose"), "rightEye")
+    left_camera = pose_from_pose_array(pc_world_pose_array(message.get("leftCameraPose")), "leftCamera")
+    right_camera = pose_from_pose_array(pc_world_pose_array(message.get("rightCameraPose")), "rightCamera")
+    left_eye = pose_from_pose_array(pc_world_pose_array(message.get("leftEyePose")), "leftEye")
+    right_eye = pose_from_pose_array(pc_world_pose_array(message.get("rightEyePose")), "rightEye")
     head = head_pose_from_pair(left_eye, right_eye, "eye_midpoint")
     if not head["ok"]:
         head = head_pose_from_pair(left_camera, right_camera, "camera_midpoint")
-    left = visualizer_controller_pose(message.get("leftController"), "left")
-    right = visualizer_controller_pose(message.get("rightController"), "right")
-    gaze = vec3_list(message.get("gazePoint3DWorld"))
+    left = visualizer_controller_pose(pc_world_controller_payload(message.get("leftController")), "left")
+    right = visualizer_controller_pose(pc_world_controller_payload(message.get("rightController")), "right")
+    gaze = pc_world_vec3(message.get("gazePoint3DWorld"))
 
     return {
         "type": "sample",
+        "coordinateFrame": PC_WORLD_FRAME,
+        "sourceCoordinateFrame": UNITY_WORLD_FRAME,
+        "worldFrameConversion": WORLD_FRAME_CONVERSION,
         "recordId": message.get("recordId"),
         "sequence": message.get("sequence"),
         "sampleIndex": message.get("sampleIndex"),
@@ -4460,8 +4594,31 @@ def calibration_result_event(record_id: str, result: dict[str, Any], result_path
     calibration = per_record.get(record_id) if isinstance(per_record, dict) else None
     if not isinstance(calibration, dict):
         calibration = next(iter(per_record.values())) if isinstance(per_record, dict) and per_record else {}
-    t_world_board = calibration.get("T_world_board") if isinstance(calibration, dict) else None
-    t_board_world = calibration.get("T_board_world") if isinstance(calibration, dict) else None
+    coordinate_frame = None
+    if isinstance(calibration, dict):
+        coordinate_frame = (
+            calibration.get("coordinate_frame")
+            or calibration.get("coordinateFrame")
+            or result.get("coordinate_frame")
+            or result.get("coordinateFrame")
+        )
+    raw_trajectory_frame = result.get("raw_trajectory_frame") or result.get("rawTrajectoryFrame") or UNITY_WORLD_FRAME
+    conversion = result.get("world_frame_conversion") or result.get("worldFrameConversion") or WORLD_FRAME_CONVERSION
+    t_world_board_raw = calibration.get("T_world_board") if isinstance(calibration, dict) else None
+    t_board_world_raw = calibration.get("T_board_world") if isinstance(calibration, dict) else None
+    t_world_board = ensure_pc_transform_payload(t_world_board_raw, coordinate_frame)
+    t_board_world = None
+    if t_world_board is not None:
+        matrix = matrix_from_transform_payload(t_world_board)
+        if matrix is not None:
+            t_board_world = coordinate_transform_payload_from_matrix(np.linalg.inv(matrix), PC_WORLD_FRAME)
+    if t_board_world is None:
+        t_board_world = ensure_pc_transform_payload(t_board_world_raw, coordinate_frame)
+    t_unity_world_board = calibration.get("T_unity_world_board") if isinstance(calibration, dict) else None
+    t_board_unity_world = calibration.get("T_board_unity_world") if isinstance(calibration, dict) else None
+    if not is_pc_world_frame(coordinate_frame):
+        t_unity_world_board = t_unity_world_board or t_world_board_raw
+        t_board_unity_world = t_board_unity_world or t_board_world_raw
     board_normal = None
     board_normal_angle_y = None
     if isinstance(t_world_board, dict):
@@ -4478,10 +4635,21 @@ def calibration_result_event(record_id: str, result: dict[str, Any], result_path
             except (TypeError, ValueError, IndexError):
                 board_normal = None
                 board_normal_angle_y = None
+    quest_world_origin_in_board = (
+        t_board_world.get("translation_m")
+        if isinstance(t_board_world, dict) and isinstance(t_board_world.get("translation_m"), list)
+        else None
+    )
     order = result.get("order_summary") if isinstance(result.get("order_summary"), dict) else {}
     stats_obj = result.get("stats") if isinstance(result.get("stats"), dict) else {}
     overall = stats_obj.get("overall") if isinstance(stats_obj.get("overall"), dict) else {}
     red_anchor_policy = result.get("red_anchor_policy") if isinstance(result.get("red_anchor_policy"), dict) else {}
+    unity_quest_world_origin_in_board = None
+    if isinstance(calibration, dict):
+        unity_quest_world_origin_in_board = (
+            calibration.get("unity_quest_world_origin_in_board_m")
+            or calibration.get("quest_world_origin_in_board_m")
+        )
     return {
         "type": "calibration_result",
         "recordId": record_id,
@@ -4489,9 +4657,15 @@ def calibration_result_event(record_id: str, result: dict[str, Any], result_path
         "pattern": result.get("pattern") or [11, 8],
         "squareSizeM": result.get("square_size_m") or 0.025,
         "imageYAxis": result.get("image_y_axis"),
+        "coordinateFrame": PC_WORLD_FRAME,
+        "rawTrajectoryFrame": raw_trajectory_frame,
+        "worldFrameConversion": conversion,
         "T_world_board": t_world_board,
         "T_board_world": t_board_world,
-        "questWorldOriginInBoardM": calibration.get("quest_world_origin_in_board_m") if isinstance(calibration, dict) else None,
+        "T_unity_world_board": t_unity_world_board,
+        "T_board_unity_world": t_board_unity_world,
+        "questWorldOriginInBoardM": quest_world_origin_in_board,
+        "unityQuestWorldOriginInBoardM": unity_quest_world_origin_in_board,
         "boardNormalWorld": board_normal,
         "boardNormalAbsAngleToWorldYDeg": board_normal_angle_y,
         "bestLagSeconds": result.get("best_lag_seconds"),
@@ -4517,7 +4691,7 @@ def recording_calibration_snapshot(output_root: Path | None) -> dict[str, Any] |
             "ok": False,
             "reason": snapshot.get("reason") if isinstance(snapshot, dict) else "missing_calibration_snapshot",
         }
-    compact = {
+    compact = canonicalize_calibration_snapshot({
         "capturedUtc": datetime.now(timezone.utc).isoformat(),
         "ok": bool(snapshot.get("ok")),
         "kind": snapshot.get("kind"),
@@ -4526,9 +4700,15 @@ def recording_calibration_snapshot(output_root: Path | None) -> dict[str, Any] |
         "pattern": event.get("pattern"),
         "squareSizeM": event.get("squareSizeM"),
         "imageYAxis": event.get("imageYAxis"),
+        "coordinateFrame": event.get("coordinateFrame"),
+        "rawTrajectoryFrame": event.get("rawTrajectoryFrame"),
+        "worldFrameConversion": event.get("worldFrameConversion"),
         "T_world_board": event.get("T_world_board"),
         "T_board_world": event.get("T_board_world"),
+        "T_unity_world_board": event.get("T_unity_world_board"),
+        "T_board_unity_world": event.get("T_board_unity_world"),
         "questWorldOriginInBoardM": event.get("questWorldOriginInBoardM"),
+        "unityQuestWorldOriginInBoardM": event.get("unityQuestWorldOriginInBoardM"),
         "boardNormalWorld": event.get("boardNormalWorld"),
         "boardNormalAbsAngleToWorldYDeg": event.get("boardNormalAbsAngleToWorldYDeg"),
         "bestLagSeconds": event.get("bestLagSeconds"),
@@ -4540,7 +4720,7 @@ def recording_calibration_snapshot(output_root: Path | None) -> dict[str, Any] |
         "redAnchorPolicy": event.get("redAnchorPolicy"),
         "medianReprojectionPx": event.get("medianReprojectionPx"),
         "p90ReprojectionPx": event.get("p90ReprojectionPx"),
-    }
+    })
     if snapshot.get("kind") != "result":
         compact["reason"] = event.get("reason")
         compact["reasonCode"] = event.get("reasonCode")
