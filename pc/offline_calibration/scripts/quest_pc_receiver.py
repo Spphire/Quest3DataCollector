@@ -626,13 +626,18 @@ class SessionWriter:
             sample_index = message.get("sampleIndex")
             if is_number(sample_index):
                 self.last_sample_index = int(sample_index)
-            self._write_sample(wrapper, message)
-            self._write_robot_sample(wrapper, message)
+            robot_row = self._write_robot_sample(wrapper, message)
+            self._write_sample(wrapper, message, robot_row)
 
         if self.messages % self.flush_every == 0:
             self.flush()
 
-    def _write_sample(self, wrapper: dict[str, Any], message: dict[str, Any]) -> None:
+    def _write_sample(
+        self,
+        wrapper: dict[str, Any],
+        message: dict[str, Any],
+        robot_row: dict[str, Any] | None = None,
+    ) -> None:
         compact = {
             "pcReceiveUtc": wrapper.get("pcReceiveUtc"),
             "pcReceiveUnixSeconds": wrapper.get("pcReceiveUnixSeconds"),
@@ -664,19 +669,58 @@ class SessionWriter:
             "leftController": message.get("leftController"),
             "rightController": message.get("rightController"),
         }
+        robot_compact = self._compact_robot_row(robot_row)
+        if robot_compact is not None:
+            compact["robot"] = robot_compact
+            compact["robotJointPose"] = robot_compact.get("jointpose")
+            compact["robotJointPos"] = robot_compact.get("jointpos")
         self.samples_file.write(json_line(compact))
         self._write_controller_csv_row(wrapper, message, "left")
         self._write_controller_csv_row(wrapper, message, "right")
 
-    def _write_robot_sample(self, wrapper: dict[str, Any], message: dict[str, Any]) -> None:
+    def _write_robot_sample(self, wrapper: dict[str, Any], message: dict[str, Any]) -> dict[str, Any] | None:
         robot_session = self.robot_session
         if robot_session is None:
-            return
+            return None
         robot_sample = dict(message)
         robot_sample["pcReceivePerfCounterSeconds"] = wrapper.get("pcReceivePerfCounterSeconds")
         robot_session.update_controller_motion(robot_sample)
         robot_session.update_gripper(robot_sample)
-        robot_session.record_sample(robot_sample)
+        return robot_session.record_sample(robot_sample)
+
+    @staticmethod
+    def _compact_robot_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(row, dict):
+            return None
+        state = row.get("robot_state") if isinstance(row.get("robot_state"), dict) else {}
+        joint_pose = row.get("jointpose")
+        if joint_pose is None:
+            joint_pose = row.get("jointpos")
+        if joint_pose is None:
+            joint_pose = state.get("jointPose") or state.get("jointpos")
+        return {
+            "sampleIndex": row.get("sample_index"),
+            "recordId": row.get("record_id"),
+            "capturedAt": row.get("captured_at"),
+            "ok": bool(row.get("ok")),
+            "error": row.get("error"),
+            "poseSource": row.get("pose_source"),
+            "questSampleIndex": row.get("quest_sample_index"),
+            "questRecordingTimestampSeconds": row.get("quest_recording_timestamp_seconds"),
+            "questPcReceivePerfCounterSeconds": row.get("quest_pc_receive_perf_counter_seconds"),
+            "jointpose": joint_pose,
+            "jointpos": joint_pose,
+            "rawEndEffectorPoseWxyz": state.get("rawEndEffectorPoseWxyz"),
+            "T_base_ee": row.get("T_base_ee"),
+            "T_base_tool_tcp": row.get("T_base_tool_tcp"),
+            "T_world_tool_tcp": row.get("T_world_tool_tcp"),
+            "T_display_tool_tcp": row.get("T_display_tool_tcp"),
+            "T_base_end_camera": row.get("T_base_end_camera"),
+            "T_world_end_camera": row.get("T_world_end_camera"),
+            "T_display_end_camera": row.get("T_display_end_camera"),
+            "gripper": row.get("gripper"),
+            "videoFrames": row.get("videoFrames"),
+        }
 
     def _write_controller_csv_row(
         self,
@@ -3704,7 +3748,8 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
                     "T_world_end_camera": world_end_camera_pose,
                     "T_display_end_camera": display_end_camera_pose,
                     "displayFrame": display_frame,
-                    "jointpose": row.get("jointpose"),
+                    "jointpose": row.get("jointpose") or row.get("jointpos"),
+                    "jointpos": row.get("jointpos") or row.get("jointpose"),
                     "images": robot_image_artifacts(robot_dir, images),
                     "videos": robot_video_artifacts(robot_dir, videos),
                     "videoFrames": row.get("videoFrames"),

@@ -962,6 +962,7 @@ class RobotRealsenseSession:
                         t_world_end_camera = invert_transform(self.t_base_world) @ t_base_end_camera_matrix
                         t_world_end_camera_payload = transform_to_json(t_world_end_camera)
                         t_display_end_camera_payload = transform_to_json(t_world_end_camera)
+        joint_pose = robot_state.get("jointPose")
         return {
             "sample_index": sample_index,
             "record_id": self.record_id,
@@ -982,7 +983,8 @@ class RobotRealsenseSession:
             "T_base_end_camera": t_base_end_camera_payload,
             "T_world_end_camera": t_world_end_camera_payload,
             "T_display_end_camera": t_display_end_camera_payload,
-            "jointpose": robot_state.get("jointPose"),
+            "jointpose": joint_pose,
+            "jointpos": joint_pose,
             "images": images,
             "videos": videos,
             "videoFrames": video_frames,
@@ -2640,7 +2642,8 @@ def robot_sample_event(row: dict[str, Any]) -> dict[str, Any]:
         "T_world_tool_tcp": row.get("T_world_tool_tcp"),
         "T_base_end_camera": row.get("T_base_end_camera"),
         "T_world_end_camera": row.get("T_world_end_camera"),
-        "jointpose": row.get("jointpose"),
+        "jointpose": row.get("jointpose") or row.get("jointpos"),
+        "jointpos": row.get("jointpos") or row.get("jointpose"),
         "images": row.get("images"),
         "videos": row.get("videos"),
         "videoFrames": row.get("videoFrames"),
