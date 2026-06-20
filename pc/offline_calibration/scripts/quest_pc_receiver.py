@@ -41,6 +41,11 @@ from flexiv_realsense_bridge import (
     DEFAULT_GRIPPER_SPEED_MPS,
     DEFAULT_GRIPPER_TRIGGER_CLOSE_THRESHOLD,
     DEFAULT_GRIPPER_TRIGGER_OPEN_THRESHOLD,
+    DEFAULT_HAND_EYE_DIVERSE_MIN_SCORE,
+    DEFAULT_HAND_EYE_DIVERSE_ROTATION_SCALE_DEG,
+    DEFAULT_HAND_EYE_DIVERSE_TRANSLATION_SCALE_M,
+    DEFAULT_HAND_EYE_MAX_DIVERSE_SAMPLES,
+    DEFAULT_HAND_EYE_MIN_DIVERSE_SAMPLES,
     DEFAULT_CONTROLLER_MAX_ROTATION_DEG,
     DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG,
     FlexivRealSenseConfig,
@@ -220,6 +225,47 @@ def main() -> int:
         help="Write PC calibration raw records but do not run calibrate_records_25mm.py after stop.",
     )
     receive_parser.add_argument(
+        "--max-diverse-detection-frames-per-side",
+        type=int,
+        default=220,
+        help="Max pose-diverse Quest video frames checked for checkerboard per eye after B-button stop. Default: 220",
+    )
+    receive_parser.add_argument(
+        "--max-diverse-fit-frames-per-side",
+        type=int,
+        default=180,
+        help="Max pose-diverse detected Quest frames used by the final optimizer per eye. Default: 180",
+    )
+    receive_parser.add_argument(
+        "--min-diverse-frames-per-side",
+        type=int,
+        default=28,
+        help="Minimum Quest frames retained before early stopping the pose-diverse selector. Default: 28",
+    )
+    receive_parser.add_argument(
+        "--diverse-translation-scale",
+        type=float,
+        default=0.025,
+        help="Quest camera translation difference that counts as one diversity unit, in meters. Default: 0.025",
+    )
+    receive_parser.add_argument(
+        "--diverse-rotation-scale",
+        type=float,
+        default=3.0,
+        help="Quest camera rotation difference that counts as one diversity unit, in degrees. Default: 3.0",
+    )
+    receive_parser.add_argument(
+        "--diverse-min-score",
+        type=float,
+        default=0.75,
+        help="Stop selecting extra Quest frames below this diversity score. Default: 0.75",
+    )
+    receive_parser.add_argument(
+        "--disable-diverse-frame-selection",
+        action="store_true",
+        help="Use every Quest calibration video frame instead of pose-diverse selection.",
+    )
+    receive_parser.add_argument(
         "--no-flexiv-realsense",
         action="store_true",
         help="Disable Flexiv/RealSense controls and synchronized robot capture.",
@@ -276,6 +322,47 @@ def main() -> int:
         "--no-robot-hand-eye",
         action="store_true",
         help="Record robot/RealSense samples but skip automatic robot hand-eye calibration after B-button stop.",
+    )
+    receive_parser.add_argument(
+        "--hand-eye-max-diverse-samples",
+        type=int,
+        default=DEFAULT_HAND_EYE_MAX_DIVERSE_SAMPLES,
+        help=f"Max pose-diverse robot samples checked for hand-eye after B-button stop. Default: {DEFAULT_HAND_EYE_MAX_DIVERSE_SAMPLES}",
+    )
+    receive_parser.add_argument(
+        "--hand-eye-min-diverse-samples",
+        type=int,
+        default=DEFAULT_HAND_EYE_MIN_DIVERSE_SAMPLES,
+        help=f"Minimum pose-diverse robot samples before early stopping. Default: {DEFAULT_HAND_EYE_MIN_DIVERSE_SAMPLES}",
+    )
+    receive_parser.add_argument(
+        "--hand-eye-diverse-translation-scale",
+        type=float,
+        default=DEFAULT_HAND_EYE_DIVERSE_TRANSLATION_SCALE_M,
+        help=(
+            "Robot TCP translation difference that counts as one hand-eye diversity unit, in meters. "
+            f"Default: {DEFAULT_HAND_EYE_DIVERSE_TRANSLATION_SCALE_M:g}"
+        ),
+    )
+    receive_parser.add_argument(
+        "--hand-eye-diverse-rotation-scale",
+        type=float,
+        default=DEFAULT_HAND_EYE_DIVERSE_ROTATION_SCALE_DEG,
+        help=(
+            "Robot TCP rotation difference that counts as one hand-eye diversity unit, in degrees. "
+            f"Default: {DEFAULT_HAND_EYE_DIVERSE_ROTATION_SCALE_DEG:g}"
+        ),
+    )
+    receive_parser.add_argument(
+        "--hand-eye-diverse-min-score",
+        type=float,
+        default=DEFAULT_HAND_EYE_DIVERSE_MIN_SCORE,
+        help=f"Stop selecting extra robot samples below this diversity score. Default: {DEFAULT_HAND_EYE_DIVERSE_MIN_SCORE:g}",
+    )
+    receive_parser.add_argument(
+        "--disable-hand-eye-diverse-selection",
+        action="store_true",
+        help="Use all robot samples for hand-eye instead of pose-diverse selection.",
     )
     receive_parser.add_argument(
         "--controller-motion-scale",
@@ -1372,6 +1459,7 @@ class PcCalibrationSession:
         visualizer: "LiveTelemetryVisualizer | None",
         run_calibration: bool,
         robot_manager: FlexivRealSenseManager | None = None,
+        calibration_options: dict[str, Any] | None = None,
     ) -> None:
         self.record_id = sanitize_name(record_id)
         self.raw_root = raw_root.resolve()
@@ -1382,6 +1470,7 @@ class PcCalibrationSession:
         self.output_directory = unique_directory(self.output_root / self.record_id)
         self.visualizer = visualizer
         self.run_calibration = run_calibration
+        self.calibration_options = dict(calibration_options or {})
         self.robot_manager = robot_manager
         self.robot_session: RobotRealsenseSession | None = None
         self.robot_realsense_directory: Path | None = None
@@ -1637,7 +1726,21 @@ class PcCalibrationSession:
             str(self.raw_root),
             "--output-root",
             str(self.output_directory),
+            "--max-diverse-detection-frames-per-side",
+            str(self.calibration_options.get("max_diverse_detection_frames_per_side", 220)),
+            "--max-diverse-fit-frames-per-side",
+            str(self.calibration_options.get("max_diverse_fit_frames_per_side", 180)),
+            "--min-diverse-frames-per-side",
+            str(self.calibration_options.get("min_diverse_frames_per_side", 28)),
+            "--diverse-translation-scale-m",
+            str(self.calibration_options.get("diverse_translation_scale", 0.025)),
+            "--diverse-rotation-scale-deg",
+            str(self.calibration_options.get("diverse_rotation_scale", 3.0)),
+            "--diverse-min-score",
+            str(self.calibration_options.get("diverse_min_score", 0.75)),
         ]
+        if bool(self.calibration_options.get("disable_diverse_frame_selection", False)):
+            command.append("--disable-diverse-frame-selection")
         env = dict(os.environ)
         env["QUEST_CALIB_PROGRESS"] = "1"
         self.publish_status("calibrating", 0.08, "Running 25mm calibration")
@@ -1747,6 +1850,7 @@ class PcCalibrationHttpReceiver:
         visualizer: LiveTelemetryVisualizer | None,
         run_calibration: bool,
         robot_manager: FlexivRealSenseManager | None = None,
+        calibration_options: dict[str, Any] | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -1755,6 +1859,7 @@ class PcCalibrationHttpReceiver:
         self.visualizer = visualizer
         self.run_calibration = run_calibration
         self.robot_manager = robot_manager
+        self.calibration_options = dict(calibration_options or {})
         self.sessions: dict[str, PcCalibrationSession] = {}
         self.lock = threading.Lock()
         self.server = self._make_server()
@@ -1877,6 +1982,7 @@ class PcCalibrationHttpReceiver:
                         receiver.visualizer,
                         receiver.run_calibration,
                         receiver.robot_manager,
+                        receiver.calibration_options,
                     )
                     receiver.sessions[record_id] = session
                 print(f"Started PC calibration raw record: {session.directory}", flush=True)
@@ -1956,6 +2062,12 @@ def receive(args: argparse.Namespace) -> int:
                 realsense_gain=args.realsense_gain,
                 capture_interval_seconds=args.robot_capture_interval,
                 run_hand_eye=not args.no_robot_hand_eye,
+                hand_eye_max_diverse_samples=args.hand_eye_max_diverse_samples,
+                hand_eye_min_diverse_samples=args.hand_eye_min_diverse_samples,
+                hand_eye_diverse_translation_scale_m=args.hand_eye_diverse_translation_scale,
+                hand_eye_diverse_rotation_scale_deg=args.hand_eye_diverse_rotation_scale,
+                hand_eye_diverse_min_score=args.hand_eye_diverse_min_score,
+                hand_eye_disable_diverse_selection=args.disable_hand_eye_diverse_selection,
                 controller_translation_scale=args.controller_motion_scale,
                 controller_max_offset_m=args.controller_motion_max_offset,
                 controller_max_step_m=args.controller_motion_max_step,
@@ -1993,6 +2105,7 @@ def receive(args: argparse.Namespace) -> int:
             visualizer,
             run_calibration=not args.no_calibrate_after_pc_recording,
             robot_manager=robot_manager,
+            calibration_options=calibration_options_from_args(args),
         )
         calibration_receiver.start()
 
@@ -2171,6 +2284,18 @@ def receive(args: argparse.Namespace) -> int:
             calibration_receiver.stop()
         if visualizer is not None:
             visualizer.stop()
+
+
+def calibration_options_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "max_diverse_detection_frames_per_side": int(getattr(args, "max_diverse_detection_frames_per_side", 220)),
+        "max_diverse_fit_frames_per_side": int(getattr(args, "max_diverse_fit_frames_per_side", 180)),
+        "min_diverse_frames_per_side": int(getattr(args, "min_diverse_frames_per_side", 28)),
+        "diverse_translation_scale": float(getattr(args, "diverse_translation_scale", 0.025)),
+        "diverse_rotation_scale": float(getattr(args, "diverse_rotation_scale", 3.0)),
+        "diverse_min_score": float(getattr(args, "diverse_min_score", 0.75)),
+        "disable_diverse_frame_selection": bool(getattr(args, "disable_diverse_frame_selection", False)),
+    }
 
 
 def handle_post_recording(summary: dict[str, Any], args: argparse.Namespace) -> None:

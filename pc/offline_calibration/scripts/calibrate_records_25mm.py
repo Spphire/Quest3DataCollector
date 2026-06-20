@@ -34,6 +34,11 @@ RED_ANCHOR_RADIUS_GRID_SPACING = 2.0
 RED_ANCHOR_MIN_PIXELS = 16
 RED_ANCHOR_MIN_RATIO = 0.002
 RED_ANCHOR_MIN_BEST_SECOND_RATIO = 1.8
+DEFAULT_DIVERSE_DETECTION_FRAMES_PER_SIDE = 220
+DEFAULT_DIVERSE_FIT_FRAMES_PER_SIDE = 180
+DEFAULT_DIVERSE_MIN_FRAMES_PER_SIDE = 28
+DEFAULT_DIVERSE_TRANSLATION_SCALE_M = 0.025
+DEFAULT_DIVERSE_ROTATION_SCALE_DEG = 3.0
 
 
 @dataclass
@@ -80,6 +85,136 @@ class CalibrationFailure(RuntimeError):
         super().__init__(reason)
         self.reason = reason
         self.diagnostics = diagnostics
+
+
+def diverse_pose_indices(
+    positions: np.ndarray,
+    rotations: Rotation,
+    max_count: int,
+    min_count: int,
+    translation_scale_m: float,
+    rotation_scale_deg: float,
+    min_score: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    count = int(len(positions))
+    if count <= 0:
+        return np.asarray([], dtype=int), {
+            "enabled": True,
+            "input_count": 0,
+            "selected_count": 0,
+            "reason": "empty",
+        }
+    max_count = int(max(1, max_count))
+    min_count = int(max(1, min_count))
+    if count <= max_count:
+        return np.arange(count, dtype=int), {
+            "enabled": True,
+            "input_count": count,
+            "selected_count": count,
+            "reason": "input_below_limit",
+        }
+
+    positions = np.asarray(positions, dtype=float).reshape(count, 3)
+    trans_scale = max(1e-6, float(translation_scale_m))
+    rot_scale = max(1e-6, np.deg2rad(float(rotation_scale_deg)))
+    selected: list[int] = [0]
+    center = np.median(positions, axis=0)
+    selected.append(int(np.argmax(np.linalg.norm(positions - center[None, :], axis=1))))
+    selected = sorted(set(selected))
+
+    min_dist = pose_distance_to_set(positions, rotations, selected, trans_scale, rot_scale)
+    stop_score = float(min_score)
+    while len(selected) < max_count:
+        candidate_scores = min_dist.copy()
+        candidate_scores[selected] = -np.inf
+        candidate = int(np.argmax(candidate_scores))
+        score = float(candidate_scores[candidate])
+        if len(selected) >= min_count and score < stop_score:
+            break
+        if not np.isfinite(score):
+            break
+        selected.append(candidate)
+        new_dist = pose_distance_to_set(positions, rotations, [candidate], trans_scale, rot_scale)
+        min_dist = np.minimum(min_dist, new_dist)
+        min_dist[selected] = 0.0
+
+    selected_arr = np.asarray(sorted(selected), dtype=int)
+    selected_positions = positions[selected_arr]
+    selected_rotations = rotations[selected_arr]
+    return selected_arr, {
+        "enabled": True,
+        "input_count": count,
+        "selected_count": int(len(selected_arr)),
+        "max_count": max_count,
+        "min_count": min_count,
+        "min_score": stop_score,
+        "translation_scale_m": trans_scale,
+        "rotation_scale_deg": float(rotation_scale_deg),
+        "selected_fraction": float(len(selected_arr) / count),
+        "pose_span": pose_selection_span(selected_positions, selected_rotations),
+        "last_best_score": float(np.max(min_dist)) if len(min_dist) else 0.0,
+    }
+
+
+def pose_distance_to_set(
+    positions: np.ndarray,
+    rotations: Rotation,
+    selected: list[int],
+    translation_scale_m: float,
+    rotation_scale_rad: float,
+) -> np.ndarray:
+    distances = np.full(len(positions), np.inf, dtype=float)
+    for index in selected:
+        translation = np.linalg.norm(positions - positions[index][None, :], axis=1) / translation_scale_m
+        delta = rotations[index].inv() * rotations
+        rotation = delta.magnitude() / rotation_scale_rad
+        distances = np.minimum(distances, np.sqrt(translation * translation + rotation * rotation))
+    return distances
+
+
+def pose_selection_span(positions: np.ndarray, rotations: Rotation) -> dict[str, Any]:
+    if len(positions) <= 0:
+        return {
+            "translation_span_m": 0.0,
+            "rotation_span_deg": 0.0,
+            "axis_span_m": [0.0, 0.0, 0.0],
+        }
+    max_translation = 0.0
+    max_rotation = 0.0
+    for i in range(len(positions)):
+        if i + 1 >= len(positions):
+            break
+        translation = np.linalg.norm(positions[i + 1 :] - positions[i][None, :], axis=1)
+        if len(translation):
+            max_translation = max(max_translation, float(np.max(translation)))
+        delta = rotations[i].inv() * rotations[i + 1 :]
+        if len(delta):
+            max_rotation = max(max_rotation, float(np.rad2deg(np.max(delta.magnitude()))))
+    axis_span = np.ptp(positions, axis=0) if len(positions) else np.zeros(3, dtype=float)
+    return {
+        "translation_span_m": float(max_translation),
+        "rotation_span_deg": float(max_rotation),
+        "axis_span_m": [float(v) for v in axis_span],
+    }
+
+
+def metadata_pose_arrays(rows: list[dict[str, Any]]) -> tuple[np.ndarray, Rotation, list[int]]:
+    positions = []
+    quats_xyzw = []
+    frame_indices = []
+    for row in rows:
+        pose = row.get("pose")
+        if not isinstance(pose, list) or len(pose) < 7:
+            continue
+        try:
+            positions.append([float(pose[0]), float(pose[1]), float(pose[2])])
+            quats_xyzw.append([float(pose[4]), float(pose[5]), float(pose[6]), float(pose[3])])
+            frame_indices.append(int(row["frameIndex"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not positions:
+        return np.zeros((0, 3), dtype=float), Rotation.identity(0), []
+    return np.asarray(positions, dtype=float), Rotation.from_quat(quats_xyzw), frame_indices
 
 
 def main() -> int:
@@ -132,6 +267,62 @@ def main() -> int:
             "Optional physical red-corner target index. Default: auto, choose the smaller index from the detected "
             "180-degree corner pair, e.g. 0 for 0/87 or 10 for 10/77."
         ),
+    )
+    parser.add_argument(
+        "--disable-diverse-frame-selection",
+        action="store_true",
+        help="Use every recorded frame instead of pose-diverse frame selection.",
+    )
+    parser.add_argument(
+        "--max-diverse-detection-frames-per-side",
+        type=int,
+        default=DEFAULT_DIVERSE_DETECTION_FRAMES_PER_SIDE,
+        help=(
+            "Maximum pose-diverse frames to run checkerboard detection on per record/side. "
+            f"Default: {DEFAULT_DIVERSE_DETECTION_FRAMES_PER_SIDE}."
+        ),
+    )
+    parser.add_argument(
+        "--max-diverse-fit-frames-per-side",
+        type=int,
+        default=DEFAULT_DIVERSE_FIT_FRAMES_PER_SIDE,
+        help=(
+            "Maximum pose-diverse detected frames used by optimizer per record/side. "
+            f"Default: {DEFAULT_DIVERSE_FIT_FRAMES_PER_SIDE}."
+        ),
+    )
+    parser.add_argument(
+        "--min-diverse-frames-per-side",
+        type=int,
+        default=DEFAULT_DIVERSE_MIN_FRAMES_PER_SIDE,
+        help=(
+            "Minimum frames retained before early-stopping the pose-diverse selector. "
+            f"Default: {DEFAULT_DIVERSE_MIN_FRAMES_PER_SIDE}."
+        ),
+    )
+    parser.add_argument(
+        "--diverse-translation-scale-m",
+        type=float,
+        default=DEFAULT_DIVERSE_TRANSLATION_SCALE_M,
+        help=(
+            "Camera translation difference that counts as roughly one diversity unit. "
+            f"Default: {DEFAULT_DIVERSE_TRANSLATION_SCALE_M:g} m."
+        ),
+    )
+    parser.add_argument(
+        "--diverse-rotation-scale-deg",
+        type=float,
+        default=DEFAULT_DIVERSE_ROTATION_SCALE_DEG,
+        help=(
+            "Camera rotation difference that counts as roughly one diversity unit. "
+            f"Default: {DEFAULT_DIVERSE_ROTATION_SCALE_DEG:g} deg."
+        ),
+    )
+    parser.add_argument(
+        "--diverse-min-score",
+        type=float,
+        default=0.75,
+        help="Stop selecting extra frames once the best remaining pose distance is below this score. Default: 0.75.",
     )
     args = parser.parse_args()
 
@@ -503,6 +694,34 @@ def scan_video(record_dir: Path, side: str, metadata: dict[str, Any], out_dir: P
     frames_meta = read_jsonl(record_dir / f"{side}_frames.jsonl")
     by_index = {int(row["frameIndex"]): row for row in frames_meta}
     video_path = record_dir / f"{side}_recording.mp4"
+    candidate_frame_indices: set[int] | None = None
+    selection_summary: dict[str, Any] = {
+        "enabled": False,
+        "input_count": len(frames_meta),
+        "selected_count": len(frames_meta),
+        "reason": "disabled",
+    }
+    if not getattr(args, "disable_diverse_frame_selection", False):
+        pose_positions, pose_rotations, pose_frame_indices = metadata_pose_arrays(frames_meta)
+        selected_local, selection_summary = diverse_pose_indices(
+            pose_positions,
+            pose_rotations,
+            int(args.max_diverse_detection_frames_per_side),
+            int(args.min_diverse_frames_per_side),
+            float(args.diverse_translation_scale_m),
+            float(args.diverse_rotation_scale_deg),
+            float(args.diverse_min_score),
+        )
+        if len(pose_frame_indices) == 0:
+            candidate_frame_indices = None
+            selection_summary = {
+                "enabled": True,
+                "input_count": len(frames_meta),
+                "selected_count": len(frames_meta),
+                "reason": "missing_pose_metadata_fallback_all_frames",
+            }
+        else:
+            candidate_frame_indices = {int(pose_frame_indices[i]) for i in selected_local}
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -537,7 +756,7 @@ def scan_video(record_dir: Path, side: str, metadata: dict[str, Any], out_dir: P
         if not ok:
             break
         meta = by_index.get(frame_index)
-        if meta is not None:
+        if meta is not None and (candidate_frame_indices is None or frame_index in candidate_frame_indices):
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             found, corners, method = detect_corners(gray, pattern)
             if found and corners is not None:
@@ -643,6 +862,7 @@ def scan_video(record_dir: Path, side: str, metadata: dict[str, Any], out_dir: P
         "first_detection_frame": int(frame_indices[0]) if frame_indices else None,
         "last_detection_frame": int(frame_indices[-1]) if frame_indices else None,
         "reprojection_error_px": stats(reproj),
+        "diverse_frame_selection": selection_summary,
         "red_anchor": {
             "enabled": not args.disable_red_anchor,
             "ok_count": int(np.sum(anchor_ok_arr)),
@@ -650,8 +870,8 @@ def scan_video(record_dir: Path, side: str, metadata: dict[str, Any], out_dir: P
             "observed_index_counts": anchor_counts,
             "corner_indices": [int(v) for v in red_corner_indices],
         },
-        "npz": str(npz_path.relative_to(ROOT)),
-        "best_overlay": str(overlay_path.relative_to(ROOT)) if overlay_path else None,
+        "npz": display_path(npz_path),
+        "best_overlay": display_path(overlay_path) if overlay_path else None,
     }
 
 
@@ -714,7 +934,7 @@ def read_existing_detection_summary(records: list[str], detections_root: Path, o
                     "first_detection_frame": int(det["frame_indices"][0]) if len(det["frame_indices"]) else None,
                     "last_detection_frame": int(det["frame_indices"][-1]) if len(det["frame_indices"]) else None,
                     "reprojection_error_px": stats(reproj),
-                    "npz": str(path.relative_to(ROOT)),
+                    "npz": display_path(path),
                     "best_overlay": None,
                 }
             )
@@ -820,6 +1040,76 @@ def build_batches(
                 )
             )
     return batches
+
+
+def select_diverse_batch_frames(batch: Batch, args: argparse.Namespace) -> tuple[np.ndarray, dict[str, Any]]:
+    if getattr(args, "disable_diverse_frame_selection", False):
+        idx = np.arange(len(batch.frame_indices), dtype=int)
+        return idx, {
+            "enabled": False,
+            "record": batch.record,
+            "side": batch.side,
+            "input_frames": int(len(idx)),
+            "selected_frames": int(len(idx)),
+            "reason": "disabled",
+        }
+    selected, summary = diverse_pose_indices(
+        batch.camera_positions,
+        batch.camera_rotations,
+        int(args.max_diverse_fit_frames_per_side),
+        int(args.min_diverse_frames_per_side),
+        float(args.diverse_translation_scale_m),
+        float(args.diverse_rotation_scale_deg),
+        float(args.diverse_min_score),
+    )
+    summary.update(
+        {
+            "record": batch.record,
+            "side": batch.side,
+            "input_frames": int(len(batch.frame_indices)),
+            "selected_frames": int(len(selected)),
+        }
+    )
+    return selected, summary
+
+
+def apply_diverse_batch_selection(batches: list[Batch], args: argparse.Namespace) -> tuple[list[Batch], dict[str, Any]]:
+    selected_batches: list[Batch] = []
+    rows = []
+    input_frames = 0
+    selected_frames = 0
+    for batch in batches:
+        input_frames += int(len(batch.frame_indices))
+        idx, row = select_diverse_batch_frames(batch, args)
+        rows.append(row)
+        selected_frames += int(len(idx))
+        if len(idx) == 0:
+            continue
+        selected_batches.append(
+            Batch(
+                record=batch.record,
+                side=batch.side,
+                frame_indices=batch.frame_indices[idx],
+                times=batch.times[idx],
+                corners=batch.corners[idx],
+                camera_positions=batch.camera_positions[idx],
+                camera_rotations=batch.camera_rotations[idx],
+                red_anchor_observed_indices=batch.red_anchor_observed_indices[idx],
+                red_anchor_best_scores=batch.red_anchor_best_scores[idx],
+                red_anchor_score_ratios=batch.red_anchor_score_ratios[idx],
+                red_anchor_target_indices=batch.red_anchor_target_indices[idx],
+                red_anchor_orders=batch.red_anchor_orders[idx],
+            )
+        )
+    return selected_batches, {
+        "enabled": not getattr(args, "disable_diverse_frame_selection", False),
+        "input_frames": int(input_frames),
+        "selected_frames": int(selected_frames),
+        "selected_fraction": float(selected_frames / input_frames) if input_frames else 0.0,
+        "max_fit_frames_per_side": int(args.max_diverse_fit_frames_per_side),
+        "min_frames_per_side": int(args.min_diverse_frames_per_side),
+        "rows": rows,
+    }
 
 
 def initial_params(records: list[str], raw_root: Path, detections_root: Path, args: argparse.Namespace, intr_scale: float) -> np.ndarray:
@@ -1354,9 +1644,10 @@ def _fit_per_record_fixed_y_axis(records: list[str], raw_root: Path, detections_
         corrected_orders=corrected_orders,
         corrected_keep=corrected_keep,
     )
+    final_batches, diverse_fit_summary = apply_diverse_batch_selection(final_batches, args)
     if not final_batches:
         raise CalibrationFailure(
-            "All frames were rejected by the final corner-order/reprojection quality gate.",
+            "All frames were rejected by the final corner-order/reprojection quality gate or diverse frame selector.",
             order_failure_diagnostics(
                 records,
                 args,
@@ -1431,6 +1722,14 @@ def _fit_per_record_fixed_y_axis(records: list[str], raw_root: Path, detections_
             "min_best_second_ratio": RED_ANCHOR_MIN_BEST_SECOND_RATIO,
         },
         "order_summary": final_order_summary,
+        "diverse_frame_selection": {
+            "enabled": not getattr(args, "disable_diverse_frame_selection", False),
+            "detection_max_frames_per_side": int(args.max_diverse_detection_frames_per_side),
+            "fit": diverse_fit_summary,
+            "translation_scale_m": float(args.diverse_translation_scale_m),
+            "rotation_scale_deg": float(args.diverse_rotation_scale_deg),
+            "min_score": float(args.diverse_min_score),
+        },
         "final_cost": float(final.cost),
         "final_status": int(final.status),
         "final_message": final.message,
@@ -1662,6 +1961,13 @@ def write_json(value: Any, path: Path) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
 def write_report(final: dict[str, Any], path: Path) -> None:
     overall = final["stats"]["overall"]
     order = final["order_summary"]
@@ -1691,6 +1997,18 @@ def write_report(final: dict[str, Any], path: Path) -> None:
         f"- Right fxfycxcy: {json.dumps(final['right_intrinsics_fxfycxcy'])}",
         "",
     ]
+    diverse = final.get("diverse_frame_selection") if isinstance(final.get("diverse_frame_selection"), dict) else {}
+    fit_diverse = diverse.get("fit") if isinstance(diverse.get("fit"), dict) else {}
+    if diverse:
+        lines += [
+            "## Diverse Frame Selection",
+            "",
+            f"- Enabled: {bool(diverse.get('enabled'))}",
+            f"- Detection max per side: {diverse.get('detection_max_frames_per_side')}",
+            f"- Fit frames: {fit_diverse.get('selected_frames')} / {fit_diverse.get('input_frames')}",
+            f"- Pose scales: {diverse.get('translation_scale_m')} m, {diverse.get('rotation_scale_deg')} deg",
+            "",
+        ]
     if final.get("image_y_axis_auto_candidates"):
         lines += [
             "## Image Y-Axis Auto Candidates",
@@ -1743,6 +2061,7 @@ def compact_result(final: dict[str, Any]) -> dict[str, Any]:
             )
             if key in final["order_summary"]
         },
+        "diverse_frame_selection": final.get("diverse_frame_selection"),
         "per_record_t_world_board_translation_m": {
             record: row["T_world_board"]["translation_m"]
             for record, row in final["per_record_calibration"].items()

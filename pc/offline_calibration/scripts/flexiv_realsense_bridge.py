@@ -39,6 +39,11 @@ DEFAULT_CONTROLLER_MAX_OFFSET_M = 0.18
 DEFAULT_CONTROLLER_MAX_STEP_M = 0.015
 DEFAULT_CONTROLLER_MAX_ROTATION_DEG = 30.0
 DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG = 2.0
+DEFAULT_HAND_EYE_MAX_DIVERSE_SAMPLES = 120
+DEFAULT_HAND_EYE_MIN_DIVERSE_SAMPLES = 20
+DEFAULT_HAND_EYE_DIVERSE_TRANSLATION_SCALE_M = 0.02
+DEFAULT_HAND_EYE_DIVERSE_ROTATION_SCALE_DEG = 3.0
+DEFAULT_HAND_EYE_DIVERSE_MIN_SCORE = 0.75
 DEFAULT_GRIPPER_DEVICE = "gripper"
 DEFAULT_GRIPPER_OPEN_WIDTH_M = 0.08
 DEFAULT_GRIPPER_CLOSE_WIDTH_M = 0.0
@@ -102,6 +107,12 @@ class FlexivRealSenseConfig:
     square_size_m: float = DEFAULT_SQUARE_SIZE_M
     run_hand_eye: bool = True
     min_hand_eye_detections: int = 6
+    hand_eye_max_diverse_samples: int = DEFAULT_HAND_EYE_MAX_DIVERSE_SAMPLES
+    hand_eye_min_diverse_samples: int = DEFAULT_HAND_EYE_MIN_DIVERSE_SAMPLES
+    hand_eye_diverse_translation_scale_m: float = DEFAULT_HAND_EYE_DIVERSE_TRANSLATION_SCALE_M
+    hand_eye_diverse_rotation_scale_deg: float = DEFAULT_HAND_EYE_DIVERSE_ROTATION_SCALE_DEG
+    hand_eye_diverse_min_score: float = DEFAULT_HAND_EYE_DIVERSE_MIN_SCORE
+    hand_eye_disable_diverse_selection: bool = False
     controller_motion_enabled: bool = False
     controller_translation_scale: float = DEFAULT_CONTROLLER_TRANSLATION_SCALE
     controller_max_offset_m: float = DEFAULT_CONTROLLER_MAX_OFFSET_M
@@ -1293,6 +1304,8 @@ class FlexivRealSenseManager:
                 ("fps", "fps"),
                 ("warmupFrames", "warmup_frames"),
                 ("minHandEyeDetections", "min_hand_eye_detections"),
+                ("handEyeMaxDiverseSamples", "hand_eye_max_diverse_samples"),
+                ("handEyeMinDiverseSamples", "hand_eye_min_diverse_samples"),
             ):
                 if key in payload and is_number(payload[key]):
                     setattr(self.config, attr, int(payload[key]))
@@ -1312,6 +1325,15 @@ class FlexivRealSenseManager:
                 self.config.board_check_warmup_frames = max(1, int(payload["boardCheckWarmupFrames"]))
             if "runHandEye" in payload:
                 self.config.run_hand_eye = bool(payload["runHandEye"])
+            if "handEyeDisableDiverseSelection" in payload:
+                self.config.hand_eye_disable_diverse_selection = bool(payload["handEyeDisableDiverseSelection"])
+            for key, attr in (
+                ("handEyeDiverseTranslationScaleM", "hand_eye_diverse_translation_scale_m"),
+                ("handEyeDiverseRotationScaleDeg", "hand_eye_diverse_rotation_scale_deg"),
+                ("handEyeDiverseMinScore", "hand_eye_diverse_min_score"),
+            ):
+                if key in payload and is_number(payload[key]):
+                    setattr(self.config, attr, float(payload[key]))
             if "controllerMotionEnabled" in payload:
                 self.config.controller_motion_enabled = bool(payload["controllerMotionEnabled"])
             if "controllerTranslationScale" in payload and is_number(payload["controllerTranslationScale"]):
@@ -1601,6 +1623,7 @@ class FlexivRealSenseManager:
                 self.config.pattern_rows,
                 self.config.square_size_m,
                 self.config.min_hand_eye_detections,
+                self.config,
             )
             result["questAlignment"] = build_quest_robot_alignment(result, quest_calibration_event)
             write_json(result, session_dir / "robot_hand_eye_result.json")
@@ -1778,6 +1801,7 @@ def calibrate_robot_realsense_run(
     rows: int,
     square_size_m: float,
     min_detections: int,
+    config: FlexivRealSenseConfig | None = None,
 ) -> dict[str, Any]:
     from scipy.optimize import least_squares
     from scipy.spatial.transform import Rotation
@@ -1790,12 +1814,14 @@ def calibrate_robot_realsense_run(
     if not isinstance(camera, dict):
         raise ValueError("missing end camera metadata")
 
+    config = config or FlexivRealSenseConfig()
+    selected_samples, sample_selection = select_diverse_hand_eye_samples(samples, config)
     observations = []
     overlay_dir = run_dir / "detections"
     overlay_dir.mkdir(parents=True, exist_ok=True)
     video_cache: dict[str, cv2.VideoCapture] = {}
     try:
-        for sample in samples:
+        for sample in selected_samples:
             if not sample.get("ok"):
                 continue
             t_base_ee = transform_from_json(sample.get("T_base_tool_tcp"))
@@ -1825,8 +1851,10 @@ def calibrate_robot_realsense_run(
 
     counts = {
         "samples": len(samples),
+        "selectedSamples": len(selected_samples),
         "detections": len(observations),
         "requiredDetections": int(min_detections),
+        "sampleSelection": sample_selection,
     }
     if len(observations) < int(min_detections):
         raise RobotHandEyeCalibrationError(
@@ -1918,6 +1946,134 @@ def load_end_observation_frame(
     if not ok or image is None:
         return None
     return {"image": image, "label": f"{video_path}#frame={index}"}
+
+
+def select_diverse_hand_eye_samples(
+    samples: list[dict[str, Any]],
+    config: FlexivRealSenseConfig,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    candidates: list[tuple[int, dict[str, Any], np.ndarray]] = []
+    for index, sample in enumerate(samples):
+        if not sample.get("ok"):
+            continue
+        transform = transform_from_json(sample.get("T_base_tool_tcp"))
+        if transform is None:
+            transform = transform_from_json(sample.get("T_base_ee"))
+        if transform is None:
+            continue
+        candidates.append((index, sample, transform))
+    if config.hand_eye_disable_diverse_selection:
+        return [sample for _, sample, _ in candidates], {
+            "enabled": False,
+            "inputSamples": len(samples),
+            "candidateSamples": len(candidates),
+            "selectedSamples": len(candidates),
+            "reason": "disabled",
+        }
+    if not candidates:
+        return [], {
+            "enabled": True,
+            "inputSamples": len(samples),
+            "candidateSamples": 0,
+            "selectedSamples": 0,
+            "reason": "no_pose_candidates",
+        }
+    max_count = max(1, int(config.hand_eye_max_diverse_samples))
+    min_count = max(1, int(config.hand_eye_min_diverse_samples))
+    if len(candidates) <= max_count:
+        return [sample for _, sample, _ in candidates], {
+            "enabled": True,
+            "inputSamples": len(samples),
+            "candidateSamples": len(candidates),
+            "selectedSamples": len(candidates),
+            "reason": "candidate_below_limit",
+            "poseSpan": transform_pose_span([matrix for _, _, matrix in candidates]),
+        }
+    selected_indices, summary = select_diverse_transforms(
+        [matrix for _, _, matrix in candidates],
+        max_count=max_count,
+        min_count=min_count,
+        translation_scale_m=float(config.hand_eye_diverse_translation_scale_m),
+        rotation_scale_deg=float(config.hand_eye_diverse_rotation_scale_deg),
+        min_score=float(config.hand_eye_diverse_min_score),
+    )
+    selected_set = {int(i) for i in selected_indices}
+    selected = [sample for local_index, (_, sample, _) in enumerate(candidates) if local_index in selected_set]
+    summary.update(
+        {
+            "inputSamples": len(samples),
+            "candidateSamples": len(candidates),
+            "selectedSamples": len(selected),
+            "selectedOriginalSampleIndices": [int(candidates[i][0]) for i in selected_indices],
+        }
+    )
+    return selected, summary
+
+
+def select_diverse_transforms(
+    transforms: list[np.ndarray],
+    *,
+    max_count: int,
+    min_count: int,
+    translation_scale_m: float,
+    rotation_scale_deg: float,
+    min_score: float,
+) -> tuple[list[int], dict[str, Any]]:
+    count = len(transforms)
+    if count <= 0:
+        return [], {"enabled": True, "reason": "empty"}
+    translations = np.asarray([matrix[:3, 3] for matrix in transforms], dtype=float)
+    rotations = [np.asarray(matrix[:3, :3], dtype=float) for matrix in transforms]
+    center = np.median(translations, axis=0)
+    selected = sorted({0, int(np.argmax(np.linalg.norm(translations - center[None, :], axis=1)))})
+    trans_scale = max(1e-6, float(translation_scale_m))
+    rot_scale = max(1e-6, math.radians(float(rotation_scale_deg)))
+    min_dist = transform_distance_to_set(translations, rotations, selected, trans_scale, rot_scale)
+    while len(selected) < max_count:
+        candidate_scores = min_dist.copy()
+        candidate_scores[selected] = -np.inf
+        candidate = int(np.argmax(candidate_scores))
+        score = float(candidate_scores[candidate])
+        if len(selected) >= min_count and score < float(min_score):
+            break
+        if not math.isfinite(score):
+            break
+        selected.append(candidate)
+        new_dist = transform_distance_to_set(translations, rotations, [candidate], trans_scale, rot_scale)
+        min_dist = np.minimum(min_dist, new_dist)
+        min_dist[selected] = 0.0
+    selected = sorted(set(selected))
+    return selected, {
+        "enabled": True,
+        "reason": "pose_diverse_selection",
+        "maxCount": int(max_count),
+        "minCount": int(min_count),
+        "translationScaleM": trans_scale,
+        "rotationScaleDeg": float(rotation_scale_deg),
+        "minScore": float(min_score),
+        "selectedFraction": float(len(selected) / count),
+        "lastBestScore": float(np.max(min_dist)) if len(min_dist) else 0.0,
+        "poseSpan": transform_pose_span([transforms[i] for i in selected]),
+    }
+
+
+def transform_distance_to_set(
+    translations: np.ndarray,
+    rotations: list[np.ndarray],
+    selected: list[int],
+    translation_scale_m: float,
+    rotation_scale_rad: float,
+) -> np.ndarray:
+    distances = np.full(len(translations), np.inf, dtype=float)
+    for index in selected:
+        translation = np.linalg.norm(translations - translations[index][None, :], axis=1) / translation_scale_m
+        rotation = np.asarray(
+            [rotation_angle_deg(rotations[index].T @ matrix) for matrix in rotations],
+            dtype=float,
+        )
+        rotation = np.deg2rad(rotation) / rotation_scale_rad
+        distances = np.minimum(distances, np.sqrt(translation * translation + rotation * rotation))
+    return distances
 
 
 def validate_hand_eye_solution(
@@ -2229,6 +2385,31 @@ def apply_global_red_anchor_target(observations: list[dict[str, Any]], summary: 
 
 def observation_pose_diversity(observations: list[dict[str, Any]]) -> dict[str, Any]:
     return ee_pose_diversity([np.asarray(obs["T_base_ee"], dtype=float) for obs in observations])
+
+
+def transform_pose_span(poses: list[np.ndarray]) -> dict[str, Any]:
+    if not poses:
+        return {
+            "samples": 0,
+            "translationSpanM": 0.0,
+            "rotationSpanDeg": 0.0,
+            "axisSpanM": [0.0, 0.0, 0.0],
+        }
+    translations = np.asarray([pose[:3, 3] for pose in poses], dtype=float)
+    max_translation = 0.0
+    max_rotation = 0.0
+    for i, a in enumerate(poses):
+        for b in poses[i + 1 :]:
+            delta = invert_transform(a) @ b
+            max_translation = max(max_translation, float(np.linalg.norm(delta[:3, 3])))
+            max_rotation = max(max_rotation, rotation_angle_deg(delta[:3, :3]))
+    axis_span = np.ptp(translations, axis=0) if translations.size else np.zeros(3, dtype=float)
+    return {
+        "samples": len(poses),
+        "translationSpanM": float(max_translation),
+        "rotationSpanDeg": float(max_rotation),
+        "axisSpanM": [float(v) for v in axis_span],
+    }
 
 
 def ee_pose_diversity(poses: list[np.ndarray]) -> dict[str, Any]:
@@ -2971,6 +3152,12 @@ def config_to_json(config: FlexivRealSenseConfig) -> dict[str, Any]:
         "squareSizeM": config.square_size_m,
         "runHandEye": config.run_hand_eye,
         "minHandEyeDetections": config.min_hand_eye_detections,
+        "handEyeMaxDiverseSamples": config.hand_eye_max_diverse_samples,
+        "handEyeMinDiverseSamples": config.hand_eye_min_diverse_samples,
+        "handEyeDiverseTranslationScaleM": config.hand_eye_diverse_translation_scale_m,
+        "handEyeDiverseRotationScaleDeg": config.hand_eye_diverse_rotation_scale_deg,
+        "handEyeDiverseMinScore": config.hand_eye_diverse_min_score,
+        "handEyeDisableDiverseSelection": config.hand_eye_disable_diverse_selection,
         "controllerMotionEnabled": config.controller_motion_enabled,
         "controllerTranslationScale": config.controller_translation_scale,
         "controllerMaxOffsetM": config.controller_max_offset_m,
