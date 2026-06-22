@@ -8,6 +8,7 @@ import math
 import os
 import posixpath
 import queue
+import shutil
 import socket
 import subprocess
 import sys
@@ -973,6 +974,7 @@ class LiveTelemetryVisualizer:
         self.history: list[dict[str, Any]] = []
         self.clients: list[queue.Queue[str | None]] = []
         self.lock = threading.Lock()
+        self.calibration_state_cleared = False
         self.udp_status: dict[str, Any] = {
             "listening": False,
             "bind": None,
@@ -1042,6 +1044,8 @@ class LiveTelemetryVisualizer:
             self.udp_status["lastBytes"] = int(byte_count)
 
     def publish_event(self, event: dict[str, Any]) -> None:
+        if event.get("type") in ("calibration_result", "robot_calibration_result"):
+            self.calibration_state_cleared = False
         payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         with self.lock:
             self.history.append(event)
@@ -1059,11 +1063,22 @@ class LiveTelemetryVisualizer:
         if self.robot_manager is None:
             return {"ok": False, "enabled": False, "reason": "disabled"}
         payload = self.robot_manager.status()
-        if not isinstance(payload.get("lastCalibration"), dict):
+        if not self.calibration_state_cleared and not isinstance(payload.get("lastCalibration"), dict):
             latest = latest_robot_calibration_event(self.calibration_raw_root, self.calibration_output_root, self.recording_root)
             if latest is not None:
                 payload["lastCalibration"] = latest
         return payload
+
+    def clear_calibration_payload(self) -> dict[str, Any]:
+        self.calibration_state_cleared = True
+        result = clear_latest_calibration_state(
+            self.calibration_raw_root,
+            self.calibration_output_root,
+            self.robot_manager,
+        )
+        self.publish_event({"type": "calibration_cleared", **result})
+        self.publish_event({"type": "robot_calibration_cleared", **result})
+        return result
 
     def camera_list_payload(self) -> dict[str, Any]:
         if self.robot_manager is None:
@@ -1357,6 +1372,9 @@ class LiveTelemetryVisualizer:
                         return
                     if parsed.path == "/quest/adb/calibration-command":
                         self._send_json(visualizer.quest_adb_calibration_command_payload(payload))
+                        return
+                    if parsed.path == "/calibration/clear":
+                        self._send_json(visualizer.clear_calibration_payload())
                         return
                     self.send_error(404)
                 except Exception as exc:
@@ -1966,6 +1984,14 @@ class PcCalibrationSession:
         self.publish_status("done", 1.0, "Calibration complete", resultPath=str(result_path))
         if self.robot_manager is not None and self.robot_realsense_directory is not None:
             self._run_robot_hand_eye_worker(event)
+        cleanup = keep_only_latest_calibration_state(
+            self.raw_root,
+            self.output_root,
+            self.raw_record_name,
+            self.output_directory.name,
+        )
+        if self.visualizer is not None and cleanup.get("removed"):
+            self.visualizer.publish_event({"type": "calibration_retained_latest", **cleanup})
 
     def _run_robot_hand_eye_worker(self, quest_calibration_event: dict[str, Any] | None) -> None:
         if self.robot_manager is None or self.robot_realsense_directory is None:
@@ -4978,6 +5004,87 @@ def latest_calibration_snapshot(output_root: Path) -> dict[str, Any]:
     return {"ok": True, **latest_failure, "latestFailure": latest_failure}
 
 
+def calibration_session_dirs(root: Path | None) -> list[Path]:
+    if root is None:
+        return []
+    resolved = root.resolve()
+    if not resolved.exists():
+        return []
+    return [
+        path
+        for path in resolved.iterdir()
+        if path.is_dir() and path.name.startswith("record_pc_calib")
+    ]
+
+
+def remove_directory_inside_root(path: Path, root: Path) -> bool:
+    resolved_root = root.resolve()
+    resolved_path = path.resolve()
+    if resolved_path == resolved_root or resolved_root not in resolved_path.parents:
+        raise ValueError(f"refusing to remove path outside calibration root: {resolved_path}")
+    shutil.rmtree(resolved_path)
+    return True
+
+
+def remove_calibration_dirs(paths: list[Path], roots: list[Path]) -> list[str]:
+    removed: list[str] = []
+    resolved_roots = [root.resolve() for root in roots if root is not None]
+    for path in paths:
+        if not path.exists():
+            continue
+        matching_root = next((root for root in resolved_roots if root in path.resolve().parents), None)
+        if matching_root is None:
+            continue
+        remove_directory_inside_root(path, matching_root)
+        removed.append(str(path.resolve()))
+    return removed
+
+
+def keep_only_latest_calibration_state(
+    raw_root: Path | None,
+    output_root: Path | None,
+    keep_raw_name: str,
+    keep_output_name: str,
+) -> dict[str, Any]:
+    roots = [root.resolve() for root in (raw_root, output_root) if root is not None]
+    remove: list[Path] = []
+    for root in roots:
+        for path in calibration_session_dirs(root):
+            if path.name in (keep_raw_name, keep_output_name):
+                continue
+            remove.append(path)
+    removed = remove_calibration_dirs(remove, roots)
+    return {
+        "ok": True,
+        "removed": removed,
+        "removedCount": len(removed),
+        "keptRawName": keep_raw_name,
+        "keptOutputName": keep_output_name,
+    }
+
+
+def clear_latest_calibration_state(
+    raw_root: Path | None,
+    output_root: Path | None,
+    robot_manager: FlexivRealSenseManager | None = None,
+) -> dict[str, Any]:
+    roots = [root.resolve() for root in (raw_root, output_root) if root is not None]
+    candidates: list[Path] = []
+    for root in roots:
+        candidates.extend(calibration_session_dirs(root))
+    removed = remove_calibration_dirs(candidates, roots)
+    if robot_manager is not None:
+        with robot_manager.lock:
+            robot_manager.last_calibration = None
+    return {
+        "ok": True,
+        "cleared": True,
+        "removed": removed,
+        "removedCount": len(removed),
+        "message": "Calibration state cleared",
+    }
+
+
 def calibration_artifacts(output_directory: Path, diagnostics: dict[str, Any], detection_summary: Any) -> dict[str, Any]:
     overlays: list[dict[str, Any]] = []
     rows = detection_summary if isinstance(detection_summary, list) else diagnostics.get("detection_summary")
@@ -5684,6 +5791,16 @@ button {
   padding: 7px 9px;
 }
 button:hover { background: #2d343c; }
+button.danger {
+  background: #4a171d;
+  border-color: #8f2b38;
+  color: #ffe5e8;
+}
+button.danger:hover,
+button.danger.confirm {
+  background: #842330;
+  border-color: #ff5d70;
+}
 .checks {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -5718,6 +5835,12 @@ label {
 .metric {
   border-top: 1px solid var(--line);
   padding: 8px 0;
+}
+.metric-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 .metric strong {
   color: var(--muted);
@@ -5998,7 +6121,10 @@ label {
       <div id="preflightList" class="preflight-list"></div>
     </div>
     <div class="metric">
-      <strong>Calibration</strong><span id="mCalibration">idle</span>
+      <div class="metric-head">
+        <div><strong>Calibration</strong><span id="mCalibration">idle</span></div>
+        <button id="clearCalibration" class="danger" type="button">Clear</button>
+      </div>
       <div class="calibration-progress"><div id="mCalibrationFill" class="calibration-progress-fill"></div></div>
     </div>
     <div id="calibrationDetails" class="calibration-details"></div>
@@ -6167,6 +6293,7 @@ const mCurrent = document.getElementById('mCurrent');
 const mCounts = document.getElementById('mCounts');
 const mCalibration = document.getElementById('mCalibration');
 const mCalibrationFill = document.getElementById('mCalibrationFill');
+const clearCalibration = document.getElementById('clearCalibration');
 const preflightRefresh = document.getElementById('preflightRefresh');
 const preflightStatus = document.getElementById('preflightStatus');
 const preflightList = document.getElementById('preflightList');
@@ -6251,6 +6378,7 @@ const state = {
   robotCalibrationKey: null,
   viewFitTimer: null,
   latestCalibrationRecordId: null,
+  clearCalibrationConfirmUntilMs: 0,
   questAdb: null,
   preflight: null,
   lastPreflightRefreshMs: 0
@@ -6368,6 +6496,10 @@ function connect() {
       updateRobotGripper(sample);
     } else if (sample.type === 'robot_calibration_result' || sample.type === 'robot_calibration_failure') {
       updateRobotCalibration(sample);
+    } else if (sample.type === 'calibration_cleared') {
+      applyCalibrationCleared(sample);
+    } else if (sample.type === 'robot_calibration_cleared') {
+      applyRobotCalibrationCleared(sample);
     } else if (sample.type === 'quest_adb_status') {
       renderQuestAdb(sample);
     }
@@ -6845,6 +6977,13 @@ function updateRobotCalibration(event) {
   renderRobotStatus(state.robot);
 }
 
+function applyRobotCalibrationCleared(event) {
+  state.robotCalibration = null;
+  state.robotCalibrationKey = null;
+  state.robotWorldBase = null;
+  renderRobotStatus(state.robot);
+}
+
 function robotCalibrationKey(event) {
   if (!event) return '';
   return String(event.sourcePath || event.runDir || event.recordId || JSON.stringify(event.T_world_base?.matrix_4x4 || null));
@@ -7299,6 +7438,57 @@ function updateCalibrationFailure(event) {
   mCalibration.textContent = `failed ${event.reasonCode || ''}`.trim();
   mCalibrationFill.style.width = '100%';
   renderCalibrationDiagnostics(event);
+}
+
+function applyCalibrationCleared(event) {
+  state.calibration = null;
+  state.latestCalibrationRecordId = null;
+  state.origin = [0, 0, 0];
+  state.target = [0, 0, 0];
+  mCalibration.textContent = event?.removedCount ? `cleared ${event.removedCount}` : 'idle';
+  mCalibrationFill.style.width = '0%';
+  calibrationDetails.innerHTML = '<div class="calibration-alert">Calibration cleared. Using default board at origin.</div>';
+  requestViewFit();
+  loadPreflightStatus();
+}
+
+async function clearCalibrationClick() {
+  const now = performance.now();
+  if (now > state.clearCalibrationConfirmUntilMs) {
+    state.clearCalibrationConfirmUntilMs = now + 3500;
+    clearCalibration.textContent = 'Confirm Clear';
+    clearCalibration.classList.add('confirm');
+    window.setTimeout(() => {
+      if (performance.now() > state.clearCalibrationConfirmUntilMs) {
+        clearCalibration.textContent = 'Clear';
+        clearCalibration.classList.remove('confirm');
+      }
+    }, 3600);
+    return;
+  }
+  state.clearCalibrationConfirmUntilMs = 0;
+  clearCalibration.disabled = true;
+  clearCalibration.textContent = 'Clearing...';
+  clearCalibration.classList.remove('confirm');
+  try {
+    const response = await fetch('/calibration/clear', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: '{}'
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.error || payload.reason || `HTTP ${response.status}`);
+    }
+    applyCalibrationCleared(payload);
+    applyRobotCalibrationCleared(payload);
+    await loadRobotStatus();
+  } catch (error) {
+    calibrationDetails.innerHTML = `<div class="calibration-alert">${escapeHtml(String(error))}</div>`;
+  } finally {
+    clearCalibration.disabled = false;
+    clearCalibration.textContent = 'Clear';
+  }
 }
 
 function renderCalibrationResult(event) {
@@ -8010,6 +8200,7 @@ robotDiagnostics.addEventListener('click', runRobotDiagnostics);
 robotConnect.addEventListener('click', connectRobot);
 robotDisconnect.addEventListener('click', disconnectRobot);
 preflightRefresh.addEventListener('click', loadPreflightStatus);
+clearCalibration.addEventListener('click', clearCalibrationClick);
 questAdbRefresh.addEventListener('click', loadQuestAdbStatus);
 questCalibStart.addEventListener('click', () => sendQuestCalibrationCommand('calib_start'));
 questCalibStop.addEventListener('click', () => sendQuestCalibrationCommand('calib_stop'));
