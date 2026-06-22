@@ -19,8 +19,9 @@ from scipy.spatial.transform import Rotation, Slerp
 from quest_coordinate_frames import (
     PC_WORLD_FRAME,
     UNITY_WORLD_FRAME,
+    UNITY_TO_PC_ROTATION_3X3,
     WORLD_FRAME_CONVERSION,
-    unity_transform_matrix_to_pc,
+    pc_transform_matrix_to_unity,
 )
 from checkerboard_orientation import (
     detect_checkerboard_appearance_anchor,
@@ -64,8 +65,16 @@ class PoseSeries:
     def from_jsonl(cls, path: Path) -> "PoseSeries":
         rows = read_jsonl(path)
         times = np.asarray([row["unityTimestampSeconds"] for row in rows], dtype=float)
-        positions = np.asarray([row["pose"][:3] for row in rows], dtype=float)
-        rotations = Rotation.from_quat([[row["pose"][4], row["pose"][5], row["pose"][6], row["pose"][3]] for row in rows])
+        positions = UNITY_TO_PC_ROTATION_3X3 @ np.asarray([row["pose"][:3] for row in rows], dtype=float).T
+        positions = positions.T
+        rotations = Rotation.from_matrix(
+            [
+                UNITY_TO_PC_ROTATION_3X3
+                @ Rotation.from_quat([row["pose"][4], row["pose"][5], row["pose"][6], row["pose"][3]]).as_matrix()
+                @ UNITY_TO_PC_ROTATION_3X3.T
+                for row in rows
+            ]
+        )
         return cls(times=times, positions=positions, rotations=rotations, slerp=Slerp(times, rotations))
 
     def sample(self, query_times: np.ndarray) -> tuple[np.ndarray, Rotation, np.ndarray]:
@@ -216,21 +225,23 @@ def pose_selection_span(positions: np.ndarray, rotations: Rotation) -> dict[str,
 
 def metadata_pose_arrays(rows: list[dict[str, Any]]) -> tuple[np.ndarray, Rotation, list[int]]:
     positions = []
-    quats_xyzw = []
+    rotation_matrices = []
     frame_indices = []
     for row in rows:
         pose = row.get("pose")
         if not isinstance(pose, list) or len(pose) < 7:
             continue
         try:
-            positions.append([float(pose[0]), float(pose[1]), float(pose[2])])
-            quats_xyzw.append([float(pose[4]), float(pose[5]), float(pose[6]), float(pose[3])])
+            position_unity = np.asarray([float(pose[0]), float(pose[1]), float(pose[2])], dtype=float)
+            rotation_unity = Rotation.from_quat([float(pose[4]), float(pose[5]), float(pose[6]), float(pose[3])]).as_matrix()
+            positions.append((UNITY_TO_PC_ROTATION_3X3 @ position_unity).tolist())
+            rotation_matrices.append(UNITY_TO_PC_ROTATION_3X3 @ rotation_unity @ UNITY_TO_PC_ROTATION_3X3.T)
             frame_indices.append(int(row["frameIndex"]))
         except (KeyError, TypeError, ValueError):
             continue
     if not positions:
         return np.zeros((0, 3), dtype=float), Rotation.identity(0), []
-    return np.asarray(positions, dtype=float), Rotation.from_quat(quats_xyzw), frame_indices
+    return np.asarray(positions, dtype=float), Rotation.from_matrix(rotation_matrices), frame_indices
 
 
 def main() -> int:
@@ -420,8 +431,8 @@ def main() -> int:
         raise SystemExit(f"Calibration failed: {diagnostics.get('reason')}")
     result["description"] = (
         "Per-record calibration from recorded passthrough videos and recorded passthrough camera poses. "
-        "The fit runs in the raw Unity trajectory frame, then T_world_board is exported in the PC "
-        "right-handed Z-up world frame; T_unity_world_board preserves the raw Unity result."
+        "Unity poses are converted once into the PC right-handed Z-up world frame before fitting; "
+        "T_unity_world_board is exported only as a Unity-frame diagnostic."
     )
     result["records"] = records
     result["pattern"] = [args.pattern_cols, args.pattern_rows]
@@ -429,7 +440,8 @@ def main() -> int:
     result["detection_summary"] = detection_summary
     result["red_anchor_global"] = red_anchor_global
     result["coordinate_frame"] = PC_WORLD_FRAME
-    result["raw_trajectory_frame"] = UNITY_WORLD_FRAME
+    result["raw_trajectory_frame"] = PC_WORLD_FRAME
+    result["source_trajectory_frame"] = UNITY_WORLD_FRAME
     result["world_frame_conversion"] = WORLD_FRAME_CONVERSION
 
     emit_progress("writing", 0.95, records=records)
@@ -1280,7 +1292,6 @@ def triangulate_initial_pose(record: str, raw_root: Path, detections_root: Path,
     metadata = json.loads((raw_root / record / "quest_camera_metadata.json").read_text(encoding="utf-8"))
     k_left = camera_matrix(metadata["leftIntrinsics"])
     k_right = camera_matrix(metadata["rightIntrinsics"])
-    ray_map = np.diag([1.0, image_y_sign(args), 1.0])
     order_180 = rot180_index(args)
     left = load_detection(record, "left", detections_root)
     right = load_detection(record, "right", detections_root)
@@ -1295,10 +1306,9 @@ def triangulate_initial_pose(record: str, raw_root: Path, detections_root: Path,
     per_corner: list[list[np.ndarray]] = [[] for _ in range(args.pattern_cols * args.pattern_rows)]
 
     def rays(corners: np.ndarray, k: np.ndarray) -> np.ndarray:
-        x = (corners[:, 0] - k[0, 2]) / k[0, 0]
-        y = (corners[:, 1] - k[1, 2]) / k[1, 1]
-        cv = np.column_stack([x, y, np.ones_like(x)])
-        local = cv @ ray_map.T
+        px = (corners[:, 0] - k[0, 2]) / k[0, 0]
+        py = (corners[:, 1] - k[1, 2]) / k[1, 1]
+        local = np.column_stack([np.ones_like(px), -px, image_y_sign(args) * py])
         return local / np.linalg.norm(local, axis=1, keepdims=True)
 
     for frame_index in common:
@@ -1336,7 +1346,10 @@ def triangulate_initial_pose(record: str, raw_root: Path, detections_root: Path,
     obj = object_points(args)
     valid = np.all(np.isfinite(dst_arr), axis=1)
     if int(valid.sum()) < 20:
-        return Rotation.from_euler("xyz", [90, 0, 0], degrees=True).as_rotvec(), np.asarray([0.2, 1.35, -0.2], dtype=float)
+        unity_fallback_rot = Rotation.from_euler("xyz", [90, 0, 0], degrees=True).as_matrix()
+        fallback_rot = UNITY_TO_PC_ROTATION_3X3 @ unity_fallback_rot @ UNITY_TO_PC_ROTATION_3X3.T
+        fallback_t = UNITY_TO_PC_ROTATION_3X3 @ np.asarray([0.2, 1.35, -0.2], dtype=float)
+        return Rotation.from_matrix(fallback_rot).as_rotvec(), fallback_t
 
     src = obj[valid]
     dst_valid = dst_arr[valid]
@@ -1408,10 +1421,10 @@ def parse_params(params: np.ndarray, records: list[str], args: argparse.Namespac
 
 
 def project_points(points_camera: np.ndarray, intr: np.ndarray, dist: np.ndarray, y_sign: float) -> np.ndarray:
-    z = points_camera[..., 2]
-    z_safe = np.where(z <= 1e-4, 1e-4, z)
-    x = points_camera[..., 0] / z_safe
-    y = y_sign * points_camera[..., 1] / z_safe
+    depth = points_camera[..., 0]
+    depth_safe = np.where(depth <= 1e-4, 1e-4, depth)
+    x = -points_camera[..., 1] / depth_safe
+    y = y_sign * points_camera[..., 2] / depth_safe
     k1, k2 = dist
     r2 = x * x + y * y
     radial = 1.0 + k1 * r2 + k2 * r2 * r2
@@ -1436,7 +1449,7 @@ def residuals(params: np.ndarray, batches: list[Batch], records: list[str], args
         p_camera = np.einsum("nij,nmj->nmi", r_c_w, rel)
         pred = project_points(p_camera, parsed[f"{batch.side}_intr"], parsed[f"{batch.side}_dist"], y_sign)
         chunks.append((pred - batch.corners).reshape(-1))
-        behind = np.minimum(p_camera[..., 2] - 0.05, 0.0)
+        behind = np.minimum(p_camera[..., 0] - 0.05, 0.0)
         behind_chunks.append(behind.reshape(-1) * 1000.0)
     chunks.extend(behind_chunks)
     return np.concatenate(chunks)
@@ -1498,7 +1511,7 @@ def stats_for_params(params: np.ndarray, batches: list[Batch], records: list[str
                 "p95_px": float(np.percentile(err, 95)),
                 "max_px": float(err.max()),
                 "frame_median_px_p90": float(np.percentile(frame_median, 90)),
-                "points_behind_camera": int(np.sum(p_camera[..., 2] <= 0.0)),
+                "points_behind_camera": int(np.sum(p_camera[..., 0] <= 0.0)),
             }
         )
     err = np.concatenate(all_err)
@@ -1827,17 +1840,18 @@ def _fit_per_record_fixed_y_axis(records: list[str], raw_root: Path, detections_
     per_record = {}
     for record in records:
         pose = parsed["records"][record]
-        t_unity_world_board = pose_to_matrix(pose["board_rvec"], pose["board_t"])
-        t_board_unity_world = np.linalg.inv(t_unity_world_board)
-        t_world_board = unity_transform_matrix_to_pc(t_unity_world_board)
+        t_world_board = pose_to_matrix(pose["board_rvec"], pose["board_t"])
         t_board_world = np.linalg.inv(t_world_board)
+        t_unity_world_board = pc_transform_matrix_to_unity(t_world_board)
+        t_board_unity_world = np.linalg.inv(t_unity_world_board)
         twb = transform_doc(t_world_board, PC_WORLD_FRAME)
         tbw = transform_doc(t_board_world, PC_WORLD_FRAME)
         twb_unity = transform_doc(t_unity_world_board, UNITY_WORLD_FRAME)
         tbw_unity = transform_doc(t_board_unity_world, UNITY_WORLD_FRAME)
         per_record[record] = {
             "coordinate_frame": PC_WORLD_FRAME,
-            "raw_trajectory_frame": UNITY_WORLD_FRAME,
+            "raw_trajectory_frame": PC_WORLD_FRAME,
+            "source_trajectory_frame": UNITY_WORLD_FRAME,
             "world_frame_conversion": WORLD_FRAME_CONVERSION,
             "T_world_board": twb,
             "T_board_world": tbw,
@@ -1857,13 +1871,14 @@ def _fit_per_record_fixed_y_axis(records: list[str], raw_root: Path, detections_
     return {
         "model": args.model,
         "coordinate_frame": PC_WORLD_FRAME,
-        "raw_trajectory_frame": UNITY_WORLD_FRAME,
+        "raw_trajectory_frame": PC_WORLD_FRAME,
+        "source_trajectory_frame": UNITY_WORLD_FRAME,
         "world_frame_conversion": WORLD_FRAME_CONVERSION,
         "image_y_axis": getattr(args, "image_y_axis", "down"),
         "image_y_projection": (
-            "pixel_y = -camera_y / camera_z for top-left/y-down video rows"
+            "pixel_y = -camera_up / camera_forward for top-left/y-down video rows"
             if getattr(args, "image_y_axis", "down") == "down"
-            else "pixel_y = +camera_y / camera_z for bottom-left/y-up or vertically flipped video rows"
+            else "pixel_y = +camera_up / camera_forward for bottom-left/y-up or vertically flipped video rows"
         ),
         "best_lag_seconds": lag,
         "left_intrinsics_fxfycxcy": parsed["left_intr"].tolist(),
@@ -2224,13 +2239,14 @@ def write_report(final: dict[str, Any], path: Path) -> None:
         "## Coordinate Frame",
         "",
         f"- Exported world frame: `{final.get('coordinate_frame') or PC_WORLD_FRAME}`",
-        f"- Raw trajectory frame: `{final.get('raw_trajectory_frame') or UNITY_WORLD_FRAME}`",
+        f"- Fit trajectory frame: `{final.get('raw_trajectory_frame') or PC_WORLD_FRAME}`",
+        f"- Source trajectory frame: `{final.get('source_trajectory_frame') or UNITY_WORLD_FRAME}`",
         "- Conversion: `pc = [unity.z, -unity.x, unity.y]`",
         "",
         "## Per-Record T_world_board",
         "",
         "`T_world_board` is in the exported PC right-handed Z-up world frame. "
-        "`T_unity_world_board` keeps the raw Unity fit for diagnostics.",
+        "`T_unity_world_board` is a diagnostic converted back to Unity coordinates.",
         "",
     ]
     for record, row in final["per_record_calibration"].items():
@@ -2252,6 +2268,7 @@ def compact_result(final: dict[str, Any]) -> dict[str, Any]:
         "model": final["model"],
         "coordinate_frame": final.get("coordinate_frame"),
         "raw_trajectory_frame": final.get("raw_trajectory_frame"),
+        "source_trajectory_frame": final.get("source_trajectory_frame"),
         "world_frame_conversion": final.get("world_frame_conversion"),
         "image_y_axis": final.get("image_y_axis"),
         "best_lag_seconds": final["best_lag_seconds"],
