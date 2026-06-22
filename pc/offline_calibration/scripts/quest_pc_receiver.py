@@ -88,7 +88,7 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = WORKSPACE_ROOT / "pc_recordings"
 DEFAULT_QUEST_LOCAL_ROOT = WORKSPACE_ROOT / "raw"
 DEFAULT_CALIBRATION_OUTPUT_ROOT = WORKSPACE_ROOT / "outputs" / "pc_live_calibration"
-DEFAULT_RIZON_URDF = WORKSPACE_ROOT / "assets" / "urdf" / "flexiv_Rizon4R_kinematics.urdf"
+DEFAULT_RIZON_URDF = WORKSPACE_ROOT / "assets" / "urdf" / "flexiv_Rizon4_kinematics.urdf"
 LATE_RECORDING_SAMPLE_GRACE_SECONDS = 5.0
 MAX_CALIBRATION_HTTP_BODY_BYTES = 8 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
@@ -5183,7 +5183,7 @@ def rizon4_model_payload() -> dict[str, Any]:
         "ok": True,
         "name": root.attrib.get("name") or "Rizon4",
         "source": str(DEFAULT_RIZON_URDF),
-        "sourceLabel": "Flexiv RDK 1.8 Rizon4R resources",
+        "sourceLabel": "Flexiv RDK 1.8 Rizon4 resources",
         "joints": joints,
         "links": links,
         "activeJointNames": [joint["name"] for joint in joints if joint.get("type") != "fixed"],
