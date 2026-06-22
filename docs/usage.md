@@ -3,6 +3,56 @@
 This is the operator guide for the Quest 3 PC receiver, live viewer, calibration
 recording, robot/RealSense capture, and replay pages.
 
+## Quick Start on the Lab PC
+
+The lab PC currently used for the live receiver is:
+
+```text
+10.128.0.227
+```
+
+Remote project root:
+
+```bash
+/ssd1/shenyibo/Quest3DataCollector
+```
+
+Open the live viewer from another PC on the same network:
+
+```text
+http://10.128.0.227:8765/
+```
+
+If the browser appears stale after a deployment, add a cache-busting query:
+
+```text
+http://10.128.0.227:8765/?reload=1
+```
+
+The current lab receiver command is:
+
+```bash
+cd /ssd1/shenyibo/Quest3DataCollector
+nohup .venv312/bin/python pc/offline_calibration/scripts/quest_pc_receiver.py receive \
+  --host 0.0.0.0 \
+  --port 9100 \
+  --visualize \
+  --visualize-host 0.0.0.0 \
+  --visualize-port 8765 \
+  --no-open-browser \
+  --flexiv-network-interface 192.168.2.108 \
+  --realsense-serial 244222073667 \
+  --third-realsense-serial 750612070265 \
+  >> receiver.log 2>&1 &
+```
+
+Check the remote process:
+
+```bash
+pgrep -af 'pc/offline_calibration/scripts/quest_pc_receiver.py receive'
+ss -ltnp | grep ':8765'
+```
+
 ## Start the PC receiver
 
 From the repository root:
@@ -24,24 +74,66 @@ Useful receiver options:
 - `--no-flexiv-realsense` hides and disables the robot/RealSense bridge.
 - `--no-calibrate-after-pc-recording` records B-button raw data but skips automatic calibration after stop.
 
+## Install the Quest App
+
+Use this when installing the Unity app on a new Quest.
+
+1. Connect the Quest by USB.
+2. Put on the headset and accept the USB debugging / RSA fingerprint prompt.
+3. Confirm ADB sees the headset as `device`, not `unauthorized`:
+
+```powershell
+adb devices -l
+```
+
+4. Install the APK:
+
+```powershell
+adb -s <quest-serial> install -r -d W:\lasertag-projs\Build\EyeTrackingBuild\EyeTrackingTest.apk
+```
+
+Current package name:
+
+```text
+com.Apricity.EyeTrackingTest
+```
+
+Optional launch command:
+
+```powershell
+adb -s <quest-serial> shell monkey -p com.Apricity.EyeTrackingTest 1
+```
+
+If the device stays `unauthorized`, reconnect the USB cable and accept the prompt
+inside the headset. If no prompt appears, toggle developer mode / USB debugging
+for the Quest and restart the ADB server:
+
+```powershell
+adb kill-server
+adb start-server
+adb devices -l
+```
+
 ## Quest Controls
 
 - `A`: start/stop a normal recording.
 - `B`: start/stop a calibration recording.
 - Right hand trigger: gripper open/close command when gripper control is enabled.
-- Right hand side/grip trigger: hold to enable robot TCP teleoperation during an active robot session.
+- Right hand side/grip trigger: hold to enable robot TCP teleoperation during an
+  `A` normal recording after Quest-robot calibration is available.
 - The headset recording indicator turns on while recording is active.
 
-Robot motion is gated by the right hand side/grip trigger. Moving the right
-controller without holding that trigger records controller poses but does not
-command the robot. Controller TCP commands also pass through a joint-limit guard:
-by default the PC stops sending teleop commands when any Flexiv joint enters the
-configured buffer around the URDF soft joint limits.
+For `B` calibration recording, the PC switches Flexiv into free-drag mode when
+the robot bridge is connected. Move the end camera by physically dragging the
+robot, then press `B` again to stop recording and leave free-drag mode.
 
-Before a robot hand-eye calibration is available, controller teleoperation uses
-the converted PC frame and maps Quest/PC `y` up to the robot base `z` up. After
-hand-eye succeeds, controller offsets are mapped through the calibrated
-Quest-world-to-robot-base transform.
+For `A` normal recording, robot motion is gated by the right hand side/grip
+trigger. Moving the right controller without holding that trigger records
+controller poses but does not command the robot. Controller TCP commands are
+mapped through the calibrated Quest-world-to-robot-base transform, and they pass
+through a joint-limit guard: by default the PC stops sending teleop commands
+when any Flexiv joint enters the configured buffer around the URDF soft joint
+limits.
 
 ## Live Viewer
 
@@ -62,6 +154,38 @@ viewer, replay, and robot bridge display a derived right-handed frame with
 After calibration, the display translates the checkerboard near the origin while
 keeping the converted world axes.
 
+### Robot live visualization
+
+Click `Connect Robot` in the `Flexiv / RealSense` panel before a robot run.
+The live viewer polls `/robot/status` independently of the RealSense stream, so
+the robot skeleton/mesh follows the latest Flexiv `jointPose` even when camera
+streaming is stopped.
+
+The robot status text should show:
+
+- `robot: connected Rizon4-062713`
+- `last sample: live robot status`
+- `joint age: <small value>s`
+- `joints: ...`
+- `URDF FK vs flange: ...mm`
+
+Use `joint age` as the quick health check. If it grows continuously, the page is
+not receiving fresh robot state. Refresh the page, reconnect the robot, and
+check `/robot/status`.
+
+The robot model is served by:
+
+```text
+http://<pc-ip>:8765/robot/model
+```
+
+The lab build can be used to try different Flexiv URDF variants. At the time of
+writing, the receiver is set to load `flexiv_Rizon4R_kinematics.urdf` from
+`pc/offline_calibration/assets/urdf/` as a visualization experiment. The original
+Rizon4 URDF is also kept in the same folder. A large `URDF FK vs flange` value
+means the selected URDF does not match the robot state/pose well, even if the
+mesh is visible.
+
 ## Calibration Recording
 
 Use `B` for the calibration flow. A calibration record writes Quest frames and
@@ -74,7 +198,8 @@ Recommended flow:
 2. Connect the robot in the `Flexiv / RealSense` panel when robot hand-eye is needed.
 3. Press `B` once to start calibration recording.
 4. Move the Quest/head through varied viewpoints of the 11x8 checkerboard.
-5. Move the robot/end camera through varied viewpoints while keeping the board visible.
+5. If the robot bridge is connected, free-drag the robot/end camera through
+   varied viewpoints while keeping the board visible.
 6. Press `B` again to stop.
 7. Wait for the PC-side calibration status to finish.
 
@@ -91,7 +216,7 @@ hand-eye calibration selects samples with different Flexiv TCP/end-camera poses.
 What gets saved in the calibration record:
 
 - Quest trajectory, metadata, and left/right MP4 videos.
-- PC robot states, joint poses, gripper state, and controller motion commands.
+- PC robot states, joint poses, and gripper state.
 - End-camera MP4 and frame metadata.
 - Third-camera MP4 and frame metadata when available.
 - Quest/checkerboard outputs under `outputs/pc_live_calibration/<recordId>/`.
@@ -120,8 +245,8 @@ PC session stores the Quest stream plus:
 - fixed third-camera MP4 when available
 
 The A-button flow is intended for task data collection after calibration. Robot
-teleoperation still requires holding the right side/grip trigger during an active
-robot session.
+teleoperation requires a successful Quest-robot calibration and still requires
+holding the right side/grip trigger during an active robot session.
 
 ## Replay
 
@@ -144,8 +269,12 @@ third-camera video when those artifacts exist in the record.
 ## Troubleshooting
 
 - No Quest data in live view: check the Quest app is running and sending UDP to the PC receiver host/port.
+- Quest is visible in ADB but install fails: `unauthorized` means the headset has not accepted USB debugging.
 - A/B buttons do not start recording: confirm Touch controllers are active; hand tracking alone does not fire these hotkeys.
-- Robot connected but does not move: hold the right side/grip trigger during the active recording/session.
+- Robot connected but does not move during `A`: confirm the latest calibration is loaded, then hold the right side/grip trigger during the active recording/session.
+- Robot cannot be dragged during `B`: check the live robot status for `control: freedrive` and `free-drag: enabled`; if it is not enabled, clear robot faults and reconnect Flexiv.
+- Robot mesh does not follow the real arm: check that `joint age` stays low and that `joints:` changes when the real robot moves. If not, refresh the page and reconnect the robot.
+- Robot mesh is visible but kinematically wrong: check `URDF FK vs flange`. A large value usually means the active URDF variant is not the correct one for the physical arm.
 - Robot motion skips with `joint_limit_buffer`: move the arm away from the reported joint limit or reduce the teleop target direction; the guard is intentionally stopping TCP commands before Flexiv reaches its own limit stop.
 - Hand-eye fails with too few detections: move the end camera so the checkerboard is visible in at least the required number of selected samples.
 - Calibration is slow: lower the max diverse frame/sample limits, or disable automatic calibration and run the script manually.

@@ -50,9 +50,12 @@ from flexiv_realsense_bridge import (
     DEFAULT_CONTROLLER_MAX_STEP_M,
     DEFAULT_CONTROLLER_MAX_ROTATION_DEG,
     DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG,
+    ROBOT_SESSION_CONTROL_FREEDRIVE,
+    ROBOT_SESSION_CONTROL_TELEOP,
     FlexivRealSenseConfig,
     FlexivRealSenseManager,
     RobotRealsenseSession,
+    compact_robot_result,
     ee_pose_diversity,
     transform_from_json,
 )
@@ -84,7 +87,7 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = WORKSPACE_ROOT / "pc_recordings"
 DEFAULT_QUEST_LOCAL_ROOT = WORKSPACE_ROOT / "raw"
 DEFAULT_CALIBRATION_OUTPUT_ROOT = WORKSPACE_ROOT / "outputs" / "pc_live_calibration"
-DEFAULT_RIZON4_URDF = WORKSPACE_ROOT / "assets" / "urdf" / "flexiv_Rizon4_kinematics.urdf"
+DEFAULT_RIZON_URDF = WORKSPACE_ROOT / "assets" / "urdf" / "flexiv_Rizon4R_kinematics.urdf"
 LATE_RECORDING_SAMPLE_GRACE_SECONDS = 5.0
 MAX_CALIBRATION_HTTP_BODY_BYTES = 8 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
@@ -601,16 +604,14 @@ class SessionWriter:
         self.closed = False
         self.robot_start_status = self._robot_start_status("not_started")
         if self.robot_manager is not None:
-            robot_alignment = latest_robot_hand_eye_result(calibration_raw_root, calibration_output_root)
+            robot_alignment = latest_robot_hand_eye_result(calibration_raw_root, calibration_output_root, output_root)
             self.robot_session = self.robot_manager.start_session(
                 self.directory,
                 self.record_id,
                 self.visualizer.publish_event if self.visualizer is not None else None,
                 robot_alignment_result=robot_alignment,
-                # Calibration needs to be able to drive the robot before Quest-board
-                # alignment exists; the robot motion layer already falls back to an
-                # unaligned controller mapping when no T_world_base is available.
-                require_controller_alignment=False,
+                require_controller_alignment=True,
+                control_mode=ROBOT_SESSION_CONTROL_TELEOP,
             )
             if self.robot_session is not None:
                 self.robot_realsense_directory = self.robot_session.directory
@@ -872,7 +873,13 @@ class SessionWriter:
         active = status.get("activeSession") if isinstance(status, dict) else None
         connected = bool(isinstance(robot, dict) and robot.get("connected"))
         motion_armed = bool(isinstance(robot, dict) and robot.get("motionArmed"))
+        freedrive_enabled = bool(
+            isinstance(robot, dict) and (robot.get("freedriveEnabled") or robot.get("freeDragEnabled"))
+        )
         controller_motion = bool(isinstance(config, dict) and config.get("controllerMotionEnabled"))
+        control_mode = active.get("controlMode") if isinstance(active, dict) else ROBOT_SESSION_CONTROL_TELEOP
+        if control_mode not in (ROBOT_SESSION_CONTROL_TELEOP, ROBOT_SESSION_CONTROL_FREEDRIVE):
+            control_mode = ROBOT_SESSION_CONTROL_TELEOP
         recording = bool(self.robot_session is not None)
         reason = "recording"
         if not connected:
@@ -881,6 +888,12 @@ class SessionWriter:
             reason = "RealSense camera serial is empty"
         elif not recording:
             reason = self.robot_manager.last_error or "robot RealSense session did not start"
+        elif control_mode == ROBOT_SESSION_CONTROL_FREEDRIVE and freedrive_enabled:
+            reason = "recording; robot free-drag mode is enabled"
+        elif control_mode == ROBOT_SESSION_CONTROL_FREEDRIVE:
+            reason = self.robot_manager.last_error or "robot free-drag mode is not enabled"
+        elif active and active.get("controllerAlignmentRequired") and not active.get("controllerAlignmentAvailable"):
+            reason = "recording; Quest-robot alignment is required before right-controller teleop"
         elif not motion_armed:
             reason = self.robot_manager.last_error or "robot motion is not armed"
         else:
@@ -896,9 +909,12 @@ class SessionWriter:
             "cameraSerial": config.get("cameraSerial") if isinstance(config, dict) else None,
             "thirdCameraSerial": config.get("thirdCameraSerial") if isinstance(config, dict) else None,
             "motionArmed": motion_armed,
+            "freedriveEnabled": freedrive_enabled,
+            "freeDragEnabled": freedrive_enabled,
+            "controlMode": control_mode,
             "controllerMotionEnabled": controller_motion,
-            "teleopRequiresRightSideButton": True,
-            "teleopRequiresRightHandTrigger": True,
+            "teleopRequiresRightSideButton": control_mode == ROBOT_SESSION_CONTROL_TELEOP,
+            "teleopRequiresRightHandTrigger": control_mode == ROBOT_SESSION_CONTROL_TELEOP,
             "gripperEnabled": bool(isinstance(config, dict) and config.get("gripperEnabled")),
             "activeSession": active,
         }
@@ -1018,7 +1034,12 @@ class LiveTelemetryVisualizer:
     def robot_status_payload(self) -> dict[str, Any]:
         if self.robot_manager is None:
             return {"ok": False, "enabled": False, "reason": "disabled"}
-        return self.robot_manager.status()
+        payload = self.robot_manager.status()
+        if not isinstance(payload.get("lastCalibration"), dict):
+            latest = latest_robot_calibration_event(self.calibration_raw_root, self.calibration_output_root, self.recording_root)
+            if latest is not None:
+                payload["lastCalibration"] = latest
+        return payload
 
     def camera_list_payload(self) -> dict[str, Any]:
         if self.robot_manager is None:
@@ -1448,10 +1469,10 @@ class LiveTelemetryVisualizer:
                 self.wfile.write(data)
 
             def _send_urdf(self) -> None:
-                if not DEFAULT_RIZON4_URDF.exists():
-                    self.send_error(404, "Rizon4 URDF asset not found")
+                if not DEFAULT_RIZON_URDF.exists():
+                    self.send_error(404, "Rizon URDF asset not found")
                     return
-                data = DEFAULT_RIZON4_URDF.read_bytes()
+                data = DEFAULT_RIZON_URDF.read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/xml; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
@@ -1587,6 +1608,8 @@ class PcCalibrationSession:
                 self.directory,
                 self.record_id,
                 self.visualizer.publish_event if self.visualizer is not None else None,
+                require_controller_alignment=False,
+                control_mode=ROBOT_SESSION_CONTROL_FREEDRIVE,
             )
             if self.robot_session is not None:
                 self.robot_realsense_directory = self.robot_session.directory
@@ -1645,7 +1668,6 @@ class PcCalibrationSession:
         if robot_session is not None:
             robot_sample = dict(sample)
             robot_sample["pcReceivePerfCounterSeconds"] = message.get("pcReceivePerfCounterSeconds")
-            robot_session.update_controller_motion(robot_sample)
             robot_session.record_sample(robot_sample)
 
     def close(self, stop_message: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1734,7 +1756,13 @@ class PcCalibrationSession:
         active = status.get("activeSession") if isinstance(status, dict) else None
         connected = bool(isinstance(robot, dict) and robot.get("connected"))
         motion_armed = bool(isinstance(robot, dict) and robot.get("motionArmed"))
+        freedrive_enabled = bool(
+            isinstance(robot, dict) and (robot.get("freedriveEnabled") or robot.get("freeDragEnabled"))
+        )
         controller_motion = bool(isinstance(config, dict) and config.get("controllerMotionEnabled"))
+        control_mode = active.get("controlMode") if isinstance(active, dict) else ROBOT_SESSION_CONTROL_FREEDRIVE
+        if control_mode not in (ROBOT_SESSION_CONTROL_TELEOP, ROBOT_SESSION_CONTROL_FREEDRIVE):
+            control_mode = ROBOT_SESSION_CONTROL_FREEDRIVE
         robot_sn = robot.get("robotSn") or config.get("robotSn") if isinstance(robot, dict) and isinstance(config, dict) else None
         pose_field = robot.get("poseField") or config.get("poseField") if isinstance(robot, dict) and isinstance(config, dict) else None
         camera_serial = config.get("cameraSerial") if isinstance(config, dict) else None
@@ -1747,6 +1775,12 @@ class PcCalibrationSession:
             reason = "RealSense camera serial is empty"
         elif not recording:
             reason = self.robot_manager.last_error or "robot RealSense session did not start"
+        elif control_mode == ROBOT_SESSION_CONTROL_FREEDRIVE and freedrive_enabled:
+            reason = "recording; robot free-drag mode is enabled"
+        elif control_mode == ROBOT_SESSION_CONTROL_FREEDRIVE:
+            reason = self.robot_manager.last_error or "robot free-drag mode is not enabled"
+        elif active and active.get("controllerAlignmentRequired") and not active.get("controllerAlignmentAvailable"):
+            reason = "recording; Quest-robot alignment is required before right-controller teleop"
         elif not motion_armed:
             reason = self.robot_manager.last_error or "robot motion is not armed"
         else:
@@ -1762,9 +1796,12 @@ class PcCalibrationSession:
             "cameraSerial": camera_serial,
             "thirdCameraSerial": third_camera_serial,
             "motionArmed": motion_armed,
+            "freedriveEnabled": freedrive_enabled,
+            "freeDragEnabled": freedrive_enabled,
+            "controlMode": control_mode,
             "controllerMotionEnabled": controller_motion,
-            "teleopRequiresRightSideButton": True,
-            "teleopRequiresRightHandTrigger": True,
+            "teleopRequiresRightSideButton": control_mode == ROBOT_SESSION_CONTROL_TELEOP,
+            "teleopRequiresRightHandTrigger": control_mode == ROBOT_SESSION_CONTROL_TELEOP,
             "gripperEnabled": bool(isinstance(config, dict) and config.get("gripperEnabled")),
             "activeSession": active,
         }
@@ -4671,9 +4708,11 @@ def calibration_result_event(record_id: str, result: dict[str, Any], result_path
         "bestLagSeconds": result.get("best_lag_seconds"),
         "keptFrames": order.get("kept_frames"),
         "inputFrames": order.get("input_frames"),
+        "appearanceAnchorFrames": order.get("appearance_anchor_frames"),
         "redAnchorFrames": order.get("red_anchor_frames"),
         "reprojectionOrderFrames": order.get("reprojection_frames"),
         "rot180Frames": order.get("rot180_frames"),
+        "appearanceAnchorPolicy": result.get("appearance_anchor_policy") if isinstance(result.get("appearance_anchor_policy"), dict) else {},
         "redAnchorPolicy": red_anchor_policy,
         "medianReprojectionPx": overall.get("median_px"),
         "p90ReprojectionPx": overall.get("p90_px"),
@@ -4730,15 +4769,17 @@ def recording_calibration_snapshot(output_root: Path | None) -> dict[str, Any] |
 def latest_robot_hand_eye_result(
     calibration_raw_root: Path | None,
     calibration_output_root: Path | None,
+    recording_root: Path | None = None,
 ) -> dict[str, Any] | None:
     candidates: list[Path] = []
-    for root in (calibration_raw_root, calibration_output_root):
+    for root in (calibration_raw_root, calibration_output_root, recording_root):
         if root is None:
             continue
         resolved = root.resolve()
         if not resolved.exists():
             continue
         candidates.extend(resolved.glob("record_pc_calib*/robot_realsense/robot_hand_eye_result.json"))
+        candidates.extend(resolved.glob("record*/robot_realsense/robot_hand_eye_result.json"))
     valid: list[Path] = []
     for path in candidates:
         if not path.exists() or path.stat().st_size <= 0:
@@ -4758,6 +4799,27 @@ def latest_robot_hand_eye_result(
         payload.setdefault("sourcePath", str(latest))
         return payload
     return None
+
+
+def latest_robot_calibration_event(
+    calibration_raw_root: Path | None,
+    calibration_output_root: Path | None,
+    recording_root: Path | None = None,
+) -> dict[str, Any] | None:
+    payload = latest_robot_hand_eye_result(calibration_raw_root, calibration_output_root, recording_root)
+    if not isinstance(payload, dict):
+        return None
+    alignment = payload.get("questAlignment") if isinstance(payload.get("questAlignment"), dict) else {}
+    event = {
+        "type": "robot_calibration_result",
+        "recordId": payload.get("record_id"),
+        "runDir": str(Path(str(payload.get("sourcePath"))).parent) if payload.get("sourcePath") else None,
+        "result": compact_robot_result(payload),
+        "T_world_base": alignment.get("T_world_base"),
+        "sourcePath": payload.get("sourcePath"),
+        "restored": True,
+    }
+    return event
 
 
 def is_successful_calibration_snapshot(snapshot: dict[str, Any] | None) -> bool:
@@ -4886,12 +4948,12 @@ def read_json_if_exists(path: Path) -> Any:
 
 
 def rizon4_model_payload() -> dict[str, Any]:
-    if not DEFAULT_RIZON4_URDF.exists():
-        return {"ok": False, "reason": "missing_urdf", "path": str(DEFAULT_RIZON4_URDF)}
+    if not DEFAULT_RIZON_URDF.exists():
+        return {"ok": False, "reason": "missing_urdf", "path": str(DEFAULT_RIZON_URDF)}
     try:
-        root = ET.fromstring(DEFAULT_RIZON4_URDF.read_text(encoding="utf-8"))
+        root = ET.fromstring(DEFAULT_RIZON_URDF.read_text(encoding="utf-8"))
     except Exception as exc:
-        return {"ok": False, "reason": "bad_urdf", "error": str(exc), "path": str(DEFAULT_RIZON4_URDF)}
+        return {"ok": False, "reason": "bad_urdf", "error": str(exc), "path": str(DEFAULT_RIZON_URDF)}
 
     joints: list[dict[str, Any]] = []
     for joint in root.findall("joint"):
@@ -4952,7 +5014,8 @@ def rizon4_model_payload() -> dict[str, Any]:
     return {
         "ok": True,
         "name": root.attrib.get("name") or "Rizon4",
-        "source": str(DEFAULT_RIZON4_URDF),
+        "source": str(DEFAULT_RIZON_URDF),
+        "sourceLabel": "Flexiv RDK 1.8 Rizon4R resources",
         "joints": joints,
         "links": links,
         "activeJointNames": [joint["name"] for joint in joints if joint.get("type") != "fixed"],
@@ -5392,8 +5455,8 @@ def resolve_robot_mesh_path(path_text: str) -> Path:
     normalized = path_text.replace("\\", "/").lstrip("/")
     if not normalized.startswith("meshes/"):
         raise ValueError("robot mesh path must be under meshes/")
-    path = (DEFAULT_RIZON4_URDF.parent / normalized).resolve()
-    root = (DEFAULT_RIZON4_URDF.parent / "meshes").resolve()
+    path = (DEFAULT_RIZON_URDF.parent / normalized).resolve()
+    root = (DEFAULT_RIZON_URDF.parent / "meshes").resolve()
     try:
         path.relative_to(root)
     except ValueError as exc:
@@ -6121,6 +6184,11 @@ const state = {
   robotLiveTimer: null,
   robotLiveLastSequence: {},
   robotLiveLastStatusRefreshMs: 0,
+  robotStatusTimer: null,
+  robotStatusIntervalMs: 0,
+  robotStatusInFlight: false,
+  robotCalibrationKey: null,
+  viewFitTimer: null,
   latestCalibrationRecordId: null,
   questAdb: null,
   preflight: null,
@@ -6143,6 +6211,18 @@ function resetView() {
   state.distance = Math.max(0.45, bounds.radius * 3.2);
 }
 
+function requestViewFit() {
+  if (state.viewFitTimer) window.clearTimeout(state.viewFitTimer);
+  state.viewFitTimer = window.setTimeout(() => {
+    state.viewFitTimer = null;
+    resetView();
+  }, 80);
+}
+
+function hasDrawableRobot() {
+  return Boolean(state.robotModel?.ok && liveRobotJointpose() && robotLiveBaseMatrix());
+}
+
 function computeBounds() {
   const pts = [];
   pts.push(...liveBoardPoints());
@@ -6157,6 +6237,13 @@ function computeBounds() {
     }
     const g = relPoint(frame.gaze?.p);
     if (g) pts.push(g);
+  }
+  const liveJointpose = liveRobotJointpose();
+  if (liveJointpose && state.robotModel?.ok) {
+    for (const m of robotFrames(state.robotModel, liveJointpose, robotLiveBaseMatrix())) {
+      const p = relPoint(matrixTranslation(m));
+      if (p) pts.push(p);
+    }
   }
   if (!pts.length) return {center: [0, 0, 0], radius: 0.35};
   const min = pts[0].slice();
@@ -6236,13 +6323,27 @@ async function loadLatestCalibration() {
 }
 
 async function loadRobotStatus() {
+  if (state.robotStatusInFlight) return;
+  state.robotStatusInFlight = true;
   try {
     const response = await fetch('/robot/status', {cache: 'no-store'});
     const payload = await response.json();
     applyRobotStatus(payload);
   } catch (error) {
     robotStatus.textContent = String(error);
+  } finally {
+    state.robotStatusInFlight = false;
+    syncRobotStatusLoop();
   }
+}
+
+function syncRobotStatusLoop() {
+  const connected = Boolean(state.robot?.robot?.connected);
+  const intervalMs = connected ? 250 : 2000;
+  if (state.robotStatusTimer && state.robotStatusIntervalMs === intervalMs) return;
+  if (state.robotStatusTimer) window.clearInterval(state.robotStatusTimer);
+  state.robotStatusIntervalMs = intervalMs;
+  state.robotStatusTimer = window.setInterval(loadRobotStatus, intervalMs);
 }
 
 async function startRobotStream() {
@@ -6335,14 +6436,18 @@ function refreshRobotLiveFrameRole(role, image, statusEl) {
 }
 
 async function loadRobotModel() {
+  const hadDrawableRobot = hasDrawableRobot();
   try {
     const response = await fetch('/robot/model', {cache: 'no-store'});
     const payload = await response.json();
     state.robotModel = payload;
+    state.robotMeshes = {};
+    state.robotMeshPending = {};
     preloadRobotMeshes(payload);
   } catch (_) {
     state.robotModel = null;
   }
+  if (!hadDrawableRobot && hasDrawableRobot()) requestViewFit();
   if (state.robotBoardCheck) renderRobotBoardCheck(state.robotBoardCheck);
   else if (state.robot) renderRobotStatus(state.robot);
 }
@@ -6648,7 +6753,9 @@ function updateRobotEvent(event) {
 }
 
 function updateRobotSample(event) {
+  const hadDrawableRobot = hasDrawableRobot();
   state.robotSample = event;
+  if (!hadDrawableRobot && hasDrawableRobot()) requestViewFit();
   renderRobotStatus(state.robot);
 }
 
@@ -6663,13 +6770,26 @@ function updateRobotGripper(event) {
 }
 
 function updateRobotCalibration(event) {
+  const key = robotCalibrationKey(event);
+  const changed = key && key !== state.robotCalibrationKey;
   state.robotCalibration = event;
+  if (key) state.robotCalibrationKey = key;
   if (event.T_world_base?.matrix_4x4) state.robotWorldBase = event.T_world_base.matrix_4x4;
+  if (changed && hasDrawableRobot()) requestViewFit();
   renderRobotStatus(state.robot);
 }
 
+function robotCalibrationKey(event) {
+  if (!event) return '';
+  return String(event.sourcePath || event.runDir || event.recordId || JSON.stringify(event.T_world_base?.matrix_4x4 || null));
+}
+
 function applyRobotStatus(payload) {
+  const hadDrawableRobot = hasDrawableRobot();
   state.robot = payload;
+  if (payload?.lastCalibration) updateRobotCalibration(payload.lastCalibration);
+  const statusSample = robotSampleFromStatus(payload);
+  if (statusSample) state.robotSample = {...(state.robotSample || {}), ...statusSample};
   const config = payload?.config || {};
   if (config.robotSn && !robotSn.value) robotSn.value = config.robotSn;
   if (config.poseField) robotPoseField.value = config.poseField;
@@ -6699,6 +6819,35 @@ function applyRobotStatus(payload) {
   if (Number.isFinite(config.gripperForceN)) robotGripperForce.value = config.gripperForceN;
   syncRobotLiveLoop();
   renderRobotStatus(payload);
+  if (!hadDrawableRobot && hasDrawableRobot()) requestViewFit();
+  syncRobotStatusLoop();
+}
+
+function robotSampleFromStatus(payload) {
+  const robot = payload?.robot || {};
+  const statePayload = robot.state || {};
+  const jointpose = numericArray(statePayload.jointPose || statePayload.jointpose || statePayload.jointpos);
+  if (!jointpose || jointpose.length < 7) return null;
+  const tcpPose = statePayload.tcp_pose || statePayload.tcpPose || {};
+  return {
+    type: 'robot_sample',
+    sampleIndex: 'live',
+    questSampleIndex: null,
+    robotSn: robot.robotSn,
+    poseField: robot.poseField,
+    readUnixSeconds: statePayload.readUnixSeconds,
+    jointpose,
+    jointpos: jointpose,
+    T_base_ee: statePayload.endEffectorPose,
+    T_base_tool_tcp: tcpPose.T_base_pose || statePayload.T_base_tool_tcp || statePayload.endEffectorPose,
+    jointLimitGuard: statePayload.jointLimitGuard
+  };
+}
+
+function numericArray(value) {
+  if (!Array.isArray(value)) return null;
+  const out = value.map(v => Number(v));
+  return out.every(Number.isFinite) ? out : null;
 }
 
 function renderRobotStatus(payload) {
@@ -6712,9 +6861,16 @@ function renderRobotStatus(payload) {
   }
   const robot = payload.robot || {};
   const active = payload.activeSession || {};
+  const controlMode = active.controlMode || (robot.freeDragEnabled || robot.freedriveEnabled ? 'freedrive' : 'idle');
+  const freeDragEnabled = Boolean(robot.freeDragEnabled || robot.freedriveEnabled);
+  const teleopText = controlMode === 'controller_teleop'
+    ? `hold right middle-finger trigger${robot.motionArmed ? ' (motion mode active)' : ' (motion not armed)'}`
+    : 'off';
   const lines = [
     `robot: ${robot.connected ? 'connected' : 'not connected'} ${robot.robotSn || ''}`.trim(),
-    `teleop: hold right middle-finger trigger${robot.motionArmed ? ' (motion mode active)' : ' (motion not armed)'}`,
+    `control: ${controlMode}`,
+    `teleop: ${teleopText}`,
+    `free-drag: ${freeDragEnabled ? 'enabled' : 'disabled'}`,
     `controller motion: ${payload.config?.controllerMotionEnabled ? 'enabled' : 'disabled'}`,
     `joint guard: ${robotJointGuardText(robot.state?.jointLimitGuard, payload.config)}`,
     `pose: ${robot.poseField || 'n/a'}`,
@@ -6723,11 +6879,20 @@ function renderRobotStatus(payload) {
     `third camera: ${payload.config?.thirdCameraSerial || 'off'}`,
     `stream: ${realsenseStreamText(payload.realsenseStream)}`,
     `exposure: ${payload.config?.realsenseAutoExposure === false ? 'manual' : 'auto'}${Number.isFinite(payload.config?.realsenseExposure) ? ` ${payload.config.realsenseExposure}` : ''}${Number.isFinite(payload.config?.realsenseGain) ? ` gain ${payload.config.realsenseGain}` : ''}`,
+    `robot frame: ${state.robotWorldBase ? 'aligned to Quest/world' : 'unaligned at viewer origin, Y up'}`,
     `session: ${payload.activeSession ? `${active.samples || 0} samples, ${active.images || 0} images` : 'idle'}`
   ];
   lines.push(`model: ${robotModelStatusText()}`);
   if (state.robotSample) {
-    lines.push(`last sample: ${state.robotSample.sampleIndex} quest ${state.robotSample.questSampleIndex}`);
+    lines.push(`last sample: ${robotSampleLabel(state.robotSample)}`);
+    if (Number.isFinite(state.robotSample.readUnixSeconds)) {
+      const age = Math.max(0, Date.now() / 1000 - Number(state.robotSample.readUnixSeconds));
+      lines.push(`joint age: ${age.toFixed(2)}s`);
+    }
+    if (Array.isArray(state.robotSample.jointpose)) {
+      const preview = state.robotSample.jointpose.slice(0, 4).map(v => Number(v).toFixed(3)).join(', ');
+      lines.push(`joints: ${preview}${state.robotSample.jointpose.length > 4 ? ', ...' : ''}`);
+    }
     const fkError = robotFkErrorMm(state.robotSample, null);
     if (Number.isFinite(fkError)) lines.push(`URDF FK vs flange: ${fkError.toFixed(1)}mm`);
     lines.push(`hand-eye motion: ${poseDiversityText(state.robotSample.poseDiversity)}`);
@@ -6772,6 +6937,12 @@ function renderRobotStatus(payload) {
   }
   if (robot.lastError || payload.lastError) lines.push(`error: ${robot.lastError || payload.lastError}`);
   robotStatus.textContent = lines.join('\n');
+}
+
+function robotSampleLabel(sample) {
+  if (sample.sampleIndex === 'live') return 'live robot status';
+  const quest = sample.questSampleIndex ?? 'n/a';
+  return `${sample.sampleIndex ?? 'n/a'} quest ${quest}`;
 }
 
 function realsenseStreamText(stream) {
@@ -6858,7 +7029,8 @@ function robotModelStatusText() {
   if (!model) return 'loading';
   if (!model.ok) return `unavailable ${model.reason || ''}`.trim();
   const active = Array.isArray(model.activeJointNames) ? model.activeJointNames.length : 0;
-  return `${model.name || 'Rizon4'} URDF, ${active} active joints`;
+  const source = model.sourceLabel ? ` (${model.sourceLabel})` : '';
+  return `${model.name || 'Rizon'} URDF${source}, ${active} active joints`;
 }
 
 function robotFkErrorMm(robotSample, baseMatrix) {
@@ -7000,6 +7172,10 @@ function renderCalibrationStatusDetails(event) {
   const robot = event.robotStartStatus || state.calibration?.robotStartStatus;
   if (!robot) return;
   const robotClass = robot.recording ? 'calibration-ok' : 'calibration-alert';
+  const mode = robot.controlMode || 'n/a';
+  const controlText = mode === 'freedrive'
+    ? `free-drag ${robot.freeDragEnabled || robot.freedriveEnabled ? 'enabled' : 'not enabled'}`
+    : (mode === 'controller_teleop' ? 'hold right middle-finger trigger' : mode);
   calibrationDetails.innerHTML = `
     <div class="${robotClass}">${escapeHtml(event.message || 'PC calibration recording')}</div>
     <div class="calibration-kv">
@@ -7007,7 +7183,7 @@ function renderCalibrationStatusDetails(event) {
       <span>robot rec</span><span>${robot.recording ? 'yes' : 'no'}</span>
       <span>robot</span><span>${escapeHtml(robot.robotConnected ? `${robot.robotSn || 'connected'} ${robot.poseField || ''}` : 'not connected')}</span>
       <span>camera</span><span>${escapeHtml(robot.cameraSerial || 'n/a')}</span>
-      <span>teleop</span><span>hold right middle-finger trigger</span>
+      <span>control</span><span>${escapeHtml(controlText)}</span>
       <span>note</span><span>${escapeHtml(robot.reason || 'n/a')}</span>
     </div>`;
 }
@@ -7093,6 +7269,7 @@ function renderCalibrationDiagnostics(event) {
       <span>best lag</span><span>${lag}</span>
       <span>gate</span><span>${threshold}</span>
       <span>kept frames</span><span>${summary.kept_frames ?? 'n/a'} / ${summary.input_frames ?? 'n/a'}</span>
+      <span>appearance anchor</span><span>${summary.appearance_anchor_frames ?? 'n/a'} / ${summary.kept_frames ?? 'n/a'}</span>
       <span>red anchor</span><span>${summary.red_anchor_frames ?? 'n/a'} / ${summary.kept_frames ?? 'n/a'}</span>
       <span>best error</span><span>${bestStats}</span>
     </div>
@@ -7125,6 +7302,9 @@ function renderFramePreview(rows) {
   if (!Array.isArray(rows) || !rows.length) return '';
   const text = rows.slice(0, 6).map(row =>
     `${row.side} f${row.frame_index}: ${fmtPx(row.best_median_px)} ${row.best_order} ${row.order_source || ''}` +
+    (Number.isFinite(row.appearance_anchor_observed_index) && row.appearance_anchor_observed_index >= 0
+      ? ` app ${row.appearance_anchor_observed_index}->${row.appearance_anchor_target_index}`
+      : '') +
     (Number.isFinite(row.red_anchor_observed_index) && row.red_anchor_observed_index >= 0
       ? ` red ${row.red_anchor_observed_index}->${row.red_anchor_target_index}`
       : '')
@@ -7162,11 +7342,11 @@ function draw() {
   if (showGrid.checked) drawGrid();
   drawCalibrationBoard();
   if (showTrail.checked) drawTrails();
+  drawRobotLive();
 
   const frame = state.frames[state.frames.length - 1];
   if (frame) {
     if (showGaze.checked) drawGaze(frame);
-    drawRobotLive();
     drawPose(frame.leftEye, '#a8ff9a', 'leftEye', 0.045);
     drawPose(frame.rightEye, '#a8ff9a', 'rightEye', 0.045);
     drawPose(frame.head, '#f1ecd0', 'head', 0.070);
@@ -7181,20 +7361,17 @@ function draw() {
 }
 
 function drawRobotLive() {
-  const sample = state.robotSample;
-  if (!sample) return;
-  const baseMatrix = state.robotWorldBase;
-  if (baseMatrix) {
-    drawRobotMeshes(sample.jointpose, baseMatrix);
-    drawRobotSkeleton(sample.jointpose, baseMatrix);
-  }
+  const jointpose = liveRobotJointpose();
+  if (!jointpose) return;
+  const sample = state.robotSample || {};
+  const baseMatrix = robotLiveBaseMatrix();
+  drawRobotMeshes(jointpose, baseMatrix);
+  drawRobotSkeleton(jointpose, baseMatrix);
   let tcpMatrix = sample.T_world_tool_tcp?.matrix_4x4;
-  if (!tcpMatrix && baseMatrix) {
-    const baseTcp = sample.T_base_tool_tcp?.matrix_4x4 || sample.T_base_ee?.matrix_4x4;
-    if (baseTcp) tcpMatrix = multiplyMatrix4(baseMatrix, baseTcp);
-  }
+  const baseTcp = sample.T_base_tool_tcp?.matrix_4x4 || sample.T_base_ee?.matrix_4x4;
+  if (!tcpMatrix && baseTcp) tcpMatrix = multiplyMatrix4(baseMatrix, baseTcp);
   let endCameraMatrix = sample.T_world_end_camera?.matrix_4x4;
-  if (!endCameraMatrix && baseMatrix && sample.T_base_end_camera?.matrix_4x4) {
+  if (!endCameraMatrix && sample.T_base_end_camera?.matrix_4x4) {
     endCameraMatrix = multiplyMatrix4(baseMatrix, sample.T_base_end_camera.matrix_4x4);
   }
   const p = relPoint(matrixTranslation(tcpMatrix));
@@ -7212,6 +7389,23 @@ function drawRobotLive() {
     drawLine(cp, relPoint(matrixPoint(endCameraMatrix, 0, 0, 0.06)), '#4b7cff', 1.9);
     if (p) drawLine(p, cp, 'rgba(130,173,255,.42)', 1.2);
   }
+}
+
+function robotLiveBaseMatrix() {
+  return state.robotWorldBase || unalignedRobotBaseMatrix();
+}
+
+function unalignedRobotBaseMatrix() {
+  return eulerXyzMatrix(-Math.PI / 2, 0, 0);
+}
+
+function liveRobotJointpose() {
+  if (Array.isArray(state.robotSample?.jointpose) && state.robotSample.jointpose.length >= 7) {
+    return state.robotSample.jointpose;
+  }
+  if (!state.robotModel?.ok) return null;
+  const count = Math.max(7, Number(state.robotModel.activeJointNames?.length || 0));
+  return Array.from({length: count}, () => 0);
 }
 
 function drawRobotSkeleton(jointpose, baseMatrix) {
@@ -8089,6 +8283,8 @@ async function loadRobotModel() {
     const response = await fetch('/robot/model', {cache: 'no-store'});
     const payload = await response.json();
     state.robotModel = payload;
+    state.robotMeshes = {};
+    state.robotMeshPending = {};
     preloadRobotMeshes(payload);
   } catch (_) {
     state.robotModel = null;
@@ -8373,7 +8569,11 @@ function renderAuditKvRows(audit) {
 
 function replayRobotStartText(start) {
   if (!start) return 'n/a';
-  return `recording=${Boolean(start.recording)}, connected=${Boolean(start.robotConnected)}, teleop=${start.teleopRequiresRightHandTrigger ? 'right middle trigger' : (start.teleopRequiresRightSideButton ? 'right side button' : 'legacy')}`;
+  const mode = start.controlMode || (start.teleopRequiresRightHandTrigger ? 'controller_teleop' : 'legacy');
+  const detail = mode === 'freedrive'
+    ? `freeDrag=${Boolean(start.freeDragEnabled || start.freedriveEnabled)}`
+    : `teleop=${start.teleopRequiresRightHandTrigger ? 'right middle trigger' : (start.teleopRequiresRightSideButton ? 'right side button' : 'legacy')}`;
+  return `recording=${Boolean(start.recording)}, connected=${Boolean(start.robotConnected)}, control=${mode}, ${detail}`;
 }
 
 function replayMotionSummaryText(session) {
@@ -8391,7 +8591,8 @@ function replayRobotModelStatusText() {
   if (!model) return 'loading';
   if (!model.ok) return `unavailable ${model.reason || ''}`.trim();
   const active = Array.isArray(model.activeJointNames) ? model.activeJointNames.length : 0;
-  return `${model.name || 'Rizon4'} URDF, ${active} active joints`;
+  const source = model.sourceLabel ? ` (${model.sourceLabel})` : '';
+  return `${model.name || 'Rizon'} URDF${source}, ${active} active joints`;
 }
 
 function replayRobotFkErrorMm(robot) {
@@ -8703,7 +8904,9 @@ function drawPose(pose, color, label, axisScale) {
 
 function drawRobotForSample(sample) {
   const robot = nearestRobotSample(sample.recordingTimestampSeconds);
-  const matrix = robot?.T_display_tool_tcp?.matrix_4x4 || robot?.T_display_ee?.matrix_4x4;
+  const baseMatrix = robotReplayBaseMatrix();
+  const baseTcp = robot?.T_base_tool_tcp?.matrix_4x4 || robot?.T_base_ee?.matrix_4x4;
+  const matrix = robot?.T_display_tool_tcp?.matrix_4x4 || robot?.T_display_ee?.matrix_4x4 || (baseTcp ? multiplyMatrix4(baseMatrix, baseTcp) : null);
   if (!matrix) return;
   drawRobotMeshes(robot);
   drawRobotSkeleton(robot);
@@ -8713,7 +8916,7 @@ function drawRobotForSample(sample) {
   drawLine(p, matrixPoint(matrix, 0.08, 0, 0), '#ff4545', 2.3);
   drawLine(p, matrixPoint(matrix, 0, 0.08, 0), '#42e875', 2.3);
   drawLine(p, matrixPoint(matrix, 0, 0, 0.08), '#4b7cff', 2.3);
-  const camMatrix = robot?.T_display_end_camera?.matrix_4x4;
+  const camMatrix = robot?.T_display_end_camera?.matrix_4x4 || (robot?.T_base_end_camera?.matrix_4x4 ? multiplyMatrix4(baseMatrix, robot.T_base_end_camera.matrix_4x4) : null);
   const cp = matrixTranslation(camMatrix);
   if (cp) {
     drawPoint(cp, '#82adff', 5, 'end cam');
@@ -8727,10 +8930,8 @@ function drawRobotForSample(sample) {
 function drawRobotMeshes(robot) {
   const model = state.robotModel;
   const jointpose = robot?.jointpose;
-  const result = state.data?.robotRealSense?.result;
-  const baseMatrix = result?.questAlignment?.T_world_base?.matrix_4x4;
-  if (!model || !Array.isArray(jointpose) || jointpose.length < 7 || !baseMatrix) return;
-  const displayBase = translateMatrixPayload(baseMatrix, state.data?.boardOriginWorld || [0,0,0]);
+  if (!model || !Array.isArray(jointpose) || jointpose.length < 7) return;
+  const displayBase = robotReplayBaseMatrix();
   const linkFrames = robotLinkFrames(model, jointpose, displayBase);
   const polygons = [];
   for (const [linkName, link] of Object.entries(model.links || {})) {
@@ -8750,10 +8951,8 @@ function drawRobotMeshes(robot) {
 function drawRobotSkeleton(robot) {
   const model = state.robotModel;
   const jointpose = robot?.jointpose;
-  const result = state.data?.robotRealSense?.result;
-  const baseMatrix = result?.questAlignment?.T_world_base?.matrix_4x4;
-  if (!model || !Array.isArray(jointpose) || jointpose.length < 7 || !baseMatrix) return;
-  const displayBase = translateMatrixPayload(baseMatrix, state.data?.boardOriginWorld || [0,0,0]);
+  if (!model || !Array.isArray(jointpose) || jointpose.length < 7) return;
+  const displayBase = robotReplayBaseMatrix();
   const frames = robotFrames(model, jointpose, displayBase);
   if (frames.length < 2) return;
   for (let i = 1; i < frames.length; i++) {
@@ -8762,6 +8961,16 @@ function drawRobotSkeleton(robot) {
   for (let i = 0; i < frames.length; i++) {
     drawPoint(matrixTranslation(frames[i]), i === 0 ? '#cbd5df' : '#ffffff', i === 0 ? 4 : 3.5, i === frames.length - 1 ? 'flange' : '');
   }
+}
+
+function robotReplayBaseMatrix() {
+  const result = state.data?.robotRealSense?.result;
+  const baseMatrix = result?.questAlignment?.T_world_base?.matrix_4x4;
+  return baseMatrix ? translateMatrixPayload(baseMatrix, state.data?.boardOriginWorld || [0,0,0]) : unalignedRobotBaseMatrix();
+}
+
+function unalignedRobotBaseMatrix() {
+  return eulerXyzMatrix(-Math.PI / 2, 0, 0);
 }
 
 function preloadRobotMeshes(model) {

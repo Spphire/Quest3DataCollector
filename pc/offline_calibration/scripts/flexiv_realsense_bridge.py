@@ -31,6 +31,10 @@ from quest_coordinate_frames import (
     unity_quaternion_wxyz_to_pc,
     unity_vec3_to_pc,
 )
+from checkerboard_orientation import (
+    detect_checkerboard_appearance_anchor,
+    draw_checkerboard_appearance_anchor_overlay,
+)
 
 
 DEFAULT_PATTERN_COLS = 11
@@ -70,6 +74,7 @@ RED_ANCHOR_RADIUS_GRID_SPACING = 2.0
 RED_ANCHOR_MIN_PIXELS = 16
 RED_ANCHOR_MIN_RATIO = 0.002
 RED_ANCHOR_MIN_BEST_SECOND_RATIO = 1.8
+APPEARANCE_ANCHOR_MIN_CONTRAST = 18.0
 QUEST_TO_ROBOT_UNALIGNED_ROTATION = np.array(
     [
         [1.0, 0.0, 0.0],
@@ -78,6 +83,14 @@ QUEST_TO_ROBOT_UNALIGNED_ROTATION = np.array(
     ],
     dtype=float,
 )
+ROBOT_SESSION_CONTROL_TELEOP = "controller_teleop"
+ROBOT_SESSION_CONTROL_FREEDRIVE = "freedrive"
+ROBOT_SESSION_CONTROL_RECORD_ONLY = "record_only"
+ROBOT_SESSION_CONTROL_MODES = {
+    ROBOT_SESSION_CONTROL_TELEOP,
+    ROBOT_SESSION_CONTROL_FREEDRIVE,
+    ROBOT_SESSION_CONTROL_RECORD_ONLY,
+}
 
 
 class RobotHandEyeCalibrationError(RuntimeError):
@@ -152,6 +165,7 @@ class FlexivRobotClient:
         self.last_error: str | None = None
         self.motion_armed = False
         self.motion_last_target_pose: list[float] | None = None
+        self.freedrive_enabled = False
         self.gripper: Any | None = None
         self.gripper_enabled = False
         self.gripper_device: str | None = None
@@ -189,6 +203,7 @@ class FlexivRobotClient:
 
     def disconnect(self) -> None:
         self.disarm_motion_locked()
+        self.disable_freedrive_locked()
         self.disable_gripper_locked()
         self.robot = None
         self.robot_sn = None
@@ -202,6 +217,8 @@ class FlexivRobotClient:
                 "poseField": self.pose_field,
                 "lastError": self.last_error,
                 "motionArmed": self.motion_armed,
+                "freedriveEnabled": self.freedrive_enabled,
+                "freeDragEnabled": self.freedrive_enabled,
                 "gripper": self.gripper_status_locked(),
             }
             if connected:
@@ -271,6 +288,7 @@ class FlexivRobotClient:
         with self.lock:
             if self.robot is None:
                 raise RuntimeError("Flexiv robot is not connected")
+            self.disable_freedrive_locked()
             flexivrdk = sys.modules.get("flexivrdk") or import_flexivrdk(None)
             robot = self.robot
             if robot.fault():
@@ -286,6 +304,43 @@ class FlexivRobotClient:
             self.motion_armed = True
             self.motion_last_target_pose = [float(v) for v in robot.states().tcp_pose]
             return self.read_state_locked()
+
+    def enable_freedrive(self) -> dict[str, Any]:
+        with self.lock:
+            if self.robot is None:
+                raise RuntimeError("Flexiv robot is not connected")
+            self.disarm_motion_locked()
+            flexivrdk = sys.modules.get("flexivrdk") or import_flexivrdk(None)
+            robot = self.robot
+            if robot.fault():
+                raise RuntimeError("Flexiv robot has fault; clear it before enabling free-drag mode")
+            robot.Enable()
+            start = time.time()
+            while not robot.operational():
+                if time.time() - start > 5.0:
+                    raise RuntimeError("Timed out waiting for Flexiv robot to become operational")
+                time.sleep(0.05)
+            robot.SwitchMode(flexivrdk.Mode.NRT_JOINT_IMPEDANCE)
+            joint_pose = self.read_joint_pose_locked()
+            dof = len(joint_pose) if joint_pose else len(self.joint_limits) or 7
+            robot.SetJointImpedance([0.0] * dof)
+            self.freedrive_enabled = True
+            self.motion_armed = False
+            self.motion_last_target_pose = None
+            return self.read_state_locked()
+
+    def disable_freedrive(self) -> dict[str, Any]:
+        with self.lock:
+            self.disable_freedrive_locked()
+            return self.status_unlocked()
+
+    def disable_freedrive_locked(self) -> None:
+        if self.robot is not None and self.freedrive_enabled:
+            try:
+                self.robot.Stop()
+            except Exception:
+                pass
+        self.freedrive_enabled = False
 
     def disarm_motion(self) -> dict[str, Any]:
         with self.lock:
@@ -309,6 +364,8 @@ class FlexivRobotClient:
             "poseField": self.pose_field,
             "lastError": self.last_error,
             "motionArmed": self.motion_armed,
+            "freedriveEnabled": self.freedrive_enabled,
+            "freeDragEnabled": self.freedrive_enabled,
             "gripper": self.gripper_status_locked(),
         }
         if connected:
@@ -702,6 +759,7 @@ class RobotRealsenseSession:
         publish_event: Callable[[dict[str, Any]], None] | None = None,
         robot_alignment_result: dict[str, Any] | None = None,
         require_controller_alignment: bool = False,
+        control_mode: str = ROBOT_SESSION_CONTROL_TELEOP,
     ) -> None:
         self.root = root.resolve()
         self.record_id = record_id
@@ -709,6 +767,9 @@ class RobotRealsenseSession:
         self.robot = robot
         self.stream_hub = stream_hub
         self.publish_event = publish_event
+        self.control_mode = (
+            control_mode if control_mode in ROBOT_SESSION_CONTROL_MODES else ROBOT_SESSION_CONTROL_RECORD_ONLY
+        )
         self.directory = self.root / "robot_realsense"
         self.image_dir = self.directory / "images"
         self.video_dir = self.directory / "videos"
@@ -761,6 +822,7 @@ class RobotRealsenseSession:
         self.video_frames_handle = self.video_frames_path.open("a", encoding="utf-8", newline="\n")
         config_payload = config_to_json(self.config)
         config_payload["recordId"] = self.record_id
+        config_payload["controlMode"] = self.control_mode
         config_payload["startedAtUtc"] = datetime.now(timezone.utc).isoformat()
         write_json(config_payload, self.directory / "capture_config.json")
         stream_status = self.stream_hub.start(self.config)
@@ -776,6 +838,8 @@ class RobotRealsenseSession:
         return summary
 
     def update_controller_motion(self, quest_sample: dict[str, Any]) -> dict[str, Any] | None:
+        if self.control_mode != ROBOT_SESSION_CONTROL_TELEOP:
+            return None
         with self.lock:
             if self.closed:
                 return None
@@ -914,6 +978,7 @@ class RobotRealsenseSession:
             "motionSkips": self.motion_skip_count,
             "motionErrors": self.motion_error_count,
             "lastMotion": self.last_motion_event,
+            "controlMode": self.control_mode,
             "controllerAlignmentRequired": self.require_controller_alignment,
             "controllerAlignmentAvailable": self.t_base_world is not None,
             "gripperEnabled": self.config.gripper_enabled,
@@ -1382,7 +1447,7 @@ class FlexivRealSenseManager:
     def __init__(self, config: FlexivRealSenseConfig | None = None) -> None:
         self.config = config or FlexivRealSenseConfig()
         self.robot = FlexivRobotClient()
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.stream_hub = RealSenseStreamHub()
         self.active_session: RobotRealsenseSession | None = None
         self.last_calibration: dict[str, Any] | None = None
@@ -1540,6 +1605,29 @@ class FlexivRealSenseManager:
             self.last_error = str(exc)
             return {"ok": False, "error": self.last_error, "status": self.status()}
 
+    def enable_freedrive(self) -> dict[str, Any]:
+        try:
+            state = self.robot.enable_freedrive()
+            with self.lock:
+                if self.active_session is not None:
+                    self.active_session.reset_controller_motion_anchor()
+            self.config.controller_motion_enabled = False
+            self.last_error = None
+            return {"ok": True, "state": state, "status": self.status()}
+        except Exception as exc:  # pragma: no cover - hardware path
+            self.last_error = str(exc)
+            return {"ok": False, "error": self.last_error, "status": self.status()}
+
+    def disable_freedrive(self) -> dict[str, Any]:
+        try:
+            self.robot.disable_freedrive()
+            self.config.controller_motion_enabled = False
+            self.last_error = None
+            return {"ok": True, "status": self.status()}
+        except Exception as exc:  # pragma: no cover - hardware path
+            self.last_error = str(exc)
+            return {"ok": False, "error": self.last_error, "status": self.status()}
+
     def list_cameras(self) -> dict[str, Any]:
         try:
             return {"ok": True, "cameras": list_realsense_cameras()}
@@ -1656,6 +1744,7 @@ class FlexivRealSenseManager:
             "method": observation.get("method") if observation is not None else None,
             "bestReprojectionRmsePx": None,
             "bestReprojectionMedianPx": None,
+            "appearanceAnchor": observation.get("appearance_anchor") if observation is not None else None,
             "redAnchor": observation.get("red_anchor") if observation is not None else None,
             "overlayPath": None,
             "message": board_check_message(observation is not None, brightness),
@@ -1676,10 +1765,19 @@ class FlexivRealSenseManager:
         publish_event: Callable[[dict[str, Any]], None] | None,
         robot_alignment_result: dict[str, Any] | None = None,
         require_controller_alignment: bool = False,
+        control_mode: str = ROBOT_SESSION_CONTROL_TELEOP,
     ) -> RobotRealsenseSession | None:
+        if control_mode not in ROBOT_SESSION_CONTROL_MODES:
+            control_mode = ROBOT_SESSION_CONTROL_TELEOP
         with self.lock:
             if self.active_session is not None:
-                self.active_session.close()
+                previous = self.active_session
+                previous.close()
+                if getattr(previous, "control_mode", ROBOT_SESSION_CONTROL_TELEOP) == ROBOT_SESSION_CONTROL_FREEDRIVE:
+                    self.robot.disable_freedrive()
+                else:
+                    self.robot.disarm_motion()
+                self.config.controller_motion_enabled = False
                 self.active_session = None
             if self.robot.robot is None:
                 self.last_error = "Flexiv robot is not connected"
@@ -1700,6 +1798,7 @@ class FlexivRealSenseManager:
                 publish_event,
                 robot_alignment_result=robot_alignment_result,
                 require_controller_alignment=require_controller_alignment,
+                control_mode=control_mode,
             )
             try:
                 session.start()
@@ -1710,11 +1809,22 @@ class FlexivRealSenseManager:
                     publish_event({"type": "robot_status", "ok": False, "stage": "start_failed", "error": self.last_error})
                 return None
             try:
-                self.robot.arm_motion()
-                self.config.controller_motion_enabled = True
+                if control_mode == ROBOT_SESSION_CONTROL_FREEDRIVE:
+                    self.robot.enable_freedrive()
+                    self.config.controller_motion_enabled = False
+                    stage = "freedrive_enabled"
+                elif control_mode == ROBOT_SESSION_CONTROL_TELEOP:
+                    self.robot.arm_motion()
+                    self.config.controller_motion_enabled = True
+                    stage = "motion_armed"
+                else:
+                    self.robot.disarm_motion()
+                    self.robot.disable_freedrive()
+                    self.config.controller_motion_enabled = False
+                    stage = "record_only"
                 self.last_error = None
                 if publish_event is not None:
-                    publish_event({"type": "robot_status", "stage": "motion_armed", **self.status()})
+                    publish_event({"type": "robot_status", "stage": stage, "controlMode": control_mode, **self.status()})
             except Exception as exc:  # pragma: no cover - hardware path
                 self.config.controller_motion_enabled = False
                 self.last_error = str(exc)
@@ -1723,7 +1833,8 @@ class FlexivRealSenseManager:
                         {
                             "type": "robot_status",
                             "ok": False,
-                            "stage": "arm_motion_failed",
+                            "stage": f"{control_mode}_start_failed",
+                            "controlMode": control_mode,
                             "error": self.last_error,
                             "status": self.status(),
                         }
@@ -1735,7 +1846,10 @@ class FlexivRealSenseManager:
         if session is None:
             return None
         summary = session.close()
-        self.robot.disarm_motion()
+        if getattr(session, "control_mode", ROBOT_SESSION_CONTROL_TELEOP) == ROBOT_SESSION_CONTROL_FREEDRIVE:
+            self.robot.disable_freedrive()
+        else:
+            self.robot.disarm_motion()
         self.config.controller_motion_enabled = False
         with self.lock:
             if self.active_session is session:
@@ -2020,6 +2134,8 @@ def calibrate_robot_realsense_run(
         "counts": {
             **counts,
             "rot180_selected": int(sum(obs["selected"] == 1 for obs in observations)),
+            "appearance_anchor_ok": int(sum(bool((obs.get("appearance_anchor") or {}).get("ok")) for obs in observations)),
+            "appearance_anchor_rot180": int(sum((obs.get("appearance_anchor") or {}).get("order") == "rot180" for obs in observations)),
             "red_anchor_ok": int(sum(bool((obs.get("red_anchor") or {}).get("ok")) for obs in observations)),
             "red_anchor_rot180": int(sum((obs.get("red_anchor") or {}).get("order") == "rot180" for obs in observations)),
             "red_anchor_global": red_anchor_global,
@@ -2289,6 +2405,14 @@ def detect_end_observation(
     if not ok or corners is None:
         return None
     corners = np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2)
+    appearance_anchor = detect_checkerboard_appearance_anchor(
+        image,
+        corners.reshape(-1, 2),
+        cols,
+        rows,
+        min_contrast=APPEARANCE_ANCHOR_MIN_CONTRAST,
+    )
+    appearance_order = appearance_anchor.get("order") if appearance_anchor.get("ok") else None
     red_anchor = detect_red_corner_anchor(image, corners.reshape(-1, 2), cols, rows)
     anchor_order = red_anchor.get("order") if red_anchor.get("ok") else None
     camera_matrix, distortion = camera_intrinsics(camera)
@@ -2308,6 +2432,7 @@ def detect_end_observation(
                 "T_camera_board": transform_to_json(transform_from_rvec_tvec(rvec, tvec)),
                 "reprojection_rmse_px": float(np.sqrt(np.mean(error * error))),
                 "reprojection_median_px": float(np.median(error)),
+                "matches_appearance_anchor": bool(order == appearance_order) if appearance_order in ("identity", "rot180") else None,
                 "matches_red_anchor": bool(order == anchor_order) if anchor_order in ("identity", "rot180") else None,
             }
         )
@@ -2317,6 +2442,7 @@ def detect_end_observation(
     overlay = image.copy()
     cv2.drawChessboardCorners(overlay, pattern, corners, True)
     draw_red_anchor_overlay(overlay, corners.reshape(-1, 2), red_anchor, cols, rows)
+    draw_checkerboard_appearance_anchor_overlay(overlay, corners.reshape(-1, 2), appearance_anchor, cols, rows)
     cv2.imwrite(str(overlay_path), overlay, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
     return {
         "sample_index": int(sample.get("sample_index", 0)),
@@ -2326,6 +2452,7 @@ def detect_end_observation(
         "overlay": str(overlay_path),
         "method": method,
         "T_base_ee": t_base_ee,
+        "appearance_anchor": appearance_anchor,
         "red_anchor": red_anchor,
         "candidates": candidates,
         "selected": 0,
@@ -2368,12 +2495,21 @@ def checkerboard_overlay_rgb(rgb: np.ndarray, cols: int, rows: int) -> tuple[np.
         method = f"overlay_error:{type(exc).__name__}"
     if ok and corners is not None:
         corners = np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2)
+        appearance_anchor = detect_checkerboard_appearance_anchor(
+            bgr,
+            corners.reshape(-1, 2),
+            int(cols),
+            int(rows),
+            min_contrast=APPEARANCE_ANCHOR_MIN_CONTRAST,
+        )
         red_anchor = detect_red_corner_anchor(bgr, corners.reshape(-1, 2), int(cols), int(rows))
         cv2.drawChessboardCorners(overlay, pattern, corners, True)
         draw_red_anchor_overlay(overlay, corners.reshape(-1, 2), red_anchor, int(cols), int(rows))
+        draw_checkerboard_appearance_anchor_overlay(overlay, corners.reshape(-1, 2), appearance_anchor, int(cols), int(rows))
         status = f"checkerboard detected: {len(corners)}/{int(cols) * int(rows)}"
         color = (80, 220, 120)
     else:
+        appearance_anchor = None
         red_anchor = None
         status = "checkerboard not detected"
         color = (80, 120, 255)
@@ -2384,6 +2520,7 @@ def checkerboard_overlay_rgb(rgb: np.ndarray, cols: int, rows: int) -> tuple[np.
         "detectedCorners": int(len(corners)) if ok and corners is not None else 0,
         "expectedCorners": int(cols) * int(rows),
         "method": method,
+        "appearanceAnchor": appearance_anchor,
         "redAnchor": red_anchor,
     }
 
@@ -2434,6 +2571,12 @@ def solve_end_hand_eye(observations: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def initial_candidate_index(obs: dict[str, Any]) -> int:
+    appearance_anchor = obs.get("appearance_anchor") if isinstance(obs.get("appearance_anchor"), dict) else {}
+    appearance_order = appearance_anchor.get("order") if appearance_anchor.get("ok") else None
+    if appearance_order in ("identity", "rot180"):
+        for index, candidate in enumerate(obs.get("candidates") or []):
+            if candidate.get("order") == appearance_order:
+                return int(index)
     red_anchor = obs.get("red_anchor") if isinstance(obs.get("red_anchor"), dict) else {}
     anchor_order = red_anchor.get("order") if red_anchor.get("ok") else None
     if anchor_order in ("identity", "rot180"):
@@ -2593,6 +2736,12 @@ def hand_eye_residual_vector(params: np.ndarray, observations: list[dict[str, An
 
 
 def choose_candidate(obs: dict[str, Any], t_ee_camera: np.ndarray, t_base_board: np.ndarray) -> int:
+    appearance_anchor = obs.get("appearance_anchor") if isinstance(obs.get("appearance_anchor"), dict) else {}
+    appearance_order = appearance_anchor.get("order") if appearance_anchor.get("ok") else None
+    if appearance_order in ("identity", "rot180"):
+        for index, candidate in enumerate(obs.get("candidates") or []):
+            if candidate.get("order") == appearance_order:
+                return int(index)
     red_anchor = obs.get("red_anchor") if isinstance(obs.get("red_anchor"), dict) else {}
     anchor_order = red_anchor.get("order") if red_anchor.get("ok") else None
     if anchor_order in ("identity", "rot180"):
@@ -3250,6 +3399,7 @@ def observations_to_json(observations: list[dict[str, Any]]) -> list[dict[str, A
                 "overlay": obs.get("overlay"),
                 "method": obs.get("method"),
                 "selected": obs.get("selected"),
+                "appearance_anchor": obs.get("appearance_anchor"),
                 "red_anchor": obs.get("red_anchor"),
                 "candidates": obs.get("candidates"),
             }
