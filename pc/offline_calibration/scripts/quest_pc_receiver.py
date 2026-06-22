@@ -3591,8 +3591,12 @@ def build_recording_replay_payload(
     calibration_failure = replay_calibration_failure(session_dir, summary, resolved_source, calibration_output_root)
 
     board_matrix_world = matrix_from_snapshot(snapshot)
-    board_origin_world = matrix_translation(board_matrix_world) if board_matrix_world is not None else [0.0, 0.0, 0.0]
-    board_matrix_display = translated_matrix_4x4(board_matrix_world, board_origin_world) if board_matrix_world is not None else None
+    if board_matrix_world is None:
+        board_origin_world = [0.0, 0.0, 0.0]
+        board_matrix_display = default_board_matrix_4x4()
+    else:
+        board_origin_world = matrix_translation(board_matrix_world)
+        board_matrix_display = translated_matrix_4x4(board_matrix_world, board_origin_world)
 
     raw_rows: list[dict[str, Any]] = []
     samples: list[dict[str, Any]] = []
@@ -4025,6 +4029,15 @@ def matrix_from_snapshot(snapshot: dict[str, Any]) -> list[list[float]] | None:
     except (TypeError, ValueError):
         return None
     return result
+
+
+def default_board_matrix_4x4() -> list[list[float]]:
+    return [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
 
 
 def matrix_translation(matrix: list[list[float]]) -> list[float]:
@@ -6308,12 +6321,17 @@ function computeBounds() {
   return {center, radius};
 }
 
+function liveBoardSpec() {
+  const result = state.calibration?.result || {};
+  const matrix = result?.T_world_board?.matrix_4x4 || defaultBoardMatrix4();
+  const pattern = Array.isArray(result.pattern) ? result.pattern : [11, 8];
+  const square = Number.isFinite(Number(result.squareSizeM)) ? Number(result.squareSizeM) : 0.025;
+  return {matrix, pattern, square};
+}
+
 function liveBoardPoints() {
-  const result = state.calibration?.result;
-  const matrix = result?.T_world_board?.matrix_4x4;
+  const {matrix, pattern, square} = liveBoardSpec();
   if (!matrix || !state.origin) return [];
-  const pattern = result.pattern || [11, 8];
-  const square = result.squareSizeM || 0.025;
   const width = (Number(pattern[0] || 11) - 1) * square;
   const height = (Number(pattern[1] || 8) - 1) * square;
   return [
@@ -7696,12 +7714,8 @@ function drawGrid() {
 }
 
 function drawCalibrationBoard() {
-  const result = state.calibration?.result;
-  const transform = result?.T_world_board;
-  const matrix = transform?.matrix_4x4;
+  const {matrix, pattern, square} = liveBoardSpec();
   if (!matrix || !state.origin) return;
-  const pattern = result.pattern || [11, 8];
-  const square = result.squareSizeM || 0.025;
   const cols = pattern[0];
   const rows = pattern[1];
   const width = (cols - 1) * square;
@@ -7886,6 +7900,10 @@ function multiplyMatrix4(a, b) {
 
 function identityMatrix4() {
   return [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]];
+}
+
+function defaultBoardMatrix4() {
+  return identityMatrix4();
 }
 
 function robotFrames(model, jointpose, baseMatrix) {
@@ -8800,8 +8818,7 @@ function boardSize() {
 }
 
 function boardPoints() {
-  const m = state.data?.boardMatrix;
-  if (!m) return [];
+  const m = replayBoardMatrix();
   const size = boardSize();
   return [
     boardPoint(m, 0, 0, 0),
@@ -8890,8 +8907,7 @@ function drawWorldAxes() {
 }
 
 function drawBoard() {
-  const m = state.data?.boardMatrix;
-  if (!m) return;
+  const m = replayBoardMatrix();
   const size = boardSize();
   const corners = boardPoints();
   const projected = corners.map(project);
@@ -9244,6 +9260,10 @@ function multiplyMatrix4(a, b) {
 
 function identityMatrix4() {
   return [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]];
+}
+
+function replayBoardMatrix() {
+  return state.data?.boardMatrix || identityMatrix4();
 }
 
 function robotFrames(model, jointpose, baseMatrix) {
