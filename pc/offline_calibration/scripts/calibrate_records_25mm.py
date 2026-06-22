@@ -421,7 +421,7 @@ def main() -> int:
     result["description"] = (
         "Per-record calibration from recorded passthrough videos and recorded passthrough camera poses. "
         "The fit runs in the raw Unity trajectory frame, then T_world_board is exported in the PC "
-        "right-handed world frame; T_unity_world_board preserves the raw Unity result."
+        "right-handed Z-up world frame; T_unity_world_board preserves the raw Unity result."
     )
     result["records"] = records
     result["pattern"] = [args.pattern_cols, args.pattern_rows]
@@ -2225,11 +2225,11 @@ def write_report(final: dict[str, Any], path: Path) -> None:
         "",
         f"- Exported world frame: `{final.get('coordinate_frame') or PC_WORLD_FRAME}`",
         f"- Raw trajectory frame: `{final.get('raw_trajectory_frame') or UNITY_WORLD_FRAME}`",
-        "- Conversion: `pc = [unity.x, unity.y, -unity.z]`",
+        "- Conversion: `pc = [unity.z, -unity.x, unity.y]`",
         "",
         "## Per-Record T_world_board",
         "",
-        "`T_world_board` is in the exported PC right-handed world frame. "
+        "`T_world_board` is in the exported PC right-handed Z-up world frame. "
         "`T_unity_world_board` keeps the raw Unity fit for diagnostics.",
         "",
     ]

@@ -78,8 +78,8 @@ APPEARANCE_ANCHOR_MIN_CONTRAST = 18.0
 QUEST_TO_ROBOT_UNALIGNED_ROTATION = np.array(
     [
         [1.0, 0.0, 0.0],
-        [0.0, 0.0, -1.0],
         [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
     ],
     dtype=float,
 )
@@ -99,6 +99,7 @@ DEFAULT_FREEDRIVE_MAX_LINEAR_VEL = 0.2
 DEFAULT_FREEDRIVE_MAX_ANGULAR_VEL = 0.6
 DEFAULT_FREEDRIVE_MAX_LINEAR_ACC = 0.8
 DEFAULT_FREEDRIVE_MAX_ANGULAR_ACC = 2.0
+FREEDRIVE_FLOATING_CARTESIAN_PRIMITIVE = "FloatingCartesian()"
 
 
 class RobotHandEyeCalibrationError(RuntimeError):
@@ -215,12 +216,29 @@ class FlexivRobotClient:
             self.last_error = None
             if wait_seconds > 0:
                 time.sleep(wait_seconds)
+            self.ensure_operational_locked("connecting Flexiv robot")
+            self.switch_mode_locked("NRT_CARTESIAN_MOTION_FORCE")
+            current_tcp = [float(v) for v in self.robot.states().tcp_pose]
+            self.freedrive_hold_pose = current_tcp
+            self.robot.SetForceControlAxis([False, False, False, False, False, False])
+            self.set_cartesian_impedance_locked(
+                DEFAULT_FREEDRIVE_HOLD_STIFFNESS,
+                DEFAULT_FREEDRIVE_DAMPING,
+            )
+            self.send_cartesian_motion_force_compat(self.robot, current_tcp)
+            self.start_cartesian_control_loop_locked()
             return self.read_state_locked()
 
     def disconnect(self) -> None:
         self.disarm_motion_locked()
         self.disable_freedrive_locked()
+        self.stop_cartesian_control_loop_locked()
         self.disable_gripper_locked()
+        if self.robot is not None:
+            try:
+                self.robot.Stop()
+            except Exception:
+                pass
         self.robot = None
         self.robot_sn = None
 
@@ -241,6 +259,7 @@ class FlexivRobotClient:
                 "freeDragPlan": self.freedrive_plan,
                 "freedriveLoopAlive": self.freedrive_thread is not None and self.freedrive_thread.is_alive(),
                 "freeDragLoopAlive": self.freedrive_thread is not None and self.freedrive_thread.is_alive(),
+                "cartesianControlLoopAlive": self.freedrive_thread is not None and self.freedrive_thread.is_alive(),
                 "freedriveLastTickUnix": self.freedrive_last_tick_unix,
                 "freeDragLastTickUnix": self.freedrive_last_tick_unix,
                 "freedriveLastError": self.freedrive_last_error,
@@ -337,6 +356,8 @@ class FlexivRobotClient:
             robot.SetForceControlAxis([False, False, False, False, False, False])
             self.motion_armed = True
             self.motion_last_target_pose = [float(v) for v in robot.states().tcp_pose]
+            self.freedrive_hold_pose = list(self.motion_last_target_pose)
+            self.start_cartesian_control_loop_locked()
             return self.read_state_locked()
 
     def enable_freedrive(self) -> dict[str, Any]:
@@ -345,6 +366,11 @@ class FlexivRobotClient:
                 raise RuntimeError("Flexiv robot is not connected")
             self.disarm_motion_locked()
             self.disable_freedrive_locked()
+            try:
+                return self.enable_floating_cartesian_freedrive_locked()
+            except Exception as exc:
+                self.freedrive_last_error = f"FloatingCartesian fallback: {exc}"
+                self.last_error = self.freedrive_last_error
             robot = self.robot
             self.ensure_operational_locked("enabling free-drag mode")
             self.switch_mode_locked("NRT_CARTESIAN_MOTION_FORCE")
@@ -354,25 +380,34 @@ class FlexivRobotClient:
                 DEFAULT_FREEDRIVE_COMPLIANT_STIFFNESS,
                 DEFAULT_FREEDRIVE_DAMPING,
             )
-            stop_event = threading.Event()
-            thread = threading.Thread(
-                target=self.freedrive_control_loop,
-                args=(robot, stop_event),
-                name="flexiv-cartesian-compliance-freedrive",
-                daemon=True,
-            )
             self.freedrive_enabled = True
             self.freedrive_method = "cartesian_compliance"
             self.freedrive_plan = None
-            self.freedrive_stop_event = stop_event
-            self.freedrive_thread = thread
             self.freedrive_hold_pose = current_tcp
             self.freedrive_last_tick_unix = None
-            self.freedrive_last_error = None
             self.motion_armed = False
             self.motion_last_target_pose = None
-            thread.start()
+            self.start_cartesian_control_loop_locked()
             return self.read_state_locked()
+
+    def enable_floating_cartesian_freedrive_locked(self) -> dict[str, Any]:
+        if self.robot is None:
+            raise RuntimeError("Flexiv robot is not connected")
+        execute_primitive = getattr(self.robot, "ExecutePrimitive", None)
+        if not callable(execute_primitive):
+            raise RuntimeError("Flexiv RDK Robot does not expose ExecutePrimitive")
+        self.stop_cartesian_control_loop_locked()
+        self.switch_mode_locked("NRT_PRIMITIVE_EXECUTION")
+        execute_primitive(FREEDRIVE_FLOATING_CARTESIAN_PRIMITIVE)
+        self.freedrive_enabled = True
+        self.freedrive_method = "floating_cartesian_primitive"
+        self.freedrive_plan = FREEDRIVE_FLOATING_CARTESIAN_PRIMITIVE
+        self.freedrive_hold_pose = None
+        self.freedrive_last_tick_unix = time.time()
+        self.freedrive_last_error = None
+        self.motion_armed = False
+        self.motion_last_target_pose = None
+        return self.read_state_locked()
 
     def disable_freedrive(self) -> dict[str, Any]:
         with self.lock:
@@ -380,13 +415,38 @@ class FlexivRobotClient:
             return self.status_unlocked()
 
     def disable_freedrive_locked(self) -> None:
-        stop_event = self.freedrive_stop_event
-        thread = self.freedrive_thread
-        if stop_event is not None:
-            stop_event.set()
-        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=1.5)
         if self.robot is not None and (self.freedrive_enabled or self.freedrive_method is not None):
+            try:
+                if self.freedrive_method == "floating_cartesian_primitive":
+                    try:
+                        self.robot.Stop()
+                        time.sleep(0.1)
+                    except Exception:
+                        pass
+                current_tcp = [float(v) for v in self.robot.states().tcp_pose]
+                self.freedrive_hold_pose = current_tcp
+                self.switch_mode_locked("NRT_CARTESIAN_MOTION_FORCE")
+                self.robot.SetForceControlAxis([False, False, False, False, False, False])
+                self.set_cartesian_impedance_locked(
+                    DEFAULT_FREEDRIVE_HOLD_STIFFNESS,
+                    DEFAULT_FREEDRIVE_DAMPING,
+                )
+                self.send_cartesian_motion_force_compat(self.robot, current_tcp)
+                self.start_cartesian_control_loop_locked()
+            except Exception as exc:
+                self.freedrive_last_error = str(exc)
+                self.last_error = str(exc)
+        self.freedrive_enabled = False
+        self.freedrive_method = None
+        self.freedrive_plan = None
+
+    def disarm_motion(self) -> dict[str, Any]:
+        with self.lock:
+            self.disarm_motion_locked()
+            return self.status_unlocked()
+
+    def disarm_motion_locked(self) -> None:
+        if self.robot is not None and self.motion_armed:
             try:
                 current_tcp = [float(v) for v in self.robot.states().tcp_pose]
                 self.freedrive_hold_pose = current_tcp
@@ -398,25 +458,7 @@ class FlexivRobotClient:
                 )
                 self.send_cartesian_motion_force_compat(self.robot, current_tcp)
             except Exception as exc:
-                self.freedrive_last_error = str(exc)
                 self.last_error = str(exc)
-        self.freedrive_enabled = False
-        self.freedrive_method = None
-        self.freedrive_plan = None
-        self.freedrive_stop_event = None
-        self.freedrive_thread = None
-
-    def disarm_motion(self) -> dict[str, Any]:
-        with self.lock:
-            self.disarm_motion_locked()
-            return self.status_unlocked()
-
-    def disarm_motion_locked(self) -> None:
-        if self.robot is not None and self.motion_armed:
-            try:
-                self.robot.Stop()
-            except Exception:
-                pass
         self.motion_armed = False
         self.motion_last_target_pose = None
 
@@ -436,6 +478,7 @@ class FlexivRobotClient:
             "freeDragPlan": self.freedrive_plan,
             "freedriveLoopAlive": self.freedrive_thread is not None and self.freedrive_thread.is_alive(),
             "freeDragLoopAlive": self.freedrive_thread is not None and self.freedrive_thread.is_alive(),
+            "cartesianControlLoopAlive": self.freedrive_thread is not None and self.freedrive_thread.is_alive(),
             "freedriveLastTickUnix": self.freedrive_last_tick_unix,
             "freeDragLastTickUnix": self.freedrive_last_tick_unix,
             "freedriveLastError": self.freedrive_last_error,
@@ -478,7 +521,34 @@ class FlexivRobotClient:
                 return guard
             self.send_cartesian_motion_force_compat(self.robot, target)
             self.motion_last_target_pose = target
+            self.freedrive_hold_pose = target
             return guard
+
+    def start_cartesian_control_loop_locked(self) -> None:
+        if self.robot is None:
+            raise RuntimeError("Flexiv robot is not connected")
+        if self.freedrive_thread is not None and self.freedrive_thread.is_alive():
+            return
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self.freedrive_control_loop,
+            args=(self.robot, stop_event),
+            name="flexiv-cartesian-control-loop",
+            daemon=True,
+        )
+        self.freedrive_stop_event = stop_event
+        self.freedrive_thread = thread
+        thread.start()
+
+    def stop_cartesian_control_loop_locked(self) -> None:
+        stop_event = self.freedrive_stop_event
+        thread = self.freedrive_thread
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.5)
+        self.freedrive_stop_event = None
+        self.freedrive_thread = None
 
     def freedrive_control_loop(self, robot: Any, stop_event: threading.Event) -> None:
         period = 1.0 / max(1.0, DEFAULT_FREEDRIVE_CONTROL_HZ)
@@ -486,8 +556,16 @@ class FlexivRobotClient:
             start = time.perf_counter()
             try:
                 current_tcp = [float(v) for v in robot.states().tcp_pose]
-                self.send_cartesian_motion_force_compat(robot, current_tcp)
-                self.freedrive_hold_pose = current_tcp
+                if self.motion_armed:
+                    target = self.motion_last_target_pose or current_tcp
+                elif self.freedrive_enabled:
+                    target = current_tcp
+                    self.freedrive_hold_pose = current_tcp
+                else:
+                    if self.freedrive_hold_pose is None:
+                        self.freedrive_hold_pose = current_tcp
+                    target = self.freedrive_hold_pose
+                self.send_cartesian_motion_force_compat(robot, target)
                 self.freedrive_last_tick_unix = time.time()
                 self.freedrive_last_error = None
             except Exception as exc:  # pragma: no cover - hardware path
@@ -1422,7 +1500,7 @@ class RobotRealsenseSession:
         else:
             mapping_rotation = QUEST_TO_ROBOT_UNALIGNED_ROTATION
             raw_offset = mapping_rotation @ raw_offset_world
-            mapping_mode = "unaligned_quest_y_to_robot_z"
+            mapping_mode = "unaligned_pc_z_up_identity"
         raw_rotation = mapping_rotation @ raw_rotation_world @ mapping_rotation.T
         offset = clamp_vector_norm(raw_offset, float(self.config.controller_max_offset_m))
         rotation_delta = clamp_rotation_angle(raw_rotation, float(self.config.controller_max_rotation_deg))

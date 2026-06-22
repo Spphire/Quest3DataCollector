@@ -7,21 +7,49 @@ import numpy as np
 
 
 UNITY_WORLD_FRAME = "unity_world_lh_y_up_z_forward"
-PC_WORLD_FRAME = "pc_world_rh_y_up_z_back"
+PC_WORLD_FRAME_LEGACY_Y_UP = "pc_world_rh_y_up_z_back"
+PC_WORLD_FRAME = "pc_world_rh_z_up_x_forward"
 WORLD_FRAME_CONVERSION = {
-    "name": "unity_lh_to_pc_rh_z_flip",
-    "position": "pc = [unity.x, unity.y, -unity.z]",
-    "quaternion_wxyz": "pc = [w, -x, -y, z]",
-    "transform": "T_pc = diag(1,1,-1,1) @ T_unity @ diag(1,1,-1,1)",
+    "name": "unity_lh_y_up_to_pc_rh_z_up",
+    "position": "pc = [unity.z, -unity.x, unity.y]",
+    "quaternion_wxyz": "derived from T_pc = C @ T_unity @ C^-1",
+    "transform": "C=[[0,0,1],[-1,0,0],[0,1,0]]; T_pc = C4 @ T_unity @ inv(C4)",
+    "axes": "pc +X=Unity +Z forward, pc +Y=Unity -X left, pc +Z=Unity +Y up",
+    "legacyPcYUpFrame": PC_WORLD_FRAME_LEGACY_Y_UP,
 }
 
-UNITY_TO_PC_REFLECTION_3X3 = np.diag([1.0, 1.0, -1.0])
-UNITY_TO_PC_REFLECTION_4X4 = np.diag([1.0, 1.0, -1.0, 1.0])
+UNITY_TO_PC_ROTATION_3X3 = np.asarray(
+    [
+        [0.0, 0.0, 1.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ],
+    dtype=float,
+)
+UNITY_TO_PC_ROTATION_4X4 = np.eye(4, dtype=float)
+UNITY_TO_PC_ROTATION_4X4[:3, :3] = UNITY_TO_PC_ROTATION_3X3
+PC_TO_UNITY_ROTATION_3X3 = UNITY_TO_PC_ROTATION_3X3.T
+PC_TO_UNITY_ROTATION_4X4 = np.eye(4, dtype=float)
+PC_TO_UNITY_ROTATION_4X4[:3, :3] = PC_TO_UNITY_ROTATION_3X3
+LEGACY_PC_Y_UP_TO_PC_Z_UP_3X3 = UNITY_TO_PC_ROTATION_3X3 @ np.diag([1.0, 1.0, -1.0])
+LEGACY_PC_Y_UP_TO_PC_Z_UP_4X4 = np.eye(4, dtype=float)
+LEGACY_PC_Y_UP_TO_PC_Z_UP_4X4[:3, :3] = LEGACY_PC_Y_UP_TO_PC_Z_UP_3X3
+PC_Z_UP_TO_LEGACY_PC_Y_UP_4X4 = np.linalg.inv(LEGACY_PC_Y_UP_TO_PC_Z_UP_4X4)
 
 
 def is_pc_world_frame(value: Any) -> bool:
     text = str(value or "").strip().lower()
     return bool(text and ("pc_world" in text or "right_handed" in text or "rh" in text))
+
+
+def is_current_pc_world_frame(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return text == PC_WORLD_FRAME or ("pc_world" in text and "z_up" in text)
+
+
+def is_legacy_pc_y_up_frame(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return text == PC_WORLD_FRAME_LEGACY_Y_UP or ("pc_world" in text and "y_up" in text)
 
 
 def is_unity_world_frame(value: Any) -> bool:
@@ -66,22 +94,32 @@ def unity_vec3_to_pc(value: Any) -> list[float] | None:
     parsed = vec3(value)
     if parsed is None:
         return None
-    return [parsed[0], parsed[1], -parsed[2]]
+    out = UNITY_TO_PC_ROTATION_3X3 @ np.asarray(parsed, dtype=float)
+    return [float(item) for item in out]
 
 
 def pc_vec3_to_unity(value: Any) -> list[float] | None:
-    return unity_vec3_to_pc(value)
+    parsed = vec3(value)
+    if parsed is None:
+        return None
+    out = PC_TO_UNITY_ROTATION_3X3 @ np.asarray(parsed, dtype=float)
+    return [float(item) for item in out]
 
 
 def unity_quaternion_wxyz_to_pc(value: Any) -> list[float] | None:
     parsed = quat_wxyz(value)
     if parsed is None:
         return None
-    return normalize_quaternion_wxyz([parsed[0], -parsed[1], -parsed[2], parsed[3]])
+    rotation = UNITY_TO_PC_ROTATION_3X3 @ quaternion_wxyz_to_matrix(parsed) @ PC_TO_UNITY_ROTATION_3X3
+    return matrix_to_quaternion_wxyz(rotation)
 
 
 def pc_quaternion_wxyz_to_unity(value: Any) -> list[float] | None:
-    return unity_quaternion_wxyz_to_pc(value)
+    parsed = quat_wxyz(value)
+    if parsed is None:
+        return None
+    rotation = PC_TO_UNITY_ROTATION_3X3 @ quaternion_wxyz_to_matrix(parsed) @ UNITY_TO_PC_ROTATION_3X3
+    return matrix_to_quaternion_wxyz(rotation)
 
 
 def unity_pose_array_to_pc(value: Any) -> list[float] | None:
@@ -133,11 +171,17 @@ def transform_payload_from_matrix(matrix: np.ndarray, coordinate_frame: str | No
 
 def unity_transform_matrix_to_pc(matrix: np.ndarray) -> np.ndarray:
     mat = np.asarray(matrix, dtype=float).reshape(4, 4)
-    return UNITY_TO_PC_REFLECTION_4X4 @ mat @ UNITY_TO_PC_REFLECTION_4X4
+    return UNITY_TO_PC_ROTATION_4X4 @ mat @ PC_TO_UNITY_ROTATION_4X4
 
 
 def pc_transform_matrix_to_unity(matrix: np.ndarray) -> np.ndarray:
-    return unity_transform_matrix_to_pc(matrix)
+    mat = np.asarray(matrix, dtype=float).reshape(4, 4)
+    return PC_TO_UNITY_ROTATION_4X4 @ mat @ UNITY_TO_PC_ROTATION_4X4
+
+
+def legacy_pc_y_up_transform_matrix_to_pc(matrix: np.ndarray) -> np.ndarray:
+    mat = np.asarray(matrix, dtype=float).reshape(4, 4)
+    return LEGACY_PC_Y_UP_TO_PC_Z_UP_4X4 @ mat @ PC_Z_UP_TO_LEGACY_PC_Y_UP_4X4
 
 
 def unity_transform_payload_to_pc(payload: Any) -> dict[str, Any] | None:
@@ -154,8 +198,10 @@ def ensure_pc_transform_payload(payload: Any, source_frame: Any = None) -> dict[
     matrix = matrix_from_transform_payload(payload)
     if matrix is None:
         return None
-    if is_pc_world_frame(frame):
+    if is_current_pc_world_frame(frame):
         return transform_payload_from_matrix(matrix, PC_WORLD_FRAME)
+    if is_legacy_pc_y_up_frame(frame):
+        return transform_payload_from_matrix(legacy_pc_y_up_transform_matrix_to_pc(matrix), PC_WORLD_FRAME)
     return transform_payload_from_matrix(unity_transform_matrix_to_pc(matrix), PC_WORLD_FRAME)
 
 

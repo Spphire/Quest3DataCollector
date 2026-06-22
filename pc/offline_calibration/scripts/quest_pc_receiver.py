@@ -879,7 +879,12 @@ class SessionWriter:
         freedrive_method = robot.get("freedriveMethod") or robot.get("freeDragMethod") if isinstance(robot, dict) else None
         freedrive_plan = robot.get("freedrivePlan") or robot.get("freeDragPlan") if isinstance(robot, dict) else None
         freedrive_loop_alive = bool(
-            isinstance(robot, dict) and (robot.get("freedriveLoopAlive") or robot.get("freeDragLoopAlive"))
+            isinstance(robot, dict)
+            and (
+                robot.get("freedriveLoopAlive")
+                or robot.get("freeDragLoopAlive")
+                or robot.get("cartesianControlLoopAlive")
+            )
         )
         freedrive_last_error = (
             robot.get("freedriveLastError") or robot.get("freeDragLastError") if isinstance(robot, dict) else None
@@ -926,6 +931,7 @@ class SessionWriter:
             "freeDragPlan": freedrive_plan,
             "freedriveLoopAlive": freedrive_loop_alive,
             "freeDragLoopAlive": freedrive_loop_alive,
+            "cartesianControlLoopAlive": freedrive_loop_alive,
             "freedriveLastError": freedrive_last_error,
             "freeDragLastError": freedrive_last_error,
             "cartesianSendSignature": freedrive_send_signature,
@@ -1780,7 +1786,12 @@ class PcCalibrationSession:
         freedrive_method = robot.get("freedriveMethod") or robot.get("freeDragMethod") if isinstance(robot, dict) else None
         freedrive_plan = robot.get("freedrivePlan") or robot.get("freeDragPlan") if isinstance(robot, dict) else None
         freedrive_loop_alive = bool(
-            isinstance(robot, dict) and (robot.get("freedriveLoopAlive") or robot.get("freeDragLoopAlive"))
+            isinstance(robot, dict)
+            and (
+                robot.get("freedriveLoopAlive")
+                or robot.get("freeDragLoopAlive")
+                or robot.get("cartesianControlLoopAlive")
+            )
         )
         freedrive_last_error = (
             robot.get("freedriveLastError") or robot.get("freeDragLastError") if isinstance(robot, dict) else None
@@ -1831,6 +1842,7 @@ class PcCalibrationSession:
             "freeDragPlan": freedrive_plan,
             "freedriveLoopAlive": freedrive_loop_alive,
             "freeDragLoopAlive": freedrive_loop_alive,
+            "cartesianControlLoopAlive": freedrive_loop_alive,
             "freedriveLastError": freedrive_last_error,
             "freeDragLastError": freedrive_last_error,
             "cartesianSendSignature": freedrive_send_signature,
@@ -3487,7 +3499,7 @@ def recording_snapshot_from_calibration_result(record_id: str, result: dict[str,
         "questWorldOriginInBoardM": event.get("questWorldOriginInBoardM"),
         "unityQuestWorldOriginInBoardM": event.get("unityQuestWorldOriginInBoardM"),
         "boardNormalWorld": event.get("boardNormalWorld"),
-        "boardNormalAbsAngleToWorldYDeg": event.get("boardNormalAbsAngleToWorldYDeg"),
+        "boardNormalAbsAngleToWorldZDeg": event.get("boardNormalAbsAngleToWorldZDeg"),
         "bestLagSeconds": event.get("bestLagSeconds"),
         "keptFrames": event.get("keptFrames"),
         "inputFrames": event.get("inputFrames"),
@@ -4693,7 +4705,7 @@ def calibration_result_event(record_id: str, result: dict[str, Any], result_path
         t_unity_world_board = t_unity_world_board or t_world_board_raw
         t_board_unity_world = t_board_unity_world or t_board_world_raw
     board_normal = None
-    board_normal_angle_y = None
+    board_normal_angle_z = None
     if isinstance(t_world_board, dict):
         rotation_matrix = t_world_board.get("rotation_matrix")
         if isinstance(rotation_matrix, list) and len(rotation_matrix) >= 3:
@@ -4703,11 +4715,11 @@ def calibration_result_event(record_id: str, result: dict[str, Any], result_path
                     float(rotation_matrix[1][2]),
                     float(rotation_matrix[2][2]),
                 ]
-                dot_y = max(-1.0, min(1.0, abs(board_normal[1])))
-                board_normal_angle_y = math.degrees(math.acos(dot_y))
+                dot_z = max(-1.0, min(1.0, abs(board_normal[2])))
+                board_normal_angle_z = math.degrees(math.acos(dot_z))
             except (TypeError, ValueError, IndexError):
                 board_normal = None
-                board_normal_angle_y = None
+                board_normal_angle_z = None
     quest_world_origin_in_board = (
         t_board_world.get("translation_m")
         if isinstance(t_board_world, dict) and isinstance(t_board_world.get("translation_m"), list)
@@ -4740,7 +4752,7 @@ def calibration_result_event(record_id: str, result: dict[str, Any], result_path
         "questWorldOriginInBoardM": quest_world_origin_in_board,
         "unityQuestWorldOriginInBoardM": unity_quest_world_origin_in_board,
         "boardNormalWorld": board_normal,
-        "boardNormalAbsAngleToWorldYDeg": board_normal_angle_y,
+        "boardNormalAbsAngleToWorldZDeg": board_normal_angle_z,
         "bestLagSeconds": result.get("best_lag_seconds"),
         "keptFrames": order.get("kept_frames"),
         "inputFrames": order.get("input_frames"),
@@ -4785,7 +4797,7 @@ def recording_calibration_snapshot(output_root: Path | None) -> dict[str, Any] |
         "questWorldOriginInBoardM": event.get("questWorldOriginInBoardM"),
         "unityQuestWorldOriginInBoardM": event.get("unityQuestWorldOriginInBoardM"),
         "boardNormalWorld": event.get("boardNormalWorld"),
-        "boardNormalAbsAngleToWorldYDeg": event.get("boardNormalAbsAngleToWorldYDeg"),
+        "boardNormalAbsAngleToWorldZDeg": event.get("boardNormalAbsAngleToWorldZDeg"),
         "bestLagSeconds": event.get("bestLagSeconds"),
         "keptFrames": event.get("keptFrames"),
         "inputFrames": event.get("inputFrames"),
@@ -6241,7 +6253,7 @@ function resize() {
 
 function resetView() {
   state.yaw = -0.72;
-  state.pitch = -0.36;
+  state.pitch = -0.62;
   const bounds = computeBounds();
   state.target = bounds.center;
   state.distance = Math.max(0.45, bounds.radius * 3.2);
@@ -6908,7 +6920,7 @@ function renderRobotStatus(payload) {
   const freeDragMethod = robot.freeDragMethod || robot.freedriveMethod || '';
   const freeDragPlan = robot.freeDragPlan || robot.freedrivePlan || '';
   const freeDragDetail = freeDragPlan || freeDragMethod;
-  const freeDragLoopAlive = Boolean(robot.freeDragLoopAlive || robot.freedriveLoopAlive);
+  const cartesianLoopAlive = Boolean(robot.cartesianControlLoopAlive || robot.freeDragLoopAlive || robot.freedriveLoopAlive);
   const freeDragLastError = robot.freeDragLastError || robot.freedriveLastError || '';
   const cartesianSendSignature = robot.cartesianSendSignature || '';
   const teleopText = controlMode === 'controller_teleop'
@@ -6919,7 +6931,7 @@ function renderRobotStatus(payload) {
     `control: ${controlMode}`,
     `teleop: ${teleopText}`,
     `free-drag: ${freeDragEnabled ? `enabled${freeDragDetail ? ` via ${freeDragDetail}` : ''}` : 'disabled'}`,
-    `free-drag loop: ${freeDragEnabled ? (freeDragLoopAlive ? 'running' : 'not running') : 'off'}${cartesianSendSignature ? ` (${cartesianSendSignature})` : ''}`,
+    `cartesian loop: ${cartesianLoopAlive ? 'running' : 'off'}${cartesianSendSignature ? ` (${cartesianSendSignature})` : ''}`,
     `controller motion: ${payload.config?.controllerMotionEnabled ? 'enabled' : 'disabled'}`,
     `joint guard: ${robotJointGuardText(robot.state?.jointLimitGuard, payload.config)}`,
     `pose: ${robot.poseField || 'n/a'}`,
@@ -6928,7 +6940,7 @@ function renderRobotStatus(payload) {
     `third camera: ${payload.config?.thirdCameraSerial || 'off'}`,
     `stream: ${realsenseStreamText(payload.realsenseStream)}`,
     `exposure: ${payload.config?.realsenseAutoExposure === false ? 'manual' : 'auto'}${Number.isFinite(payload.config?.realsenseExposure) ? ` ${payload.config.realsenseExposure}` : ''}${Number.isFinite(payload.config?.realsenseGain) ? ` gain ${payload.config.realsenseGain}` : ''}`,
-    `robot frame: ${state.robotWorldBase ? 'aligned to Quest/world' : 'unaligned at viewer origin, Y up'}`,
+    `robot frame: ${state.robotWorldBase ? 'aligned to Quest/world' : 'unaligned at viewer origin, Z up'}`,
     `session: ${payload.activeSession ? `${active.samples || 0} samples, ${active.images || 0} images` : 'idle'}`
   ];
   lines.push(`model: ${robotModelStatusText()}`);
@@ -7226,8 +7238,9 @@ function renderCalibrationStatusDetails(event) {
   if (!robot) return;
   const robotClass = robot.recording ? 'calibration-ok' : 'calibration-alert';
   const mode = robot.controlMode || 'n/a';
+  const cartesianLoop = robot.cartesianControlLoopAlive || robot.freeDragLoopAlive || robot.freedriveLoopAlive;
   const controlText = mode === 'freedrive'
-    ? `free-drag ${robot.freeDragEnabled || robot.freedriveEnabled ? 'enabled' : 'not enabled'}${robot.freeDragPlan || robot.freedrivePlan || robot.freeDragMethod || robot.freedriveMethod ? ` via ${robot.freeDragPlan || robot.freedrivePlan || robot.freeDragMethod || robot.freedriveMethod}` : ''}${robot.freeDragLoopAlive || robot.freedriveLoopAlive ? ', loop running' : ''}${robot.cartesianSendSignature ? `, ${robot.cartesianSendSignature}` : ''}`
+    ? `free-drag ${robot.freeDragEnabled || robot.freedriveEnabled ? 'enabled' : 'not enabled'}${robot.freeDragPlan || robot.freedrivePlan || robot.freeDragMethod || robot.freedriveMethod ? ` via ${robot.freeDragPlan || robot.freedrivePlan || robot.freeDragMethod || robot.freedriveMethod}` : ''}${cartesianLoop ? ', cartesian loop running' : ''}${robot.cartesianSendSignature ? `, ${robot.cartesianSendSignature}` : ''}`
     : (mode === 'controller_teleop' ? 'hold right middle-finger trigger' : mode);
   calibrationDetails.innerHTML = `
     <div class="${robotClass}">${escapeHtml(event.message || 'PC calibration recording')}</div>
@@ -7274,8 +7287,8 @@ function renderCalibrationResult(event) {
   const median = Number.isFinite(event.medianReprojectionPx) ? `${event.medianReprojectionPx.toFixed(2)}px` : 'n/a';
   const p90 = Number.isFinite(event.p90ReprojectionPx) ? `${event.p90ReprojectionPx.toFixed(2)}px` : 'n/a';
   const lag = Number.isFinite(event.bestLagSeconds) ? `${(event.bestLagSeconds * 1000).toFixed(1)} ms` : 'n/a';
-  const normalAngle = Number.isFinite(event.boardNormalAbsAngleToWorldYDeg)
-    ? `${event.boardNormalAbsAngleToWorldYDeg.toFixed(1)} deg`
+  const normalAngle = Number.isFinite(event.boardNormalAbsAngleToWorldZDeg)
+    ? `${event.boardNormalAbsAngleToWorldZDeg.toFixed(1)} deg`
     : 'n/a';
   const redAnchorFrames = Number.isFinite(event.redAnchorFrames)
     ? `${event.redAnchorFrames} / ${event.keptFrames ?? 'n/a'}`
@@ -7290,7 +7303,7 @@ function renderCalibrationResult(event) {
       <span>red anchor</span><span>${redAnchorFrames}</span>
       <span>rot180</span><span>${event.rot180Frames ?? 'n/a'}</span>
       <span>median / p90</span><span>${median} / ${p90}</span>
-      <span>board Z vs world Y</span><span>${normalAngle}</span>
+      <span>board Z vs world Z</span><span>${normalAngle}</span>
     </div>`;
 }
 
@@ -7449,7 +7462,7 @@ function robotLiveBaseMatrix() {
 }
 
 function unalignedRobotBaseMatrix() {
-  return eulerXyzMatrix(-Math.PI / 2, 0, 0);
+  return identityMatrix4();
 }
 
 function liveRobotJointpose() {
@@ -7674,8 +7687,8 @@ function drawGrid() {
   for (let v = -extent; v <= extent + 1e-6; v += step) {
     const major = Math.abs(Math.round(v * 10) % 5) === 0;
     const color = major ? 'rgba(92,105,118,0.32)' : 'rgba(92,105,118,0.14)';
-    drawLine([-extent, 0, v], [extent, 0, v], color, major ? 1.1 : 0.8);
-    drawLine([v, 0, -extent], [v, 0, extent], color, major ? 1.1 : 0.8);
+    drawLine([-extent, v, 0], [extent, v, 0], color, major ? 1.1 : 0.8);
+    drawLine([v, -extent, 0], [v, extent, 0], color, major ? 1.1 : 0.8);
   }
   drawLine([0,0,0], [0.35,0,0], 'rgba(255,75,75,0.8)', 2);
   drawLine([0,0,0], [0,0.35,0], 'rgba(75,255,120,0.8)', 2);
@@ -7805,17 +7818,17 @@ function project(p) {
   const z = p[2] - state.target[2];
   const cy = Math.cos(state.yaw), sy = Math.sin(state.yaw);
   const cp = Math.cos(state.pitch), sp = Math.sin(state.pitch);
-  const x1 = cy * x - sy * z;
-  const z1 = sy * x + cy * z;
-  const y1 = y;
-  const y2 = cp * y1 - sp * z1;
-  const z2 = sp * y1 + cp * z1 + state.distance;
+  const x1 = cy * x - sy * y;
+  const y1 = sy * x + cy * y;
+  const z1 = z;
+  const screenY = cp * z1 - sp * y1;
+  const depth = sp * z1 + cp * y1 + state.distance;
   const f = Math.min(rect.width, rect.height) * 0.92;
   return {
-    x: rect.width * 0.5 + x1 * f / Math.max(0.03, z2),
-    y: rect.height * 0.5 - y2 * f / Math.max(0.03, z2),
-    z: z2,
-    visible: z2 > 0.03
+    x: rect.width * 0.5 + x1 * f / Math.max(0.03, depth),
+    y: rect.height * 0.5 - screenY * f / Math.max(0.03, depth),
+    z: depth,
+    visible: depth > 0.03
   };
 }
 
@@ -8800,7 +8813,7 @@ function boardPoints() {
 
 function resetView() {
   state.yaw = -0.82;
-  state.pitch = -0.34;
+  state.pitch = -0.62;
   state.target = [0,0,0];
   const pts = boardPoints();
   for (const s of state.data?.samples || []) {
@@ -8865,8 +8878,8 @@ function drawGroundGrid() {
   const extent = 1.0, step = 0.1;
   for (let v = -extent; v <= extent + 1e-6; v += step) {
     const alpha = Math.abs(v) < 1e-6 ? 0.24 : 0.10;
-    drawLine([-extent,0,v], [extent,0,v], `rgba(255,255,255,${alpha})`, 1);
-    drawLine([v,0,-extent], [v,0,extent], `rgba(255,255,255,${alpha})`, 1);
+    drawLine([-extent,v,0], [extent,v,0], `rgba(255,255,255,${alpha})`, 1);
+    drawLine([v,-extent,0], [v,extent,0], `rgba(255,255,255,${alpha})`, 1);
   }
 }
 
@@ -9023,7 +9036,7 @@ function robotReplayBaseMatrix() {
 }
 
 function unalignedRobotBaseMatrix() {
-  return eulerXyzMatrix(-Math.PI / 2, 0, 0);
+  return identityMatrix4();
 }
 
 function preloadRobotMeshes(model) {
@@ -9177,12 +9190,12 @@ function project(p) {
   const x = p[0] - state.target[0], y = p[1] - state.target[1], z = p[2] - state.target[2];
   const cy = Math.cos(state.yaw), sy = Math.sin(state.yaw);
   const cp = Math.cos(state.pitch), sp = Math.sin(state.pitch);
-  const x1 = cy * x - sy * z;
-  const z1 = sy * x + cy * z;
-  const y2 = cp * y - sp * z1;
-  const z2 = sp * y + cp * z1 + state.distance;
+  const x1 = cy * x - sy * y;
+  const y1 = sy * x + cy * y;
+  const screenY = cp * z - sp * y1;
+  const depth = sp * z + cp * y1 + state.distance;
   const focal = Math.min(rect.width, rect.height) * 0.92;
-  return {x: rect.width * 0.5 + x1 * focal / Math.max(0.03, z2), y: rect.height * 0.5 - y2 * focal / Math.max(0.03, z2), z: z2, visible: z2 > 0.03};
+  return {x: rect.width * 0.5 + x1 * focal / Math.max(0.03, depth), y: rect.height * 0.5 - screenY * focal / Math.max(0.03, depth), z: depth, visible: depth > 0.03};
 }
 
 function boardPoint(m, x, y, z) {

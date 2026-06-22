@@ -123,11 +123,11 @@ adb devices -l
   `A` normal recording after Quest-robot calibration is available.
 - The headset recording indicator turns on while recording is active.
 
-For `B` calibration recording, the PC switches Flexiv into Cartesian
-motion-force mode, lowers Cartesian impedance, and runs a small compliance loop
-so the robot can be physically dragged while the end-camera trajectory is
-recorded. Move the end camera by hand, then press `B` again to stop recording
-and return the robot to a high-stiffness hold.
+For `B` calibration recording, the PC first tries Flexiv's native
+`FloatingCartesian()` free-drive primitive. If that primitive is unavailable or
+not licensed, it falls back to the same Cartesian motion-force compliance loop
+used by the iPhone calibration tool: low Cartesian impedance while recording,
+then high-stiffness hold when recording stops.
 
 For `A` normal recording, robot motion is gated by the right hand side/grip
 trigger. Moving the right controller without holding that trigger records
@@ -151,8 +151,8 @@ Before recording:
 
 The 3D view can be dragged to orbit and scrolled to zoom. Unity/Quest telemetry
 arrives in raw Unity world coordinates (`x` right, `y` up, `z` forward). The PC
-viewer, replay, and robot bridge display a derived right-handed frame with
-`pc = [unity.x, unity.y, -unity.z]`; raw Unity samples are still stored for audit.
+viewer, replay, and robot bridge display a derived right-handed Z-up frame with
+`pc = [unity.z, -unity.x, unity.y]`; raw Unity samples are still stored for audit.
 After calibration, the display translates the checkerboard near the origin while
 keeping the converted world axes.
 
@@ -274,7 +274,7 @@ third-camera video when those artifacts exist in the record.
 - Quest is visible in ADB but install fails: `unauthorized` means the headset has not accepted USB debugging.
 - A/B buttons do not start recording: confirm Touch controllers are active; hand tracking alone does not fire these hotkeys.
 - Robot connected but does not move during `A`: confirm the latest calibration is loaded, then hold the right side/grip trigger during the active recording/session.
-- Robot cannot be dragged during `B`: check the live robot status for `control: freedrive`, `free-drag: enabled via cartesian_compliance`, and `free-drag loop: running`. If the loop is not running or reports an error, clear robot faults, reconnect Flexiv, and restart the receiver.
+- Robot cannot be dragged during `B`: check the live robot status for `control: freedrive` and `free-drag: enabled`. If it says `floating_cartesian_primitive`, verify the arm is in a state where Flexiv native free-drive is allowed. If it falls back to `cartesian_compliance`, verify `cartesian loop: running`, clear robot faults, reconnect Flexiv, and restart the receiver.
 - Robot mesh does not follow the real arm: check that `joint age` stays low and that `joints:` changes when the real robot moves. If not, refresh the page and reconnect the robot.
 - Robot mesh is visible but kinematically wrong: check `URDF FK vs flange`. A large value usually means the active URDF variant is not the correct one for the physical arm.
 - Robot motion skips with `joint_limit_buffer`: move the arm away from the reported joint limit or reduce the teleop target direction; the guard is intentionally stopping TCP commands before Flexiv reaches its own limit stop.

@@ -353,7 +353,7 @@ function setSnapshotInfo() {
     ['image y', s.imageYAxis || 'n/a'],
     ['lag', Number.isFinite(s.bestLagSeconds) ? (s.bestLagSeconds * 1000).toFixed(1) + ' ms' : 'n/a'],
     ['median', Number.isFinite(s.medianReprojectionPx) ? s.medianReprojectionPx.toFixed(2) + ' px' : 'n/a'],
-    ['board Z vs Y', Number.isFinite(s.boardNormalAbsAngleToWorldYDeg) ? s.boardNormalAbsAngleToWorldYDeg.toFixed(1) + ' deg' : 'n/a']
+    ['board Z vs world Z', Number.isFinite(s.boardNormalAbsAngleToWorldZDeg) ? s.boardNormalAbsAngleToWorldZDeg.toFixed(1) + ' deg' : 'n/a']
   ];
   snapKv.innerHTML = kv.map(([k, v]) => `<span>${k}</span><span>${v}</span>`).join('');
   sessionLabel.textContent = DATA.sessionDir || '';
@@ -361,7 +361,7 @@ function setSnapshotInfo() {
 
 function resetView() {
   state.yaw = -0.82;
-  state.pitch = -0.34;
+  state.pitch = -0.62;
   state.target = [0, 0, 0];
   const points = boardPoints();
   for (const sample of DATA.samples) {
@@ -446,8 +446,8 @@ function drawGroundGrid() {
   const step = 0.1;
   for (let v = -extent; v <= extent + 1e-6; v += step) {
     const alpha = Math.abs(v) < 1e-6 ? 0.24 : 0.10;
-    drawLine([-extent, 0, v], [extent, 0, v], `rgba(255,255,255,${alpha})`, 1);
-    drawLine([v, 0, -extent], [v, 0, extent], `rgba(255,255,255,${alpha})`, 1);
+    drawLine([-extent, v, 0], [extent, v, 0], `rgba(255,255,255,${alpha})`, 1);
+    drawLine([v, -extent, 0], [v, extent, 0], `rgba(255,255,255,${alpha})`, 1);
   }
 }
 
@@ -551,15 +551,15 @@ function project(p) {
   const z = p[2] - state.target[2];
   const cy = Math.cos(state.yaw), sy = Math.sin(state.yaw);
   const cp = Math.cos(state.pitch), sp = Math.sin(state.pitch);
-  const x1 = cy * x - sy * z;
-  const z1 = sy * x + cy * z;
-  const y2 = cp * y - sp * z1;
-  const z2 = sp * y + cp * z1 + state.distance;
+  const x1 = cy * x - sy * y;
+  const y1 = sy * x + cy * y;
+  const screenY = cp * z - sp * y1;
+  const depth = sp * z + cp * y1 + state.distance;
   const focal = Math.min(rect.width, rect.height) * 0.92;
   return {
-    x: rect.width * 0.5 + x1 * focal / Math.max(0.03, z2),
-    y: rect.height * 0.5 - y2 * focal / Math.max(0.03, z2),
-    visible: z2 > 0.03
+    x: rect.width * 0.5 + x1 * focal / Math.max(0.03, depth),
+    y: rect.height * 0.5 - screenY * focal / Math.max(0.03, depth),
+    visible: depth > 0.03
   };
 }
 
