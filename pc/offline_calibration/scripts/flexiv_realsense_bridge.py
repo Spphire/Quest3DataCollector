@@ -91,6 +91,7 @@ ROBOT_SESSION_CONTROL_MODES = {
     ROBOT_SESSION_CONTROL_FREEDRIVE,
     ROBOT_SESSION_CONTROL_RECORD_ONLY,
 }
+DEFAULT_FREEDRIVE_PLANS = ("PLAN-FreeDriveManual", "PLAN-FreeDriveAuto")
 
 
 class RobotHandEyeCalibrationError(RuntimeError):
@@ -166,6 +167,8 @@ class FlexivRobotClient:
         self.motion_armed = False
         self.motion_last_target_pose: list[float] | None = None
         self.freedrive_enabled = False
+        self.freedrive_method: str | None = None
+        self.freedrive_plan: str | None = None
         self.gripper: Any | None = None
         self.gripper_enabled = False
         self.gripper_device: str | None = None
@@ -219,6 +222,10 @@ class FlexivRobotClient:
                 "motionArmed": self.motion_armed,
                 "freedriveEnabled": self.freedrive_enabled,
                 "freeDragEnabled": self.freedrive_enabled,
+                "freedriveMethod": self.freedrive_method,
+                "freeDragMethod": self.freedrive_method,
+                "freedrivePlan": self.freedrive_plan,
+                "freeDragPlan": self.freedrive_plan,
                 "gripper": self.gripper_status_locked(),
             }
             if connected:
@@ -320,10 +327,36 @@ class FlexivRobotClient:
                 if time.time() - start > 5.0:
                     raise RuntimeError("Timed out waiting for Flexiv robot to become operational")
                 time.sleep(0.05)
-            robot.SwitchMode(flexivrdk.Mode.NRT_JOINT_IMPEDANCE)
-            joint_pose = self.read_joint_pose_locked()
-            dof = len(joint_pose) if joint_pose else len(self.joint_limits) or 7
-            robot.SetJointImpedance([0.0] * dof)
+            plan_errors: list[str] = []
+            try:
+                available_plans = set(str(row) for row in robot.plan_list())
+            except Exception as exc:
+                available_plans = set()
+                plan_errors.append(f"plan_list failed: {exc}")
+            for plan_name in DEFAULT_FREEDRIVE_PLANS:
+                if available_plans and plan_name not in available_plans:
+                    continue
+                try:
+                    robot.SwitchMode(flexivrdk.Mode.NRT_PLAN_EXECUTION)
+                    robot.ExecutePlan(plan_name, False, True)
+                    self.freedrive_enabled = True
+                    self.freedrive_method = "plan"
+                    self.freedrive_plan = plan_name
+                    self.motion_armed = False
+                    self.motion_last_target_pose = None
+                    return self.read_state_locked()
+                except Exception as exc:
+                    plan_errors.append(f"{plan_name}: {exc}")
+            try:
+                robot.SwitchMode(flexivrdk.Mode.NRT_JOINT_IMPEDANCE)
+                joint_pose = self.read_joint_pose_locked()
+                dof = len(joint_pose) if joint_pose else len(self.joint_limits) or 7
+                robot.SetJointImpedance([0.0] * dof)
+                self.freedrive_method = "nrt_joint_impedance_zero_stiffness"
+                self.freedrive_plan = None
+            except Exception as exc:
+                detail = "; ".join(plan_errors + [f"impedance fallback: {exc}"])
+                raise RuntimeError(f"Failed to enable Flexiv free-drag mode ({detail})") from exc
             self.freedrive_enabled = True
             self.motion_armed = False
             self.motion_last_target_pose = None
@@ -341,6 +374,8 @@ class FlexivRobotClient:
             except Exception:
                 pass
         self.freedrive_enabled = False
+        self.freedrive_method = None
+        self.freedrive_plan = None
 
     def disarm_motion(self) -> dict[str, Any]:
         with self.lock:
@@ -366,6 +401,10 @@ class FlexivRobotClient:
             "motionArmed": self.motion_armed,
             "freedriveEnabled": self.freedrive_enabled,
             "freeDragEnabled": self.freedrive_enabled,
+            "freedriveMethod": self.freedrive_method,
+            "freeDragMethod": self.freedrive_method,
+            "freedrivePlan": self.freedrive_plan,
+            "freeDragPlan": self.freedrive_plan,
             "gripper": self.gripper_status_locked(),
         }
         if connected:

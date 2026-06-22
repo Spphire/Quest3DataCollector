@@ -218,12 +218,12 @@ Then:
 2. Enter the Flexiv robot SN.
 3. Click `Connect Robot`.
 4. Click `Check Board` before recording. It captures one end-camera frame, checks for the 11x8 checkerboard, saves the frame/overlay under `board_checks/end_camera/`, and reports brightness. If it says the image is very dark, fix lighting/camera aim before recording.
-5. Connect the robot. Robot motion is armed automatically when the robot session starts, so the right controller can drive bounded TCP offsets during B-button calibration.
+5. Connect the robot. During B-button calibration the robot session starts Flexiv's built-in `PLAN-FreeDriveManual` so the operator can physically drag the end camera; right-controller TCP teleoperation is reserved for A-button normal recordings after Quest-robot alignment is available.
 6. Check the live viewer `Preflight` panel. It aggregates `/preflight/status` and should show OK for Quest live telemetry, Flexiv, End RealSense, checkerboard, and URDF model before a real run. The right-controller robot-motion row is advisory and should report armed motion once the robot session is live.
 7. Press Quest B once to start PC calibration capture.
 8. Move the Quest for Quest/checkerboard pose diversity.
 9. Move the robot/end camera for robot/checkerboard pose diversity while keeping the checkerboard visible to the end-mounted RealSense in at least six captured samples.
-10. Press Quest B again to stop. Stopping also disarms controller motion.
+10. Press Quest B again to stop. Stopping also exits the free-drive plan.
 
 If Touch controllers are not connected and the Quest only reports hand tracking, B/A hotkeys will not fire. For hardware/debug smoke tests, the Unity `QuestCameraRecorderCommandBridge` also accepts file commands through:
 
@@ -267,7 +267,8 @@ This unifies Quest world, checkerboard, and robot base in the live/replay visual
 - Unity sends raw Unity world telemetry (`unity_world_lh_y_up_z_forward`). PC code keeps those raw samples for traceability and derives a canonical display/robot frame (`pc_world_rh_y_up_z_back`) with `pc = [unity.x, unity.y, -unity.z]`. Apply that conversion only at PC boundaries: live visualization, replay payloads, robot alignment, and controller teleoperation.
 - Calibration fitting stays in the raw Unity trajectory frame so the video reprojection model remains unchanged. Exported Quest calibration snapshots include PC-frame `T_world_board`/`T_board_world` plus raw `T_unity_world_board`/`T_board_unity_world` for diagnostics. Legacy snapshots without frame metadata are treated as raw Unity and converted when loaded.
 - The bridge uses `flexivrdk.Robot(sn).states()` and records the configured `flange_pose` or `tcp_pose` as `[x, y, z, qw, qx, qy, qz]`.
-- Right-controller motion uses Flexiv RDK v1.7 non-real-time Cartesian motion-force mode with all force-control axes disabled. It reads the controller in the canonical PC frame, maps PC `y` up to robot `z` up before hand-eye exists, and maps through `T_base_world` after hand-eye succeeds.
+- Right-controller motion uses Flexiv RDK v1.7 non-real-time Cartesian motion-force mode with all force-control axes disabled. It reads the controller in the canonical PC frame and maps through `T_base_world`; A-button robot teleoperation requires this Quest-robot alignment to be available.
+- B-button calibration free-drag uses the robot's built-in `PLAN-FreeDriveManual`. The lab PC's Python `flexivrdk==1.7.0` package does not expose the RT joint-torque streaming API used by Flexiv's C++ joint-floating example, so do not rely on `NRT_JOINT_IMPEDANCE` zero stiffness for physical drag.
 - RealSense intrinsics come from `pyrealsense2` color stream metadata.
 - The board is fixed at 11x8 inner corners, 25 mm square size.
 - Hand-eye calibration solves `T_ee_realsense` and `T_base_board` from repeated end-camera observations of the fixed board.

@@ -876,6 +876,8 @@ class SessionWriter:
         freedrive_enabled = bool(
             isinstance(robot, dict) and (robot.get("freedriveEnabled") or robot.get("freeDragEnabled"))
         )
+        freedrive_method = robot.get("freedriveMethod") or robot.get("freeDragMethod") if isinstance(robot, dict) else None
+        freedrive_plan = robot.get("freedrivePlan") or robot.get("freeDragPlan") if isinstance(robot, dict) else None
         controller_motion = bool(isinstance(config, dict) and config.get("controllerMotionEnabled"))
         control_mode = active.get("controlMode") if isinstance(active, dict) else ROBOT_SESSION_CONTROL_TELEOP
         if control_mode not in (ROBOT_SESSION_CONTROL_TELEOP, ROBOT_SESSION_CONTROL_FREEDRIVE):
@@ -911,6 +913,10 @@ class SessionWriter:
             "motionArmed": motion_armed,
             "freedriveEnabled": freedrive_enabled,
             "freeDragEnabled": freedrive_enabled,
+            "freedriveMethod": freedrive_method,
+            "freeDragMethod": freedrive_method,
+            "freedrivePlan": freedrive_plan,
+            "freeDragPlan": freedrive_plan,
             "controlMode": control_mode,
             "controllerMotionEnabled": controller_motion,
             "teleopRequiresRightSideButton": control_mode == ROBOT_SESSION_CONTROL_TELEOP,
@@ -1759,6 +1765,8 @@ class PcCalibrationSession:
         freedrive_enabled = bool(
             isinstance(robot, dict) and (robot.get("freedriveEnabled") or robot.get("freeDragEnabled"))
         )
+        freedrive_method = robot.get("freedriveMethod") or robot.get("freeDragMethod") if isinstance(robot, dict) else None
+        freedrive_plan = robot.get("freedrivePlan") or robot.get("freeDragPlan") if isinstance(robot, dict) else None
         controller_motion = bool(isinstance(config, dict) and config.get("controllerMotionEnabled"))
         control_mode = active.get("controlMode") if isinstance(active, dict) else ROBOT_SESSION_CONTROL_FREEDRIVE
         if control_mode not in (ROBOT_SESSION_CONTROL_TELEOP, ROBOT_SESSION_CONTROL_FREEDRIVE):
@@ -1798,6 +1806,10 @@ class PcCalibrationSession:
             "motionArmed": motion_armed,
             "freedriveEnabled": freedrive_enabled,
             "freeDragEnabled": freedrive_enabled,
+            "freedriveMethod": freedrive_method,
+            "freeDragMethod": freedrive_method,
+            "freedrivePlan": freedrive_plan,
+            "freeDragPlan": freedrive_plan,
             "controlMode": control_mode,
             "controllerMotionEnabled": controller_motion,
             "teleopRequiresRightSideButton": control_mode == ROBOT_SESSION_CONTROL_TELEOP,
@@ -6863,6 +6875,9 @@ function renderRobotStatus(payload) {
   const active = payload.activeSession || {};
   const controlMode = active.controlMode || (robot.freeDragEnabled || robot.freedriveEnabled ? 'freedrive' : 'idle');
   const freeDragEnabled = Boolean(robot.freeDragEnabled || robot.freedriveEnabled);
+  const freeDragMethod = robot.freeDragMethod || robot.freedriveMethod || '';
+  const freeDragPlan = robot.freeDragPlan || robot.freedrivePlan || '';
+  const freeDragDetail = freeDragPlan || freeDragMethod;
   const teleopText = controlMode === 'controller_teleop'
     ? `hold right middle-finger trigger${robot.motionArmed ? ' (motion mode active)' : ' (motion not armed)'}`
     : 'off';
@@ -6870,7 +6885,7 @@ function renderRobotStatus(payload) {
     `robot: ${robot.connected ? 'connected' : 'not connected'} ${robot.robotSn || ''}`.trim(),
     `control: ${controlMode}`,
     `teleop: ${teleopText}`,
-    `free-drag: ${freeDragEnabled ? 'enabled' : 'disabled'}`,
+    `free-drag: ${freeDragEnabled ? `enabled${freeDragDetail ? ` via ${freeDragDetail}` : ''}` : 'disabled'}`,
     `controller motion: ${payload.config?.controllerMotionEnabled ? 'enabled' : 'disabled'}`,
     `joint guard: ${robotJointGuardText(robot.state?.jointLimitGuard, payload.config)}`,
     `pose: ${robot.poseField || 'n/a'}`,
@@ -7174,7 +7189,7 @@ function renderCalibrationStatusDetails(event) {
   const robotClass = robot.recording ? 'calibration-ok' : 'calibration-alert';
   const mode = robot.controlMode || 'n/a';
   const controlText = mode === 'freedrive'
-    ? `free-drag ${robot.freeDragEnabled || robot.freedriveEnabled ? 'enabled' : 'not enabled'}`
+    ? `free-drag ${robot.freeDragEnabled || robot.freedriveEnabled ? 'enabled' : 'not enabled'}${robot.freeDragPlan || robot.freedrivePlan ? ` via ${robot.freeDragPlan || robot.freedrivePlan}` : ''}`
     : (mode === 'controller_teleop' ? 'hold right middle-finger trigger' : mode);
   calibrationDetails.innerHTML = `
     <div class="${robotClass}">${escapeHtml(event.message || 'PC calibration recording')}</div>
@@ -8571,7 +8586,7 @@ function replayRobotStartText(start) {
   if (!start) return 'n/a';
   const mode = start.controlMode || (start.teleopRequiresRightHandTrigger ? 'controller_teleop' : 'legacy');
   const detail = mode === 'freedrive'
-    ? `freeDrag=${Boolean(start.freeDragEnabled || start.freedriveEnabled)}`
+    ? `freeDrag=${Boolean(start.freeDragEnabled || start.freedriveEnabled)}${start.freeDragPlan || start.freedrivePlan ? ` plan=${start.freeDragPlan || start.freedrivePlan}` : ''}`
     : `teleop=${start.teleopRequiresRightHandTrigger ? 'right middle trigger' : (start.teleopRequiresRightSideButton ? 'right side button' : 'legacy')}`;
   return `recording=${Boolean(start.recording)}, connected=${Boolean(start.robotConnected)}, control=${mode}, ${detail}`;
 }

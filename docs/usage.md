@@ -123,9 +123,10 @@ adb devices -l
   `A` normal recording after Quest-robot calibration is available.
 - The headset recording indicator turns on while recording is active.
 
-For `B` calibration recording, the PC switches Flexiv into free-drag mode when
-the robot bridge is connected. Move the end camera by physically dragging the
-robot, then press `B` again to stop recording and leave free-drag mode.
+For `B` calibration recording, the PC switches Flexiv into its built-in
+`PLAN-FreeDriveManual` free-drag plan when the robot bridge is connected. Move
+the end camera by physically dragging the robot, then press `B` again to stop
+recording and leave free-drag mode.
 
 For `A` normal recording, robot motion is gated by the right hand side/grip
 trigger. Moving the right controller without holding that trigger records
@@ -272,7 +273,7 @@ third-camera video when those artifacts exist in the record.
 - Quest is visible in ADB but install fails: `unauthorized` means the headset has not accepted USB debugging.
 - A/B buttons do not start recording: confirm Touch controllers are active; hand tracking alone does not fire these hotkeys.
 - Robot connected but does not move during `A`: confirm the latest calibration is loaded, then hold the right side/grip trigger during the active recording/session.
-- Robot cannot be dragged during `B`: check the live robot status for `control: freedrive` and `free-drag: enabled`; if it is not enabled, clear robot faults and reconnect Flexiv.
+- Robot cannot be dragged during `B`: check the live robot status for `control: freedrive` and `free-drag: enabled via PLAN-FreeDriveManual`; if it is not enabled, clear robot faults and reconnect Flexiv.
 - Robot mesh does not follow the real arm: check that `joint age` stays low and that `joints:` changes when the real robot moves. If not, refresh the page and reconnect the robot.
 - Robot mesh is visible but kinematically wrong: check `URDF FK vs flange`. A large value usually means the active URDF variant is not the correct one for the physical arm.
 - Robot motion skips with `joint_limit_buffer`: move the arm away from the reported joint limit or reduce the teleop target direction; the guard is intentionally stopping TCP commands before Flexiv reaches its own limit stop.
