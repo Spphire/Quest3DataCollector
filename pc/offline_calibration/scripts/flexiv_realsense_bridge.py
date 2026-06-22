@@ -91,7 +91,14 @@ ROBOT_SESSION_CONTROL_MODES = {
     ROBOT_SESSION_CONTROL_FREEDRIVE,
     ROBOT_SESSION_CONTROL_RECORD_ONLY,
 }
-DEFAULT_FREEDRIVE_PLANS = ("PLAN-FreeDriveManual", "PLAN-FreeDriveAuto")
+DEFAULT_FREEDRIVE_HOLD_STIFFNESS = [10000.0, 10000.0, 10000.0, 1500.0, 1500.0, 1500.0]
+DEFAULT_FREEDRIVE_COMPLIANT_STIFFNESS = [1000.0, 1000.0, 1000.0, 8.0, 8.0, 8.0]
+DEFAULT_FREEDRIVE_DAMPING = [0.6, 0.6, 0.6, 0.6, 0.6, 0.6]
+DEFAULT_FREEDRIVE_CONTROL_HZ = 100.0
+DEFAULT_FREEDRIVE_MAX_LINEAR_VEL = 0.2
+DEFAULT_FREEDRIVE_MAX_ANGULAR_VEL = 0.6
+DEFAULT_FREEDRIVE_MAX_LINEAR_ACC = 0.8
+DEFAULT_FREEDRIVE_MAX_ANGULAR_ACC = 2.0
 
 
 class RobotHandEyeCalibrationError(RuntimeError):
@@ -162,13 +169,19 @@ class FlexivRobotClient:
         self.robot: Any | None = None
         self.robot_sn: str | None = None
         self.pose_field = "flange_pose"
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.last_error: str | None = None
         self.motion_armed = False
         self.motion_last_target_pose: list[float] | None = None
         self.freedrive_enabled = False
         self.freedrive_method: str | None = None
         self.freedrive_plan: str | None = None
+        self.freedrive_stop_event: threading.Event | None = None
+        self.freedrive_thread: threading.Thread | None = None
+        self.freedrive_hold_pose: list[float] | None = None
+        self.freedrive_last_tick_unix: float | None = None
+        self.freedrive_last_error: str | None = None
+        self.freedrive_send_signature: str | None = None
         self.gripper: Any | None = None
         self.gripper_enabled = False
         self.gripper_device: str | None = None
@@ -226,6 +239,15 @@ class FlexivRobotClient:
                 "freeDragMethod": self.freedrive_method,
                 "freedrivePlan": self.freedrive_plan,
                 "freeDragPlan": self.freedrive_plan,
+                "freedriveLoopAlive": self.freedrive_thread is not None and self.freedrive_thread.is_alive(),
+                "freeDragLoopAlive": self.freedrive_thread is not None and self.freedrive_thread.is_alive(),
+                "freedriveLastTickUnix": self.freedrive_last_tick_unix,
+                "freeDragLastTickUnix": self.freedrive_last_tick_unix,
+                "freedriveLastError": self.freedrive_last_error,
+                "freeDragLastError": self.freedrive_last_error,
+                "freedriveControlHz": DEFAULT_FREEDRIVE_CONTROL_HZ,
+                "freeDragControlHz": DEFAULT_FREEDRIVE_CONTROL_HZ,
+                "cartesianSendSignature": self.freedrive_send_signature,
                 "gripper": self.gripper_status_locked(),
             }
             if connected:
@@ -309,17 +331,9 @@ class FlexivRobotClient:
             if self.robot is None:
                 raise RuntimeError("Flexiv robot is not connected")
             self.disable_freedrive_locked()
-            flexivrdk = sys.modules.get("flexivrdk") or import_flexivrdk(None)
             robot = self.robot
-            if robot.fault():
-                raise RuntimeError("Flexiv robot has fault; clear it before arming controller motion")
-            robot.Enable()
-            start = time.time()
-            while not robot.operational():
-                if time.time() - start > 5.0:
-                    raise RuntimeError("Timed out waiting for Flexiv robot to become operational")
-                time.sleep(0.05)
-            robot.SwitchMode(flexivrdk.Mode.NRT_CARTESIAN_MOTION_FORCE)
+            self.ensure_operational_locked("arming controller motion")
+            self.switch_mode_locked("NRT_CARTESIAN_MOTION_FORCE")
             robot.SetForceControlAxis([False, False, False, False, False, False])
             self.motion_armed = True
             self.motion_last_target_pose = [float(v) for v in robot.states().tcp_pose]
@@ -330,49 +344,34 @@ class FlexivRobotClient:
             if self.robot is None:
                 raise RuntimeError("Flexiv robot is not connected")
             self.disarm_motion_locked()
-            flexivrdk = sys.modules.get("flexivrdk") or import_flexivrdk(None)
+            self.disable_freedrive_locked()
             robot = self.robot
-            if robot.fault():
-                raise RuntimeError("Flexiv robot has fault; clear it before enabling free-drag mode")
-            robot.Enable()
-            start = time.time()
-            while not robot.operational():
-                if time.time() - start > 5.0:
-                    raise RuntimeError("Timed out waiting for Flexiv robot to become operational")
-                time.sleep(0.05)
-            plan_errors: list[str] = []
-            try:
-                available_plans = set(str(row) for row in robot.plan_list())
-            except Exception as exc:
-                available_plans = set()
-                plan_errors.append(f"plan_list failed: {exc}")
-            for plan_name in DEFAULT_FREEDRIVE_PLANS:
-                if available_plans and plan_name not in available_plans:
-                    continue
-                try:
-                    robot.SwitchMode(flexivrdk.Mode.NRT_PLAN_EXECUTION)
-                    robot.ExecutePlan(plan_name, False, True)
-                    self.freedrive_enabled = True
-                    self.freedrive_method = "plan"
-                    self.freedrive_plan = plan_name
-                    self.motion_armed = False
-                    self.motion_last_target_pose = None
-                    return self.read_state_locked()
-                except Exception as exc:
-                    plan_errors.append(f"{plan_name}: {exc}")
-            try:
-                robot.SwitchMode(flexivrdk.Mode.NRT_JOINT_IMPEDANCE)
-                joint_pose = self.read_joint_pose_locked()
-                dof = len(joint_pose) if joint_pose else len(self.joint_limits) or 7
-                robot.SetJointImpedance([0.0] * dof)
-                self.freedrive_method = "nrt_joint_impedance_zero_stiffness"
-                self.freedrive_plan = None
-            except Exception as exc:
-                detail = "; ".join(plan_errors + [f"impedance fallback: {exc}"])
-                raise RuntimeError(f"Failed to enable Flexiv free-drag mode ({detail})") from exc
+            self.ensure_operational_locked("enabling free-drag mode")
+            self.switch_mode_locked("NRT_CARTESIAN_MOTION_FORCE")
+            current_tcp = [float(v) for v in robot.states().tcp_pose]
+            robot.SetForceControlAxis([False, False, False, False, False, False])
+            self.set_cartesian_impedance_locked(
+                DEFAULT_FREEDRIVE_COMPLIANT_STIFFNESS,
+                DEFAULT_FREEDRIVE_DAMPING,
+            )
+            stop_event = threading.Event()
+            thread = threading.Thread(
+                target=self.freedrive_control_loop,
+                args=(robot, stop_event),
+                name="flexiv-cartesian-compliance-freedrive",
+                daemon=True,
+            )
             self.freedrive_enabled = True
+            self.freedrive_method = "cartesian_compliance"
+            self.freedrive_plan = None
+            self.freedrive_stop_event = stop_event
+            self.freedrive_thread = thread
+            self.freedrive_hold_pose = current_tcp
+            self.freedrive_last_tick_unix = None
+            self.freedrive_last_error = None
             self.motion_armed = False
             self.motion_last_target_pose = None
+            thread.start()
             return self.read_state_locked()
 
     def disable_freedrive(self) -> dict[str, Any]:
@@ -381,14 +380,31 @@ class FlexivRobotClient:
             return self.status_unlocked()
 
     def disable_freedrive_locked(self) -> None:
-        if self.robot is not None and self.freedrive_enabled:
+        stop_event = self.freedrive_stop_event
+        thread = self.freedrive_thread
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.5)
+        if self.robot is not None and (self.freedrive_enabled or self.freedrive_method is not None):
             try:
-                self.robot.Stop()
-            except Exception:
-                pass
+                current_tcp = [float(v) for v in self.robot.states().tcp_pose]
+                self.freedrive_hold_pose = current_tcp
+                self.switch_mode_locked("NRT_CARTESIAN_MOTION_FORCE")
+                self.robot.SetForceControlAxis([False, False, False, False, False, False])
+                self.set_cartesian_impedance_locked(
+                    DEFAULT_FREEDRIVE_HOLD_STIFFNESS,
+                    DEFAULT_FREEDRIVE_DAMPING,
+                )
+                self.send_cartesian_motion_force_compat(self.robot, current_tcp)
+            except Exception as exc:
+                self.freedrive_last_error = str(exc)
+                self.last_error = str(exc)
         self.freedrive_enabled = False
         self.freedrive_method = None
         self.freedrive_plan = None
+        self.freedrive_stop_event = None
+        self.freedrive_thread = None
 
     def disarm_motion(self) -> dict[str, Any]:
         with self.lock:
@@ -418,6 +434,15 @@ class FlexivRobotClient:
             "freeDragMethod": self.freedrive_method,
             "freedrivePlan": self.freedrive_plan,
             "freeDragPlan": self.freedrive_plan,
+            "freedriveLoopAlive": self.freedrive_thread is not None and self.freedrive_thread.is_alive(),
+            "freeDragLoopAlive": self.freedrive_thread is not None and self.freedrive_thread.is_alive(),
+            "freedriveLastTickUnix": self.freedrive_last_tick_unix,
+            "freeDragLastTickUnix": self.freedrive_last_tick_unix,
+            "freedriveLastError": self.freedrive_last_error,
+            "freeDragLastError": self.freedrive_last_error,
+            "freedriveControlHz": DEFAULT_FREEDRIVE_CONTROL_HZ,
+            "freeDragControlHz": DEFAULT_FREEDRIVE_CONTROL_HZ,
+            "cartesianSendSignature": self.freedrive_send_signature,
             "gripper": self.gripper_status_locked(),
         }
         if connected:
@@ -451,9 +476,116 @@ class FlexivRobotClient:
             )
             if not bool(guard.get("ok")):
                 return guard
-            self.robot.SendCartesianMotionForce(target)
+            self.send_cartesian_motion_force_compat(self.robot, target)
             self.motion_last_target_pose = target
             return guard
+
+    def freedrive_control_loop(self, robot: Any, stop_event: threading.Event) -> None:
+        period = 1.0 / max(1.0, DEFAULT_FREEDRIVE_CONTROL_HZ)
+        while not stop_event.is_set():
+            start = time.perf_counter()
+            try:
+                current_tcp = [float(v) for v in robot.states().tcp_pose]
+                self.send_cartesian_motion_force_compat(robot, current_tcp)
+                self.freedrive_hold_pose = current_tcp
+                self.freedrive_last_tick_unix = time.time()
+                self.freedrive_last_error = None
+            except Exception as exc:  # pragma: no cover - hardware path
+                self.freedrive_last_error = str(exc)
+                self.last_error = str(exc)
+            elapsed = time.perf_counter() - start
+            stop_event.wait(max(0.0, period - elapsed))
+
+    def ensure_operational_locked(self, action: str, timeout_s: float = 5.0) -> None:
+        if self.robot is None:
+            raise RuntimeError("Flexiv robot is not connected")
+        try:
+            if self.robot.fault() or self.robot.stopped():
+                clear_fault = getattr(self.robot, "ClearFault", None)
+                if callable(clear_fault):
+                    clear_fault()
+                    time.sleep(0.2)
+        except Exception:
+            pass
+        if self.robot.fault():
+            raise RuntimeError(f"Flexiv robot has fault; clear it before {action}")
+        self.robot.Enable()
+        start = time.time()
+        while not self.robot.operational():
+            if time.time() - start > timeout_s:
+                details: list[str] = []
+                for name, getter in (
+                    ("mode", self.robot.mode),
+                    ("operationalStatus", self.robot.operational_status),
+                    ("stopped", self.robot.stopped),
+                    ("busy", self.robot.busy),
+                    ("enablingButtonPressed", self.robot.enabling_button_pressed),
+                ):
+                    try:
+                        value = getter()
+                        details.append(f"{name}={getattr(value, 'name', value)}")
+                    except Exception:
+                        pass
+                suffix = f" ({', '.join(details)})" if details else ""
+                raise RuntimeError(f"Timed out waiting for Flexiv robot to become operational while {action}{suffix}")
+            time.sleep(0.05)
+
+    def mode_name_locked(self) -> str:
+        if self.robot is None:
+            return ""
+        value = self.robot.mode()
+        return str(getattr(value, "name", value)).split(".")[-1]
+
+    def switch_mode_locked(self, mode_name: str, timeout_s: float = 2.0) -> None:
+        if self.robot is None:
+            raise RuntimeError("Flexiv robot is not connected")
+        if self.mode_name_locked() == mode_name:
+            return
+        flexivrdk = sys.modules.get("flexivrdk") or import_flexivrdk(None)
+        mode = getattr(flexivrdk.Mode, mode_name, None)
+        if mode is None:
+            raise RuntimeError(f"Flexiv RDK does not expose mode {mode_name}")
+        self.robot.SwitchMode(mode)
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if self.mode_name_locked() == mode_name:
+                return
+            time.sleep(0.05)
+        raise RuntimeError(f"Timed out switching Flexiv mode to {mode_name}; current mode is {self.mode_name_locked()}")
+
+    def set_cartesian_impedance_locked(self, stiffness: list[float], damping: list[float]) -> None:
+        if self.robot is None:
+            raise RuntimeError("Flexiv robot is not connected")
+        try:
+            self.robot.SetCartesianImpedance(list(stiffness), list(damping))
+        except TypeError:
+            self.robot.SetCartesianImpedance(list(stiffness))
+
+    def send_cartesian_motion_force_compat(self, robot: Any, pose: list[float]) -> None:
+        target = [float(v) for v in pose[:7]]
+        zero6 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        try:
+            robot.SendCartesianMotionForce(
+                target,
+                zero6,
+                zero6,
+                max_linear_vel=DEFAULT_FREEDRIVE_MAX_LINEAR_VEL,
+                max_angular_vel=DEFAULT_FREEDRIVE_MAX_ANGULAR_VEL,
+                max_linear_acc=DEFAULT_FREEDRIVE_MAX_LINEAR_ACC,
+                max_angular_acc=DEFAULT_FREEDRIVE_MAX_ANGULAR_ACC,
+            )
+            self.freedrive_send_signature = "pose+wrench+velocity+limits"
+            return
+        except TypeError:
+            pass
+        try:
+            robot.SendCartesianMotionForce(target, zero6, zero6)
+            self.freedrive_send_signature = "pose+wrench+velocity"
+            return
+        except TypeError:
+            pass
+        robot.SendCartesianMotionForce(target)
+        self.freedrive_send_signature = "pose"
 
     def joint_limit_guard(self, buffer_rad: float, enabled: bool) -> dict[str, Any]:
         with self.lock:

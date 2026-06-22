@@ -878,6 +878,13 @@ class SessionWriter:
         )
         freedrive_method = robot.get("freedriveMethod") or robot.get("freeDragMethod") if isinstance(robot, dict) else None
         freedrive_plan = robot.get("freedrivePlan") or robot.get("freeDragPlan") if isinstance(robot, dict) else None
+        freedrive_loop_alive = bool(
+            isinstance(robot, dict) and (robot.get("freedriveLoopAlive") or robot.get("freeDragLoopAlive"))
+        )
+        freedrive_last_error = (
+            robot.get("freedriveLastError") or robot.get("freeDragLastError") if isinstance(robot, dict) else None
+        )
+        freedrive_send_signature = robot.get("cartesianSendSignature") if isinstance(robot, dict) else None
         controller_motion = bool(isinstance(config, dict) and config.get("controllerMotionEnabled"))
         control_mode = active.get("controlMode") if isinstance(active, dict) else ROBOT_SESSION_CONTROL_TELEOP
         if control_mode not in (ROBOT_SESSION_CONTROL_TELEOP, ROBOT_SESSION_CONTROL_FREEDRIVE):
@@ -917,6 +924,11 @@ class SessionWriter:
             "freeDragMethod": freedrive_method,
             "freedrivePlan": freedrive_plan,
             "freeDragPlan": freedrive_plan,
+            "freedriveLoopAlive": freedrive_loop_alive,
+            "freeDragLoopAlive": freedrive_loop_alive,
+            "freedriveLastError": freedrive_last_error,
+            "freeDragLastError": freedrive_last_error,
+            "cartesianSendSignature": freedrive_send_signature,
             "controlMode": control_mode,
             "controllerMotionEnabled": controller_motion,
             "teleopRequiresRightSideButton": control_mode == ROBOT_SESSION_CONTROL_TELEOP,
@@ -1767,6 +1779,13 @@ class PcCalibrationSession:
         )
         freedrive_method = robot.get("freedriveMethod") or robot.get("freeDragMethod") if isinstance(robot, dict) else None
         freedrive_plan = robot.get("freedrivePlan") or robot.get("freeDragPlan") if isinstance(robot, dict) else None
+        freedrive_loop_alive = bool(
+            isinstance(robot, dict) and (robot.get("freedriveLoopAlive") or robot.get("freeDragLoopAlive"))
+        )
+        freedrive_last_error = (
+            robot.get("freedriveLastError") or robot.get("freeDragLastError") if isinstance(robot, dict) else None
+        )
+        freedrive_send_signature = robot.get("cartesianSendSignature") if isinstance(robot, dict) else None
         controller_motion = bool(isinstance(config, dict) and config.get("controllerMotionEnabled"))
         control_mode = active.get("controlMode") if isinstance(active, dict) else ROBOT_SESSION_CONTROL_FREEDRIVE
         if control_mode not in (ROBOT_SESSION_CONTROL_TELEOP, ROBOT_SESSION_CONTROL_FREEDRIVE):
@@ -1810,6 +1829,11 @@ class PcCalibrationSession:
             "freeDragMethod": freedrive_method,
             "freedrivePlan": freedrive_plan,
             "freeDragPlan": freedrive_plan,
+            "freedriveLoopAlive": freedrive_loop_alive,
+            "freeDragLoopAlive": freedrive_loop_alive,
+            "freedriveLastError": freedrive_last_error,
+            "freeDragLastError": freedrive_last_error,
+            "cartesianSendSignature": freedrive_send_signature,
             "controlMode": control_mode,
             "controllerMotionEnabled": controller_motion,
             "teleopRequiresRightSideButton": control_mode == ROBOT_SESSION_CONTROL_TELEOP,
@@ -6884,6 +6908,9 @@ function renderRobotStatus(payload) {
   const freeDragMethod = robot.freeDragMethod || robot.freedriveMethod || '';
   const freeDragPlan = robot.freeDragPlan || robot.freedrivePlan || '';
   const freeDragDetail = freeDragPlan || freeDragMethod;
+  const freeDragLoopAlive = Boolean(robot.freeDragLoopAlive || robot.freedriveLoopAlive);
+  const freeDragLastError = robot.freeDragLastError || robot.freedriveLastError || '';
+  const cartesianSendSignature = robot.cartesianSendSignature || '';
   const teleopText = controlMode === 'controller_teleop'
     ? `hold right middle-finger trigger${robot.motionArmed ? ' (motion mode active)' : ' (motion not armed)'}`
     : 'off';
@@ -6892,6 +6919,7 @@ function renderRobotStatus(payload) {
     `control: ${controlMode}`,
     `teleop: ${teleopText}`,
     `free-drag: ${freeDragEnabled ? `enabled${freeDragDetail ? ` via ${freeDragDetail}` : ''}` : 'disabled'}`,
+    `free-drag loop: ${freeDragEnabled ? (freeDragLoopAlive ? 'running' : 'not running') : 'off'}${cartesianSendSignature ? ` (${cartesianSendSignature})` : ''}`,
     `controller motion: ${payload.config?.controllerMotionEnabled ? 'enabled' : 'disabled'}`,
     `joint guard: ${robotJointGuardText(robot.state?.jointLimitGuard, payload.config)}`,
     `pose: ${robot.poseField || 'n/a'}`,
@@ -6926,6 +6954,7 @@ function renderRobotStatus(payload) {
   } else if (active.poseDiversity) {
     lines.push(`hand-eye motion: ${poseDiversityText(active.poseDiversity)}`);
   }
+  if (freeDragLastError) lines.push(`free-drag error: ${freeDragLastError}`);
   if (payload.activeSession) {
     lines.push(`motion counts: cmd ${active.motionCommands ?? 0}, skip ${active.motionSkips ?? 0}, err ${active.motionErrors ?? 0}`);
     lines.push(`gripper counts: cmd ${active.gripperCommands ?? 0}, skip ${active.gripperSkips ?? 0}, err ${active.gripperErrors ?? 0}`);
@@ -7198,7 +7227,7 @@ function renderCalibrationStatusDetails(event) {
   const robotClass = robot.recording ? 'calibration-ok' : 'calibration-alert';
   const mode = robot.controlMode || 'n/a';
   const controlText = mode === 'freedrive'
-    ? `free-drag ${robot.freeDragEnabled || robot.freedriveEnabled ? 'enabled' : 'not enabled'}${robot.freeDragPlan || robot.freedrivePlan ? ` via ${robot.freeDragPlan || robot.freedrivePlan}` : ''}`
+    ? `free-drag ${robot.freeDragEnabled || robot.freedriveEnabled ? 'enabled' : 'not enabled'}${robot.freeDragPlan || robot.freedrivePlan || robot.freeDragMethod || robot.freedriveMethod ? ` via ${robot.freeDragPlan || robot.freedrivePlan || robot.freeDragMethod || robot.freedriveMethod}` : ''}${robot.freeDragLoopAlive || robot.freedriveLoopAlive ? ', loop running' : ''}${robot.cartesianSendSignature ? `, ${robot.cartesianSendSignature}` : ''}`
     : (mode === 'controller_teleop' ? 'hold right middle-finger trigger' : mode);
   calibrationDetails.innerHTML = `
     <div class="${robotClass}">${escapeHtml(event.message || 'PC calibration recording')}</div>
