@@ -6852,7 +6852,13 @@ function robotSampleFromStatus(payload) {
     jointpos: jointpose,
     T_base_ee: statePayload.endEffectorPose,
     T_base_tool_tcp: tcpPose.T_base_pose || statePayload.T_base_tool_tcp || statePayload.endEffectorPose,
-    jointLimitGuard: statePayload.jointLimitGuard
+    jointLimitGuard: statePayload.jointLimitGuard,
+    mode: statePayload.mode,
+    operationalStatus: statePayload.operationalStatus,
+    enablingButtonPressed: statePayload.enablingButtonPressed,
+    busy: statePayload.busy,
+    stopped: statePayload.stopped,
+    reduced: statePayload.reduced
   };
 }
 
@@ -6907,6 +6913,9 @@ function renderRobotStatus(payload) {
     if (Array.isArray(state.robotSample.jointpose)) {
       const preview = state.robotSample.jointpose.slice(0, 4).map(v => Number(v).toFixed(3)).join(', ');
       lines.push(`joints: ${preview}${state.robotSample.jointpose.length > 4 ? ', ...' : ''}`);
+    }
+    if (state.robotSample.mode || state.robotSample.operationalStatus) {
+      lines.push(`rdk state: ${state.robotSample.mode || 'n/a'} / ${state.robotSample.operationalStatus || 'n/a'} busy=${Boolean(state.robotSample.busy)} enableBtn=${Boolean(state.robotSample.enablingButtonPressed)}`);
     }
     const fkError = robotFkErrorMm(state.robotSample, null);
     if (Number.isFinite(fkError)) lines.push(`URDF FK vs flange: ${fkError.toFixed(1)}mm`);

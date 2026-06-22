@@ -266,6 +266,19 @@ class FlexivRobotClient:
                 ],
             ),
         }
+        for name, getter in (
+            ("mode", lambda: self.robot.mode()),
+            ("operationalStatus", lambda: self.robot.operational_status()),
+            ("enablingButtonPressed", lambda: self.robot.enabling_button_pressed()),
+            ("busy", lambda: self.robot.busy()),
+            ("stopped", lambda: self.robot.stopped()),
+            ("reduced", lambda: self.robot.reduced()),
+        ):
+            try:
+                value = getter()
+                payload[name] = getattr(value, "name", str(value)) if name in ("mode", "operationalStatus") else bool(value)
+            except Exception:
+                pass
         payload["jointLimitGuard"] = joint_limit_guard_state(
             payload.get("jointPose"),
             self.joint_limits,
