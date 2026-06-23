@@ -89,6 +89,44 @@ Expected:
 .../.venv312/lib/python3.12/site-packages/flexivrdk/__init__.py
 ```
 
+Receiver-only smoke test, using temporary ports and a temporary output folder:
+
+```bash
+cd /ssd1/shenyibo/Quest3DataCollector
+.venv312/bin/python pc/offline_calibration/scripts/smoke_pc_receiver.py --samples 20
+```
+
+This does not touch the lab `pc_recordings` directory and does not require
+Quest, Flexiv, or RealSense hardware. It verifies UDP receive, session close,
+summary writing, `/recordings` replay-cache generation, and bounded raw-sample
+logging.
+
+Hardware receiver performance probe, using the already running lab receiver:
+
+```bash
+cd /ssd1/shenyibo/Quest3DataCollector
+.venv312/bin/python pc/offline_calibration/scripts/perf_probe_receiver.py --duration-seconds 10
+```
+
+This sends a synthetic A-button formal record to UDP `9100`, waits for the
+background saving phase, runs `audit-performance`, and checks compact replay
+loading. It does not press the teleop side trigger and does not send gripper
+trigger input, so it should not move the robot. Add `--connect-robot` only when
+you intentionally want the probe to connect the robot before recording.
+
+After a real A-button recording, audit the actual hardware capture rates:
+
+```bash
+cd /ssd1/shenyibo/Quest3DataCollector
+.venv312/bin/python pc/offline_calibration/scripts/quest_pc_receiver.py audit-performance \
+  --pc-session pc/offline_calibration/pc_recordings/<record_id>
+```
+
+This is the preferred regression check for recording-performance changes. It
+fails when PC writer drops, close/save errors, robot state rate, camera FPS,
+camera queue drops, camera writer shutdown, or capture-to-write latency fall
+outside the current high-frequency capture targets.
+
 ### Hardware state found on 2026-06-17
 
 RealSense devices detected on the remote PC:
@@ -122,16 +160,14 @@ References:
 ### Receiver command
 
 ```bash
-/ssd1/shenyibo/Quest3DataCollector/.venv312/bin/python \
-  /ssd1/shenyibo/Quest3DataCollector/pc/offline_calibration/scripts/quest_pc_receiver.py \
-  receive \
-  --host 0.0.0.0 \
-  --port 9100 \
-  --visualize \
-  --visualize-host 0.0.0.0 \
-  --visualize-port 8765 \
-  --no-open-browser
+cd /ssd1/shenyibo/Quest3DataCollector
+pc/offline_calibration/scripts/start_lab_receiver.sh --restart
 ```
+
+Use `pc/offline_calibration/scripts/start_lab_receiver.sh --status` to inspect
+the running process and listening ports. The restart path intentionally matches
+only `quest_pc_receiver.py receive`; do not use broad commands such as
+`pkill -x python` on the lab machine.
 
 Useful options:
 
@@ -139,13 +175,16 @@ Useful options:
 - `--flexiv-robot-sn <sn>` sets the default robot serial shown in the UI.
 - `--flexiv-pose-field flange_pose|tcp_pose` selects the robot state pose used as `T_base_ee`.
 - `--flexiv-network-interface 192.168.2.108` limits Flexiv RDK discovery to the PC interface connected to the robot network. This can also be entered in the web UI as `RDK local IP`.
+- `--robot-state-hz 60` controls Flexiv robot state polling for A-button formal recordings. The lab default is 60 Hz; set `QUEST3_ROBOT_STATE_HZ=90` only for targeted high-rate experiments and audit the resulting record.
 - `--robot-capture-interval 0.35` controls how often robot/RealSense samples are taken during B-button calibration.
+- `--enable-gripper` enables right index-trigger gripper open/close commands during robot sessions. The default gripper device is `auto`: the receiver lists Flexiv Elements devices on the active robot connection, then tries Robotiq/gripper-looking device names before common Robotiq fallbacks. Use `--gripper-device <Elements device name>` to force one.
 - `--no-flexiv-realsense` hides/disables the robot bridge.
 - `--no-robot-hand-eye` records robot/RealSense data but skips the automatic hand-eye solve.
 - `--controller-motion-scale 1.0` scales right-controller displacement into TCP displacement.
-- `--controller-motion-max-offset 0.18` limits the TCP offset from the arm anchor.
-- `--controller-motion-max-step 0.025` limits each target update step.
-- `--controller-joint-limit-buffer 0.08` stops controller TCP commands when any joint is within the buffer around the URDF soft joint limits.
+- `--controller-motion-max-step 0.04` limits each target position update step. Teleop does not clamp cumulative TCP offset from the hand anchor.
+- `--controller-motion-max-rotation-step 4` limits each target orientation update step. Teleop does not clamp cumulative TCP rotation from the hand anchor.
+- `--controller-motion-max-offset` and `--controller-motion-max-rotation` are accepted as legacy no-op arguments for old launch scripts.
+- `--controller-joint-limit-buffer 0.04` stops controller TCP commands when any joint is within the buffer around the URDF soft joint limits.
 - `--disable-controller-joint-limit-guard` disables that teleop joint-limit guard for debugging only.
 
 Read-only hardware diagnostics:
@@ -272,7 +311,7 @@ This unifies Quest world, checkerboard, and robot base in the live/replay visual
 - RealSense intrinsics come from `pyrealsense2` color stream metadata.
 - The board is fixed at 11x8 inner corners, 25 mm square size.
 - Hand-eye calibration solves `T_ee_realsense` and `T_base_board` from repeated end-camera observations of the fixed board.
-- Checkerboard 180-degree ambiguity is resolved first from the black/white appearance near the four corner inner-corners: each corner is classified by long/short-side turn direction plus the luminance of its inner square. A red marker near one corner remains an optional fallback/diagnostic hint; frames without a red marker are still valid and can be oriented by appearance or, if needed, residual matching between identity and 180-degree corner orderings.
+- Checkerboard 180-degree ambiguity is resolved first from the black/white appearance near the four corner inner-corners: each corner is classified by long/short-side turn direction plus the luminance of its inner square. Frames with inconclusive appearance are oriented, if needed, by residual matching between identity and 180-degree corner orderings.
 - Replay uses the canonical PC frame and translates the view near the board origin; robot EE samples are drawn as white points with local RGB axes.
 - The live/replay robot viewer currently loads the Flexiv RDK 1.8 `Rizon4R` asset at `pc/offline_calibration/assets/urdf/flexiv_Rizon4R_kinematics.urdf` as a visualization experiment, with meshes under `pc/offline_calibration/assets/urdf/meshes/Rizon4R`. The original `Rizon4` asset is kept next to it for comparison. The viewers parse the URDF joint chain, draw meshes and a line skeleton from recorded `jointpose`, and report the URDF FK-vs-`flange_pose` translation error when a robot sample is available; use that error to decide whether the active URDF matches the physical arm. If no robot sample is available yet, the live viewer draws a zero-joint robot at the viewer origin with URDF +Z mapped to viewer +Y so the robot remains visible before calibration or connection.
 

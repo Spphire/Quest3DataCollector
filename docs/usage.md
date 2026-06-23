@@ -33,24 +33,24 @@ The current lab receiver command is:
 
 ```bash
 cd /ssd1/shenyibo/Quest3DataCollector
-nohup .venv312/bin/python pc/offline_calibration/scripts/quest_pc_receiver.py receive \
-  --host 0.0.0.0 \
-  --port 9100 \
-  --visualize \
-  --visualize-host 0.0.0.0 \
-  --visualize-port 8765 \
-  --no-open-browser \
-  --flexiv-network-interface 192.168.2.108 \
-  --realsense-serial 244222073667 \
-  --third-realsense-serial 750612070265 \
-  >> receiver.log 2>&1 &
+pc/offline_calibration/scripts/start_lab_receiver.sh --restart
 ```
+
+The script stops only existing `quest_pc_receiver.py receive` processes, starts
+the receiver under `nohup`, writes logs to `receiver.log`, and uses the current
+lab defaults: UDP `9100`, viewer `8765`, Flexiv interface `192.168.2.108`,
+end RealSense `244222073667`, third RealSense `750612070265`, robot state
+`60 Hz`, and depth every `3` RGB frames.
+
+With `--enable-gripper`, the default gripper device is `auto`: the receiver
+asks the connected Flexiv robot for the Elements device list and tries names
+that look like Robotiq/gripper devices before falling back to common Robotiq
+names. If needed, pass `--gripper-device <exact Elements device name>`.
 
 Check the remote process:
 
 ```bash
-pgrep -af 'pc/offline_calibration/scripts/quest_pc_receiver.py receive'
-ss -ltnp | grep ':8765'
+pc/offline_calibration/scripts/start_lab_receiver.sh --status
 ```
 
 ## Start the PC receiver
@@ -73,6 +73,11 @@ Useful receiver options:
 - `--pc-record-root <path>` chooses where A-button PC recordings are written.
 - `--no-flexiv-realsense` hides and disables the robot/RealSense bridge.
 - `--no-calibrate-after-pc-recording` records B-button raw data but skips automatic calibration after stop.
+- `--record-realsense-depth-every-n-frames <N>` keeps RGB at full frame rate but only appends depth to the indexed raw depth stream every `N` frames during A-button formal recordings. Default: `3`.
+- `--flush-every <N>` and `--flush-interval-seconds <T>` control how often the PC telemetry JSONL/CSV files are flushed; the default is batched instead of every packet.
+- `--sample-log-interval-seconds <T>` limits the console sample-status print rate during high-frequency runs. Default: `1`.
+- `--udp-receive-buffer-bytes <N>` requests a larger UDP receive buffer for Quest telemetry bursts. The effective value may still be capped by the remote OS socket limits.
+- `--recording-idle-timeout-seconds <T>` closes an active PC recording if its own recording datagrams stop arriving for too long, which helps recover when a `recording_stop` packet is lost.
 
 ## Install the Quest App
 
@@ -118,7 +123,7 @@ adb devices -l
 
 - `A`: start/stop a normal recording.
 - `B`: start/stop a calibration recording.
-- Right hand trigger: gripper open/close command when gripper control is enabled.
+- Right index trigger: gripper open/close command when gripper control is enabled.
 - Right hand side/grip trigger: hold to enable robot TCP teleoperation during an
   `A` normal recording after Quest-robot calibration is available.
 - The headset recording indicator turns on while recording is active.
@@ -205,10 +210,10 @@ Recommended flow:
 6. Press `B` again to stop.
 7. Wait for the PC-side calibration status to finish.
 
-The checkerboard is 11x8 inner corners with 25 mm square size. A red marker near
-one board corner is optional; one reliable red-anchored observation can resolve
-the global 180-degree corner-order ambiguity, and frames without the red marker
-can still be used by residual matching.
+The checkerboard is 11x8 inner corners with 25 mm square size. The 180-degree
+corner-order ambiguity is resolved from black/white corner appearance first,
+then by identity-vs-rot180 reprojection or hand-eye residual matching when
+appearance is inconclusive.
 
 After a calibration recording stops, the PC pipeline uses pose-diverse frame
 selection by default. It does not process every nearly identical frame. Quest
@@ -246,9 +251,69 @@ PC session stores the Quest stream plus:
 - end-camera MP4
 - fixed third-camera MP4 when available
 
-The A-button flow is intended for task data collection after calibration. Robot
-teleoperation requires a successful Quest-robot calibration and still requires
-holding the right side/grip trigger during an active robot session.
+The A-button flow is intended for task data collection after calibration, and it
+does not reuse the low-frequency calibration sampling policy. It runs as an
+independent timestamped capture pipeline:
+
+- Quest telemetry is recorded whenever the Quest sends a sample.
+- Flexiv robot state is polled independently into
+  `robot_realsense/robot_states.jsonl`, default `60 Hz`.
+- RealSense videos are recorded independently at the stream frame rate, with
+  frame timing written to `robot_realsense/video_frames.jsonl`.
+- `robot_realsense/samples.jsonl` keeps one Quest-aligned compatibility row per
+  Quest sample, pointing at the latest robot state and latest video frames.
+
+This means the formal record should be synchronized by timestamps during replay
+or downstream processing, rather than by assuming every modality shares the same
+sample clock. The high-rate `robot_states.jsonl` rows intentionally store the
+raw Flexiv pose/joint state in a lightweight form; replay and analysis derive
+display transforms from those raw fields when needed.
+
+When the machine is under unusually heavy disk/CPU load, the live viewer exposes
+`Depth every` as the same `recordDepthEveryNFrames` knob. The current default
+is `3`, which keeps RGB video at full frame rate while recording depth at about
+10 Hz on a 30 Hz stream. Setting it to `1` preserves every depth frame, but that
+is significantly heavier and should be reserved for short, depth-critical
+captures.
+
+On the current lab machine, the requested UDP receive buffer may be higher than
+the effective kernel-accepted buffer. The receiver prints the actual bound
+buffer in its startup log as `rcvbuf=...`.
+
+Robot teleoperation still requires a successful Quest-robot calibration and
+still requires holding the right side/grip trigger during an active robot
+session.
+
+After a formal recording, run the performance audit when you want a quick
+pass/fail on capture health:
+
+```bash
+cd /ssd1/shenyibo/Quest3DataCollector
+.venv312/bin/python pc/offline_calibration/scripts/quest_pc_receiver.py audit-performance \
+  --pc-session pc/offline_calibration/pc_recordings/<record_id>
+```
+
+The default thresholds require robot state to reach at least 80% of the
+configured target rate, each RealSense stream to reach at least 80% of target
+FPS, camera queue drops to stay below 5%, p95 capture-to-write latency to stay
+below 1 second, and the PC writer/save path to finish without drops or close
+errors. The lab default is 60 Hz because the current Python single-process
+pipeline can show long-tail scheduling gaps at a requested 90 Hz when dual
+RGB-D recording is active. A failed audit means the record is still often
+replayable, but it should not be treated as a healthy high-frequency data
+capture.
+
+To check receiver performance without wearing the Quest, use the synthetic
+formal-recording probe on the lab machine:
+
+```bash
+cd /ssd1/shenyibo/Quest3DataCollector
+.venv312/bin/python pc/offline_calibration/scripts/perf_probe_receiver.py --duration-seconds 10
+```
+
+The probe sends A-recording UDP samples, waits for the saving phase to finish,
+runs the same audit, and loads compact replay. It intentionally does not press
+teleop or gripper controls.
 
 ## Replay
 
@@ -274,9 +339,15 @@ third-camera video when those artifacts exist in the record.
 - Quest is visible in ADB but install fails: `unauthorized` means the headset has not accepted USB debugging.
 - A/B buttons do not start recording: confirm Touch controllers are active; hand tracking alone does not fire these hotkeys.
 - Robot connected but does not move during `A`: confirm the latest calibration is loaded, then hold the right side/grip trigger during the active recording/session.
+- Right index trigger does not move the gripper: check the live `gripper:` and
+  `devices:` status. If `devices` does not list a Robotiq/gripper device, fix
+  the Flexiv Elements device configuration or pass the exact
+  `--gripper-device` name. If a recording already happened, inspect
+  `robot_realsense/gripper_commands.jsonl`; `trigger` proves Quest/PC trigger
+  delivery, while `enableAttempts` shows device-name failures.
 - Robot cannot be dragged during `B`: check the live robot status for `control: freedrive` and `free-drag: enabled`. If it says `floating_cartesian_primitive`, verify the arm is in a state where Flexiv native free-drive is allowed. If it falls back to `cartesian_compliance`, verify `cartesian loop: running`, clear robot faults, reconnect Flexiv, and restart the receiver.
 - Robot mesh does not follow the real arm: check that `joint age` stays low and that `joints:` changes when the real robot moves. If not, refresh the page and reconnect the robot.
 - Robot mesh is visible but kinematically wrong: check `URDF FK vs flange`. A large value usually means the active URDF variant is not the correct one for the physical arm.
-- Robot motion skips with `joint_limit_buffer`: move the arm away from the reported joint limit or reduce the teleop target direction; the guard is intentionally stopping TCP commands before Flexiv reaches its own limit stop.
+- Robot motion skips with `joint_limit_buffer`: move the arm away from the reported joint limit or reduce the teleop target direction; the guard is intentionally stopping TCP commands before Flexiv reaches its own limit stop. The default guard buffer is `0.04` rad. If the arm feels artificially constrained but the status does not report `joint_limit_buffer`, check the teleop step limits (`Max step m` and `Rot step deg`) in the live UI; teleop does not clamp cumulative workspace offset.
 - Hand-eye fails with too few detections: move the end camera so the checkerboard is visible in at least the required number of selected samples.
 - Calibration is slow: lower the max diverse frame/sample limits, or disable automatic calibration and run the script manually.

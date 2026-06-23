@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
+import queue
 import sys
 import threading
 import time
@@ -43,6 +45,17 @@ DEFAULT_SQUARE_SIZE_M = 0.025
 DEFAULT_REALSENSE_WIDTH = 1280
 DEFAULT_REALSENSE_HEIGHT = 720
 DEFAULT_REALSENSE_FPS = 30
+DEFAULT_ROBOT_STATE_HZ = 60.0
+DEFAULT_RECORD_DEPTH_EVERY_N_FRAMES = 3
+ASYNC_JSONL_FLUSH_ROWS = 16
+ASYNC_JSONL_FLUSH_INTERVAL_SECONDS = 0.25
+ASYNC_QUEST_ALIGNED_SAMPLE_HZ = 10.0
+ASYNC_CAMERA_QUEUE_SECONDS = 0.25
+ASYNC_CAMERA_QUEUE_MIN_FRAMES = 4
+ASYNC_CAMERA_QUEUE_MAX_FRAMES = 8
+ROBOT_SESSION_THREAD_JOIN_SECONDS = 5.0
+ROBOT_SESSION_CAMERA_WRITER_FINAL_JOIN_SECONDS = 1.0
+ROBOT_SESSION_VIDEO_RELEASE_LOCK_SECONDS = 1.0
 DEFAULT_CAPTURE_INTERVAL_SECONDS = 0.35
 DEFAULT_FLEXIV_RDK_ROOT: Path | None = None
 DEFAULT_FLEXIV_ROBOT_SN = "Rizon4-062713"
@@ -50,30 +63,34 @@ DEFAULT_END_CAMERA_SERIAL = "750612070265"
 MIN_HAND_EYE_EE_TRANSLATION_SPAN_M = 0.02
 MIN_HAND_EYE_EE_ROTATION_SPAN_DEG = 2.0
 DEFAULT_CONTROLLER_TRANSLATION_SCALE = 1.0
-DEFAULT_CONTROLLER_MAX_OFFSET_M = 0.18
-DEFAULT_CONTROLLER_MAX_STEP_M = 0.025
-DEFAULT_CONTROLLER_MAX_ROTATION_DEG = 30.0
-DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG = 2.0
-DEFAULT_CONTROLLER_JOINT_LIMIT_BUFFER_RAD = 0.08
+DEFAULT_CONTROLLER_MAX_STEP_M = 0.04
+DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG = 4.0
+DEFAULT_CONTROLLER_JOINT_LIMIT_BUFFER_RAD = 0.04
 DEFAULT_HAND_EYE_MAX_DIVERSE_SAMPLES = 120
 DEFAULT_HAND_EYE_MIN_DIVERSE_SAMPLES = 20
 DEFAULT_HAND_EYE_DIVERSE_TRANSLATION_SCALE_M = 0.02
 DEFAULT_HAND_EYE_DIVERSE_ROTATION_SCALE_DEG = 3.0
 DEFAULT_HAND_EYE_DIVERSE_MIN_SCORE = 0.75
-DEFAULT_GRIPPER_DEVICE = "gripper"
+DEFAULT_GRIPPER_DEVICE = "auto"
+DEFAULT_GRIPPER_DEVICE_CANDIDATES = [
+    "Robotiq",
+    "Robotiq-2F-85",
+    "Robotiq 2F-85",
+    "Robotiq_2F_85",
+    "robotiq",
+    "robotiq_2f_85",
+    "gripper",
+]
 DEFAULT_GRIPPER_OPEN_WIDTH_M = 0.08
 DEFAULT_GRIPPER_CLOSE_WIDTH_M = 0.0
 DEFAULT_GRIPPER_SPEED_MPS = 0.04
 DEFAULT_GRIPPER_FORCE_N = 20.0
 DEFAULT_GRIPPER_TRIGGER_CLOSE_THRESHOLD = 0.65
 DEFAULT_GRIPPER_TRIGGER_OPEN_THRESHOLD = 0.25
+DEFAULT_GRIPPER_INIT_ON_ENABLE = False
 MAX_HAND_EYE_CAMERA_OFFSET_M = 0.50
 MAX_HAND_EYE_TRANSLATION_MEDIAN_RESIDUAL_MM = 15.0
 MAX_HAND_EYE_TRANSLATION_P95_RESIDUAL_MM = 35.0
-RED_ANCHOR_RADIUS_GRID_SPACING = 2.0
-RED_ANCHOR_MIN_PIXELS = 16
-RED_ANCHOR_MIN_RATIO = 0.002
-RED_ANCHOR_MIN_BEST_SECOND_RATIO = 1.8
 APPEARANCE_ANCHOR_MIN_CONTRAST = 18.0
 QUEST_TO_ROBOT_UNALIGNED_ROTATION = np.array(
     [
@@ -90,6 +107,12 @@ ROBOT_SESSION_CONTROL_MODES = {
     ROBOT_SESSION_CONTROL_TELEOP,
     ROBOT_SESSION_CONTROL_FREEDRIVE,
     ROBOT_SESSION_CONTROL_RECORD_ONLY,
+}
+ROBOT_SESSION_RECORD_SYNC = "sync"
+ROBOT_SESSION_RECORD_ASYNC = "async"
+ROBOT_SESSION_RECORD_MODES = {
+    ROBOT_SESSION_RECORD_SYNC,
+    ROBOT_SESSION_RECORD_ASYNC,
 }
 DEFAULT_FREEDRIVE_HOLD_STIFFNESS = [10000.0, 10000.0, 10000.0, 1500.0, 1500.0, 1500.0]
 DEFAULT_FREEDRIVE_COMPLIANT_STIFFNESS = [1000.0, 1000.0, 1000.0, 8.0, 8.0, 8.0]
@@ -119,6 +142,90 @@ class RobotHandEyeCalibrationError(RuntimeError):
         self.diagnostics = diagnostics
 
 
+class OnlineNumericStats:
+    def __init__(self, *, max_recent: int = 4096) -> None:
+        self.max_recent = max(32, int(max_recent))
+        self.count = 0
+        self.total = 0.0
+        self.min_value: float | None = None
+        self.max_value: float | None = None
+        self.recent: list[float] = []
+
+    def add(self, value: Any) -> None:
+        if not is_number(value):
+            return
+        number = float(value)
+        if not math.isfinite(number):
+            return
+        self.count += 1
+        self.total += number
+        self.min_value = number if self.min_value is None else min(self.min_value, number)
+        self.max_value = number if self.max_value is None else max(self.max_value, number)
+        self.recent.append(number)
+        if len(self.recent) > self.max_recent:
+            del self.recent[: len(self.recent) - self.max_recent]
+
+    def summary(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "count": int(self.count),
+        }
+        if self.count <= 0:
+            return payload
+        payload["mean"] = float(self.total / self.count)
+        payload["min"] = self.min_value
+        payload["max"] = self.max_value
+        if self.recent:
+            recent = np.asarray(self.recent, dtype=float)
+            payload["recentWindowCount"] = int(recent.size)
+            payload["median"] = float(np.median(recent))
+            payload["p90"] = float(np.percentile(recent, 90))
+            payload["p95"] = float(np.percentile(recent, 95))
+            payload["p99"] = float(np.percentile(recent, 99))
+        return payload
+
+
+class OnlineTimeSeriesStats:
+    def __init__(self, *, max_recent_gaps: int = 4096) -> None:
+        self.count = 0
+        self.first: float | None = None
+        self.last: float | None = None
+        self.gaps = OnlineNumericStats(max_recent=max_recent_gaps)
+
+    def add(self, value: Any) -> None:
+        if not is_number(value):
+            return
+        number = float(value)
+        if not math.isfinite(number):
+            return
+        if self.first is None:
+            self.first = number
+        if self.last is not None:
+            self.gaps.add(max(0.0, number - self.last))
+        self.last = number
+        self.count += 1
+
+    def summary(self, target_hz: float | None = None) -> dict[str, Any]:
+        if self.count <= 0 or self.first is None or self.last is None:
+            return {"count": 0}
+        duration = float(max(0.0, self.last - self.first))
+        hz = float((self.count - 1) / duration) if duration > 1e-9 and self.count >= 2 else None
+        payload: dict[str, Any] = {
+            "count": int(self.count),
+            "durationSeconds": duration,
+            "effectiveHz": hz,
+            "firstPerfCounterSeconds": self.first,
+            "lastPerfCounterSeconds": self.last,
+        }
+        if target_hz is not None and target_hz > 0:
+            payload["targetHz"] = float(target_hz)
+            if hz is not None:
+                payload["targetRatio"] = float(hz / float(target_hz))
+        gap_summary = self.gaps.summary()
+        if gap_summary.get("count"):
+            payload["gapSeconds"] = gap_summary
+        return payload
+
+
 @dataclass
 class FlexivRealSenseConfig:
     robot_sn: str = DEFAULT_FLEXIV_ROBOT_SN
@@ -130,6 +237,10 @@ class FlexivRealSenseConfig:
     width: int = DEFAULT_REALSENSE_WIDTH
     height: int = DEFAULT_REALSENSE_HEIGHT
     fps: int = DEFAULT_REALSENSE_FPS
+    robot_state_hz: float = DEFAULT_ROBOT_STATE_HZ
+    record_depth: bool = True
+    record_depth_align_to_color: bool = False
+    record_depth_every_n_frames: int = DEFAULT_RECORD_DEPTH_EVERY_N_FRAMES
     warmup_frames: int = 2
     realsense_auto_exposure: bool = True
     realsense_exposure: float | None = None
@@ -149,9 +260,7 @@ class FlexivRealSenseConfig:
     hand_eye_disable_diverse_selection: bool = False
     controller_motion_enabled: bool = False
     controller_translation_scale: float = DEFAULT_CONTROLLER_TRANSLATION_SCALE
-    controller_max_offset_m: float = DEFAULT_CONTROLLER_MAX_OFFSET_M
     controller_max_step_m: float = DEFAULT_CONTROLLER_MAX_STEP_M
-    controller_max_rotation_deg: float = DEFAULT_CONTROLLER_MAX_ROTATION_DEG
     controller_max_rotation_step_deg: float = DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG
     controller_joint_limit_buffer_rad: float = DEFAULT_CONTROLLER_JOINT_LIMIT_BUFFER_RAD
     controller_joint_limit_guard_enabled: bool = True
@@ -163,6 +272,7 @@ class FlexivRealSenseConfig:
     gripper_force_n: float = DEFAULT_GRIPPER_FORCE_N
     gripper_trigger_close_threshold: float = DEFAULT_GRIPPER_TRIGGER_CLOSE_THRESHOLD
     gripper_trigger_open_threshold: float = DEFAULT_GRIPPER_TRIGGER_OPEN_THRESHOLD
+    gripper_init_on_enable: bool = DEFAULT_GRIPPER_INIT_ON_ENABLE
 
 
 class FlexivRobotClient:
@@ -187,6 +297,9 @@ class FlexivRobotClient:
         self.gripper_enabled = False
         self.gripper_device: str | None = None
         self.gripper_last_error: str | None = None
+        self.gripper_enable_attempts: list[dict[str, Any]] = []
+        self.device_list_cache: dict[str, bool] | None = None
+        self.device_list_last_error: str | None = None
         self.joint_limits = default_rizon4_joint_limits()
 
     def connect(
@@ -217,16 +330,18 @@ class FlexivRobotClient:
             if wait_seconds > 0:
                 time.sleep(wait_seconds)
             self.ensure_operational_locked("connecting Flexiv robot")
-            self.switch_mode_locked("NRT_CARTESIAN_MOTION_FORCE")
             current_tcp = [float(v) for v in self.robot.states().tcp_pose]
             self.freedrive_hold_pose = current_tcp
-            self.robot.SetForceControlAxis([False, False, False, False, False, False])
-            self.set_cartesian_impedance_locked(
-                DEFAULT_FREEDRIVE_HOLD_STIFFNESS,
-                DEFAULT_FREEDRIVE_DAMPING,
-            )
-            self.send_cartesian_motion_force_compat(self.robot, current_tcp)
-            self.start_cartesian_control_loop_locked()
+            self.motion_armed = False
+            self.motion_last_target_pose = None
+            self.freedrive_enabled = False
+            self.freedrive_method = None
+            self.freedrive_plan = None
+            self.freedrive_last_tick_unix = None
+            self.freedrive_last_error = None
+            self.freedrive_send_signature = None
+            self.device_list_cache = None
+            self.device_list_last_error = None
             return self.read_state_locked()
 
     def disconnect(self) -> None:
@@ -241,6 +356,7 @@ class FlexivRobotClient:
                 pass
         self.robot = None
         self.robot_sn = None
+        self.device_list_cache = None
 
     def status(self) -> dict[str, Any]:
         with self.lock:
@@ -268,6 +384,7 @@ class FlexivRobotClient:
                 "freeDragControlHz": DEFAULT_FREEDRIVE_CONTROL_HZ,
                 "cartesianSendSignature": self.freedrive_send_signature,
                 "gripper": self.gripper_status_locked(),
+                "devices": self.device_status_locked(),
             }
             if connected:
                 try:
@@ -277,11 +394,11 @@ class FlexivRobotClient:
                     payload["lastError"] = self.last_error
             return payload
 
-    def read_state(self) -> dict[str, Any]:
+    def read_state(self, *, include_diagnostics: bool = True) -> dict[str, Any]:
         with self.lock:
-            return self.read_state_locked()
+            return self.read_state_locked(include_diagnostics=include_diagnostics)
 
-    def read_state_locked(self) -> dict[str, Any]:
+    def read_state_locked(self, *, include_diagnostics: bool = True) -> dict[str, Any]:
         if self.robot is None:
             raise RuntimeError("Flexiv robot is not connected")
         states = self.robot.states()
@@ -307,19 +424,20 @@ class FlexivRobotClient:
                 ],
             ),
         }
-        for name, getter in (
-            ("mode", lambda: self.robot.mode()),
-            ("operationalStatus", lambda: self.robot.operational_status()),
-            ("enablingButtonPressed", lambda: self.robot.enabling_button_pressed()),
-            ("busy", lambda: self.robot.busy()),
-            ("stopped", lambda: self.robot.stopped()),
-            ("reduced", lambda: self.robot.reduced()),
-        ):
-            try:
-                value = getter()
-                payload[name] = getattr(value, "name", str(value)) if name in ("mode", "operationalStatus") else bool(value)
-            except Exception:
-                pass
+        if include_diagnostics:
+            for name, getter in (
+                ("mode", lambda: self.robot.mode()),
+                ("operationalStatus", lambda: self.robot.operational_status()),
+                ("enablingButtonPressed", lambda: self.robot.enabling_button_pressed()),
+                ("busy", lambda: self.robot.busy()),
+                ("stopped", lambda: self.robot.stopped()),
+                ("reduced", lambda: self.robot.reduced()),
+            ):
+                try:
+                    value = getter()
+                    payload[name] = getattr(value, "name", str(value)) if name in ("mode", "operationalStatus") else bool(value)
+                except Exception:
+                    pass
         payload["jointLimitGuard"] = joint_limit_guard_state(
             payload.get("jointPose"),
             self.joint_limits,
@@ -338,6 +456,64 @@ class FlexivRobotClient:
             except Exception:
                 pass
         return payload
+
+    def read_record_state(
+        self,
+        joint_limit_buffer_rad: float,
+        joint_limit_guard_enabled: bool,
+        *,
+        lightweight: bool = False,
+    ) -> dict[str, Any]:
+        with self.lock:
+            if lightweight:
+                if self.robot is None:
+                    raise RuntimeError("Flexiv robot is not connected")
+                states = self.robot.states()
+                pose = np.asarray(getattr(states, self.pose_field), dtype=float).reshape(7)
+                payload: dict[str, Any] = {
+                    "ok": True,
+                    "robotSn": self.robot_sn,
+                    "poseField": self.pose_field,
+                    "readUnixSeconds": time.time(),
+                    "rawEndEffectorPoseWxyz": [float(v) for v in pose],
+                    "jointPose": first_numeric_state_list(
+                        states,
+                        [
+                            "q",
+                            "theta",
+                            "joint_pos",
+                            "joint_position",
+                            "joint_positions",
+                            "jointPosition",
+                            "actual_q",
+                        ],
+                    ),
+                }
+                for field in ("flange_pose", "tcp_pose"):
+                    if field == self.pose_field or not hasattr(states, field):
+                        continue
+                    try:
+                        other_pose = np.asarray(getattr(states, field), dtype=float).reshape(7)
+                        payload[field] = {"pose": [float(v) for v in other_pose]}
+                    except Exception:
+                        pass
+            else:
+                payload = self.read_state_locked(include_diagnostics=False)
+            payload["jointLimitGuard"] = joint_limit_guard_state(
+                payload.get("jointPose"),
+                self.joint_limits,
+                joint_limit_buffer_rad,
+                joint_limit_guard_enabled,
+            )
+            if lightweight:
+                payload["gripper"] = {
+                    "enabled": self.gripper_enabled,
+                    "device": self.gripper_device,
+                    "lastError": self.gripper_last_error,
+                }
+            else:
+                payload["gripper"] = self.gripper_status_locked(include_params=False)
+            return payload
 
     def read_tcp_pose(self) -> list[float]:
         with self.lock:
@@ -487,6 +663,7 @@ class FlexivRobotClient:
             "freeDragControlHz": DEFAULT_FREEDRIVE_CONTROL_HZ,
             "cartesianSendSignature": self.freedrive_send_signature,
             "gripper": self.gripper_status_locked(),
+            "devices": self.device_status_locked(),
         }
         if connected:
             try:
@@ -689,26 +866,106 @@ class FlexivRobotClient:
             ],
         )
 
-    def enable_gripper(self, device_name: str) -> dict[str, Any]:
+    def enable_gripper(self, device_name: str, *, init_on_enable: bool = DEFAULT_GRIPPER_INIT_ON_ENABLE) -> dict[str, Any]:
         with self.lock:
-            return self.enable_gripper_locked(device_name)
+            return self.enable_gripper_locked(device_name, init_on_enable=init_on_enable)
 
-    def enable_gripper_locked(self, device_name: str) -> dict[str, Any]:
+    def device_status_locked(self, *, refresh: bool = False) -> dict[str, Any]:
+        if self.robot is None:
+            return {
+                "ok": False,
+                "reason": "robot_not_connected",
+                "list": self.device_list_cache,
+                "lastError": self.device_list_last_error,
+            }
+        if self.device_list_cache is not None and not refresh:
+            return {"ok": True, "list": self.device_list_cache, "lastError": self.device_list_last_error}
+        try:
+            flexivrdk = sys.modules.get("flexivrdk") or import_flexivrdk(None)
+            device = flexivrdk.Device(self.robot)
+            items = device.list()
+            self.device_list_cache = {str(name): bool(enabled) for name, enabled in dict(items).items()}
+            self.device_list_last_error = None
+            return {"ok": True, "list": self.device_list_cache, "lastError": None}
+        except Exception as exc:
+            self.device_list_last_error = str(exc)
+            return {
+                "ok": False,
+                "list": self.device_list_cache,
+                "lastError": self.device_list_last_error,
+            }
+
+    def gripper_device_candidates_locked(self, requested: str | None) -> list[str]:
+        requested_text = str(requested or "").strip()
+        candidates: list[str] = []
+        if requested_text and requested_text.lower() not in ("auto", "default"):
+            candidates.append(requested_text)
+        device_status = self.device_status_locked(refresh=True)
+        device_list = device_status.get("list") if isinstance(device_status, dict) else None
+        if isinstance(device_list, dict):
+            names = [str(name) for name in device_list.keys()]
+            gripperish = [
+                name
+                for name in names
+                if any(token in name.lower() for token in ("robotiq", "gripper", "2f", "hand-e", "hande"))
+            ]
+            for name in gripperish:
+                if name not in candidates:
+                    candidates.append(name)
+        for name in DEFAULT_GRIPPER_DEVICE_CANDIDATES:
+            if name not in candidates:
+                candidates.append(name)
+        return candidates
+
+    def enable_gripper_locked(
+        self,
+        device_name: str,
+        *,
+        init_on_enable: bool = DEFAULT_GRIPPER_INIT_ON_ENABLE,
+    ) -> dict[str, Any]:
         if self.robot is None:
             raise RuntimeError("Flexiv robot is not connected")
         flexivrdk = sys.modules.get("flexivrdk") or import_flexivrdk(None)
-        device = str(device_name or DEFAULT_GRIPPER_DEVICE).strip() or DEFAULT_GRIPPER_DEVICE
-        self.gripper = flexivrdk.Gripper(self.robot)
-        self.gripper.Enable(device)
-        try:
-            self.gripper.Init()
-        except Exception:
-            # Some gripper configurations are already initialized after Enable.
-            pass
-        self.gripper_enabled = True
-        self.gripper_device = device
-        self.gripper_last_error = None
-        return self.gripper_status_locked()
+        requested = str(device_name or DEFAULT_GRIPPER_DEVICE).strip() or DEFAULT_GRIPPER_DEVICE
+        attempts: list[dict[str, Any]] = []
+        last_error: str | None = None
+        for device in self.gripper_device_candidates_locked(requested):
+            gripper = flexivrdk.Gripper(self.robot)
+            try:
+                gripper.Enable(device)
+                init_error: str | None = None
+                if init_on_enable:
+                    try:
+                        gripper.Init()
+                    except Exception as exc:
+                        # Some Robotiq/Flexiv gripper configurations initialize automatically on power-on.
+                        init_error = str(exc)
+                self.gripper = gripper
+                self.gripper_enabled = True
+                self.gripper_device = device
+                self.gripper_last_error = None
+                attempts.append({"device": device, "ok": True, "initError": init_error})
+                self.gripper_enable_attempts = attempts
+                return self.gripper_status_locked()
+            except Exception as exc:
+                last_error = str(exc)
+                attempts.append({"device": device, "ok": False, "error": last_error})
+                if "already enabled" in last_error.lower():
+                    self.gripper = gripper
+                    self.gripper_enabled = True
+                    self.gripper_device = device
+                    self.gripper_last_error = None
+                    attempts[-1]["ok"] = True
+                    attempts[-1]["reusedAlreadyEnabled"] = True
+                    self.gripper_enable_attempts = attempts
+                    return self.gripper_status_locked()
+        self.gripper = None
+        self.gripper_enabled = False
+        self.gripper_device = None
+        self.gripper_last_error = last_error or "no gripper device candidates were available"
+        self.gripper_enable_attempts = attempts
+        tried = ", ".join(row.get("device", "") for row in attempts) or requested
+        raise RuntimeError(f"Could not enable Flexiv gripper; tried [{tried}]. Last error: {self.gripper_last_error}")
 
     def disable_gripper_locked(self) -> None:
         if self.gripper is not None:
@@ -724,11 +981,12 @@ class FlexivRobotClient:
         self.gripper_enabled = False
         self.gripper_device = None
 
-    def gripper_status_locked(self) -> dict[str, Any]:
+    def gripper_status_locked(self, *, include_params: bool = True) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "enabled": self.gripper_enabled,
             "device": self.gripper_device,
             "lastError": self.gripper_last_error,
+            "enableAttempts": self.gripper_enable_attempts[-12:],
         }
         if self.gripper is not None:
             try:
@@ -741,19 +999,20 @@ class FlexivRobotClient:
             except Exception as exc:
                 self.gripper_last_error = str(exc)
                 payload["lastError"] = self.gripper_last_error
-            try:
-                params = self.gripper.params()
-                payload["params"] = {
-                    "name": str(getattr(params, "name", "")),
-                    "minWidth": safe_float(getattr(params, "min_width", None)),
-                    "maxWidth": safe_float(getattr(params, "max_width", None)),
-                    "minVel": safe_float(getattr(params, "min_vel", None)),
-                    "maxVel": safe_float(getattr(params, "max_vel", None)),
-                    "minForce": safe_float(getattr(params, "min_force", None)),
-                    "maxForce": safe_float(getattr(params, "max_force", None)),
-                }
-            except Exception:
-                pass
+            if include_params:
+                try:
+                    params = self.gripper.params()
+                    payload["params"] = {
+                        "name": str(getattr(params, "name", "")),
+                        "minWidth": safe_float(getattr(params, "min_width", None)),
+                        "maxWidth": safe_float(getattr(params, "max_width", None)),
+                        "minVel": safe_float(getattr(params, "min_vel", None)),
+                        "maxVel": safe_float(getattr(params, "max_vel", None)),
+                        "minForce": safe_float(getattr(params, "min_force", None)),
+                        "maxForce": safe_float(getattr(params, "max_force", None)),
+                    }
+                except Exception:
+                    pass
         return payload
 
     def gripper_status(self) -> dict[str, Any]:
@@ -765,14 +1024,46 @@ class FlexivRobotClient:
             if self.robot is None:
                 raise RuntimeError("Flexiv robot is not connected")
             if self.gripper is None:
-                self.enable_gripper_locked(str(self.gripper_device or DEFAULT_GRIPPER_DEVICE))
+                self.enable_gripper_locked(
+                    str(self.gripper_device or DEFAULT_GRIPPER_DEVICE),
+                    init_on_enable=DEFAULT_GRIPPER_INIT_ON_ENABLE,
+                )
             assert self.gripper is not None
-            width = float(width_m)
-            speed = float(speed_mps)
-            force = float(force_n)
+            params_payload: dict[str, Any] = {}
+            try:
+                params = self.gripper.params()
+                params_payload = {
+                    "minWidth": safe_float(getattr(params, "min_width", None)),
+                    "maxWidth": safe_float(getattr(params, "max_width", None)),
+                    "minVel": safe_float(getattr(params, "min_vel", None)),
+                    "maxVel": safe_float(getattr(params, "max_vel", None)),
+                    "minForce": safe_float(getattr(params, "min_force", None)),
+                    "maxForce": safe_float(getattr(params, "max_force", None)),
+                }
+            except Exception:
+                params_payload = {}
+            requested = {
+                "width": float(width_m),
+                "speed": float(speed_mps),
+                "force": float(force_n),
+            }
+            width = clamp_optional_range(requested["width"], params_payload.get("minWidth"), params_payload.get("maxWidth"))
+            speed = clamp_optional_range(requested["speed"], params_payload.get("minVel"), params_payload.get("maxVel"))
+            force = clamp_optional_range(requested["force"], params_payload.get("minForce"), params_payload.get("maxForce"))
             self.gripper.Move(width, speed, force)
             self.gripper_last_error = None
-            return self.gripper_status_locked()
+            status = self.gripper_status_locked()
+            status["command"] = {
+                "requestedWidth": requested["width"],
+                "requestedSpeed": requested["speed"],
+                "requestedForce": requested["force"],
+                "width": width,
+                "speed": speed,
+                "force": force,
+                "clamped": width != requested["width"] or speed != requested["speed"] or force != requested["force"],
+                "params": params_payload,
+            }
+            return status
 
 
 class RealSenseColorCamera:
@@ -784,6 +1075,10 @@ class RealSenseColorCamera:
         self.height = DEFAULT_REALSENSE_HEIGHT
         self.fps = DEFAULT_REALSENSE_FPS
         self.metadata: dict[str, Any] | None = None
+        self.align_to_color: Any | None = None
+        self.record_depth = False
+        self.record_depth_align_to_color = False
+        self.record_depth_every_n_frames = DEFAULT_RECORD_DEPTH_EVERY_N_FRAMES
 
     def start(
         self,
@@ -791,11 +1086,25 @@ class RealSenseColorCamera:
         width: int,
         height: int,
         fps: int,
+        record_depth: bool = True,
+        record_depth_align_to_color: bool = False,
+        record_depth_every_n_frames: int = DEFAULT_RECORD_DEPTH_EVERY_N_FRAMES,
         auto_exposure: bool = True,
         exposure: float | None = None,
         gain: float | None = None,
     ) -> dict[str, Any]:
-        if self.pipeline is not None and self.serial == serial and self.width == width and self.height == height and self.fps == fps:
+        requested_depth = bool(record_depth)
+        requested_depth_align = bool(record_depth and record_depth_align_to_color)
+        if (
+            self.pipeline is not None
+            and self.serial == serial
+            and self.width == width
+            and self.height == height
+            and self.fps == fps
+            and self.record_depth == requested_depth
+            and self.record_depth_align_to_color == requested_depth_align
+            and self.record_depth_every_n_frames == max(1, int(record_depth_every_n_frames))
+        ):
             return self.metadata or {}
         self.stop()
         import pyrealsense2 as rs  # type: ignore[import-not-found]
@@ -803,7 +1112,11 @@ class RealSenseColorCamera:
         pipeline = rs.pipeline()
         config = rs.config()
         config.enable_device(serial)
-        config.enable_stream(rs.stream.color, int(width), int(height), rs.format.rgb8, int(fps))
+        # OpenCV VideoWriter/imencode/checkerboard detection all operate naturally on
+        # BGR frames, so request bgr8 from RealSense and avoid a per-frame RGB->BGR copy.
+        config.enable_stream(rs.stream.color, int(width), int(height), rs.format.bgr8, int(fps))
+        if record_depth:
+            config.enable_stream(rs.stream.depth, int(width), int(height), rs.format.z16, int(fps))
         profile = pipeline.start(config)
         color_options = configure_color_sensor(profile, auto_exposure, exposure, gain)
         self.pipeline = pipeline
@@ -812,8 +1125,19 @@ class RealSenseColorCamera:
         self.width = int(width)
         self.height = int(height)
         self.fps = int(fps)
+        self.record_depth = requested_depth
+        self.record_depth_align_to_color = requested_depth_align
+        self.record_depth_every_n_frames = max(1, int(record_depth_every_n_frames))
+        self.align_to_color = rs.align(rs.stream.color) if self.record_depth_align_to_color else None
         self.metadata = camera_metadata_from_profile(profile, serial)
         self.metadata["colorOptions"] = color_options
+        self.metadata["colorFormat"] = "bgr8"
+        self.metadata["imageColorConvention"] = "opencv_bgr"
+        self.metadata["depthEnabled"] = bool(record_depth)
+        self.metadata["depthAlignedToColor"] = bool(self.record_depth_align_to_color)
+        self.metadata["depthEveryNFrames"] = int(self.record_depth_every_n_frames)
+        if record_depth:
+            self.metadata["depthScaleM"] = depth_scale_from_profile(profile)
         return self.metadata
 
     def stop(self) -> None:
@@ -825,17 +1149,34 @@ class RealSenseColorCamera:
         self.pipeline = None
         self.profile = None
         self.metadata = None
+        self.align_to_color = None
+        self.record_depth = False
+        self.record_depth_align_to_color = False
+        self.record_depth_every_n_frames = DEFAULT_RECORD_DEPTH_EVERY_N_FRAMES
 
-    def capture_rgb(self, warmup_frames: int) -> np.ndarray:
+    def capture_frame(self, warmup_frames: int, *, include_depth: bool = True) -> dict[str, Any]:
         if self.pipeline is None:
             raise RuntimeError("RealSense camera is not started")
-        frame = None
+        color_frame = None
+        depth_frame = None
         for _ in range(max(1, int(warmup_frames))):
             frames = self.pipeline.wait_for_frames(5000)
-            frame = frames.get_color_frame()
-        if not frame:
+            if include_depth and self.align_to_color is not None:
+                frames = self.align_to_color.process(frames)
+            color_frame = frames.get_color_frame()
+            depth_frame = frames.get_depth_frame() if self.record_depth and include_depth else None
+        if not color_frame:
             raise RuntimeError("No RealSense color frame received")
-        return np.asanyarray(frame.get_data()).copy()
+        result: dict[str, Any] = {"bgr": np.asanyarray(color_frame.get_data()).copy()}
+        if depth_frame:
+            result["depth"] = np.asanyarray(depth_frame.get_data()).copy()
+        return result
+
+    def capture_rgb(self, warmup_frames: int) -> np.ndarray:
+        return cv2.cvtColor(self.capture_frame(warmup_frames, include_depth=False)["bgr"], cv2.COLOR_BGR2RGB)
+
+    def capture_bgr(self, warmup_frames: int) -> np.ndarray:
+        return self.capture_frame(warmup_frames, include_depth=False)["bgr"]
 
 
 class RealSenseStreamHub:
@@ -844,16 +1185,21 @@ class RealSenseStreamHub:
         self.cameras: dict[str, RealSenseColorCamera] = {}
         self.metadata: dict[str, dict[str, Any]] = {}
         self.latest: dict[str, dict[str, Any]] = {}
+        self.subscribers: dict[str, list[queue.Queue[Any]]] = {}
+        self.subscriber_drop_counts: dict[str, int] = {}
         self.signature: tuple[Any, ...] | None = None
         self.stop_event: threading.Event | None = None
-        self.thread: threading.Thread | None = None
+        self.threads: dict[str, threading.Thread] = {}
         self.frame_count = 0
+        self.frame_sequence = 0
+        self.role_frame_counts: dict[str, int] = {}
+        self.role_errors: dict[str, str | None] = {}
         self.last_error: str | None = None
 
     def start(self, config: FlexivRealSenseConfig) -> dict[str, Any]:
         signature = self._signature(config)
         with self.lock:
-            if self.thread is not None and self.thread.is_alive() and self.signature == signature:
+            if self._running_locked() and self.signature == signature:
                 return self.status_locked()
         self.stop()
 
@@ -867,6 +1213,9 @@ class RealSenseStreamHub:
                     int(config.width),
                     int(config.height),
                     int(config.fps),
+                    bool(config.record_depth),
+                    bool(config.record_depth_align_to_color),
+                    max(1, int(config.record_depth_every_n_frames)),
                     bool(config.realsense_auto_exposure),
                     config.realsense_exposure,
                     config.realsense_gain,
@@ -882,35 +1231,54 @@ class RealSenseStreamHub:
             raise RuntimeError("No RealSense camera serials are configured")
 
         stop_event = threading.Event()
-        thread = threading.Thread(target=self._capture_loop, args=(stop_event,), name="realsense-stream", daemon=True)
+        threads = {
+            role: threading.Thread(
+                target=self._capture_role_loop,
+                args=(role, camera, stop_event),
+                name=f"realsense-stream-{role}",
+                daemon=True,
+            )
+            for role, camera in cameras.items()
+        }
         with self.lock:
             self.cameras = cameras
             self.metadata = metadata
             self.latest = {}
+            self.subscribers = {role: [] for role in cameras}
+            self.subscriber_drop_counts = {role: 0 for role in cameras}
             self.signature = signature
             self.stop_event = stop_event
-            self.thread = thread
+            self.threads = threads
             self.frame_count = 0
+            self.frame_sequence = 0
+            self.role_frame_counts = {role: 0 for role in cameras}
+            self.role_errors = {role: None for role in cameras}
             self.last_error = None
-        thread.start()
+        for thread in threads.values():
+            thread.start()
         return self.status()
 
     def stop(self) -> None:
         with self.lock:
             stop_event = self.stop_event
-            thread = self.thread
+            threads = list(self.threads.values())
         if stop_event is not None:
             stop_event.set()
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
+        for thread in threads:
+            if thread.is_alive():
+                thread.join(timeout=2.0)
         with self.lock:
             cameras = self.cameras
             self.cameras = {}
             self.metadata = {}
             self.latest = {}
+            self.subscribers = {}
+            self.subscriber_drop_counts = {}
             self.signature = None
             self.stop_event = None
-            self.thread = None
+            self.threads = {}
+            self.role_frame_counts = {}
+            self.role_errors = {}
         for camera in cameras.values():
             camera.stop()
 
@@ -919,35 +1287,56 @@ class RealSenseStreamHub:
             return self.status_locked()
 
     def status_locked(self) -> dict[str, Any]:
-        running = self.thread is not None and self.thread.is_alive()
+        role_threads = {role: thread.is_alive() for role, thread in self.threads.items()}
+        running = any(role_threads.values())
         return {
             "running": running,
             "roles": sorted(self.cameras.keys()),
             "metadata": self.metadata,
             "frameCount": self.frame_count,
+            "frameCountByRole": dict(self.role_frame_counts),
+            "roleThreads": role_threads,
+            "roleErrors": {role: error for role, error in self.role_errors.items() if error},
+            "subscriberDropCounts": dict(self.subscriber_drop_counts),
             "latest": {
                 role: {
                     "capturedAtUtc": frame.get("capturedAtUtc"),
                     "serial": frame.get("serial"),
                     "sequence": frame.get("sequence"),
+                    "roleSequence": frame.get("roleSequence"),
+                    "hasDepth": isinstance(frame.get("depth"), np.ndarray),
                 }
                 for role, frame in self.latest.items()
             },
             "lastError": self.last_error,
         }
 
-    def get_latest(self, role: str = "end", wait_timeout: float = 2.0) -> dict[str, Any]:
+    def get_latest(
+        self,
+        role: str = "end",
+        wait_timeout: float = 2.0,
+        *,
+        copy_arrays: bool = True,
+        include_depth: bool = True,
+    ) -> dict[str, Any]:
         deadline = time.perf_counter() + max(0.0, float(wait_timeout))
         while True:
             with self.lock:
                 frame = self.latest.get(role)
-                running = self.thread is not None and self.thread.is_alive()
-                last_error = self.last_error
+                role_thread = self.threads.get(role)
+                running = role_thread is not None and role_thread.is_alive()
+                last_error = self.role_errors.get(role) or self.last_error
             if frame is not None:
+                bgr = frame.get("bgr")
+                depth = frame.get("depth")
                 return {
                     **frame,
-                    "rgb": frame["rgb"].copy(),
-                    "jpeg": bytes(frame["jpeg"]),
+                    "bgr": bgr.copy() if copy_arrays and isinstance(bgr, np.ndarray) else bgr,
+                    "depth": (
+                        depth.copy()
+                        if include_depth and copy_arrays and isinstance(depth, np.ndarray)
+                        else (depth if include_depth else None)
+                    ),
                     "metadata": dict(frame["metadata"]),
                 }
             if not running:
@@ -959,33 +1348,90 @@ class RealSenseStreamHub:
     def snapshot_roles(self, roles: list[str], wait_timeout: float = 2.0) -> dict[str, dict[str, Any]]:
         return {role: self.get_latest(role, wait_timeout=wait_timeout) for role in roles}
 
-    def _capture_loop(self, stop_event: threading.Event) -> None:
+    def subscribe(self, role: str, *, max_queue_size: int = 128) -> queue.Queue[Any]:
+        role_name = str(role or "").strip().lower()
+        if not role_name:
+            raise ValueError("RealSense subscriber role is empty")
+        frame_queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, int(max_queue_size)))
+        with self.lock:
+            if role_name not in self.cameras:
+                raise RuntimeError(f"RealSense role is not active: {role_name}")
+            self.subscribers.setdefault(role_name, []).append(frame_queue)
+        return frame_queue
+
+    def unsubscribe(self, role: str, frame_queue: queue.Queue[Any]) -> None:
+        role_name = str(role or "").strip().lower()
+        with self.lock:
+            queues = self.subscribers.get(role_name) or []
+            if frame_queue in queues:
+                queues.remove(frame_queue)
+
+    def _running_locked(self) -> bool:
+        return any(thread.is_alive() for thread in self.threads.values())
+
+    def _capture_role_loop(
+        self,
+        role: str,
+        camera: RealSenseColorCamera,
+        stop_event: threading.Event,
+    ) -> None:
+        local_capture_index = 0
         while not stop_event.is_set():
-            with self.lock:
-                cameras = list(self.cameras.items())
-            for role, camera in cameras:
-                if stop_event.is_set():
-                    return
-                try:
-                    rgb = camera.capture_rgb(1)
-                    jpeg = encode_rgb_jpeg(rgb, quality=86)
-                    captured_at = datetime.now(timezone.utc).isoformat()
-                    with self.lock:
-                        self.frame_count += 1
-                        self.latest[role] = {
-                            "role": role,
-                            "serial": camera.serial,
-                            "metadata": self.metadata.get(role, {}),
-                            "rgb": rgb,
-                            "jpeg": jpeg,
-                            "capturedAtUtc": captured_at,
-                            "sequence": self.frame_count,
-                        }
+            try:
+                every_n = max(1, int(camera.record_depth_every_n_frames))
+                include_depth = bool(camera.record_depth and local_capture_index % every_n == 0)
+                captured = camera.capture_frame(1, include_depth=include_depth)
+                bgr = captured["bgr"]
+                captured_at_perf = time.perf_counter()
+                captured_at = datetime.now(timezone.utc).isoformat()
+                subscribers: list[queue.Queue[Any]] = []
+                with self.lock:
+                    self.frame_sequence += 1
+                    self.frame_count += 1
+                    role_sequence = int(self.role_frame_counts.get(role, 0)) + 1
+                    self.role_frame_counts[role] = role_sequence
+                    frame_payload = {
+                        "role": role,
+                        "serial": camera.serial,
+                        "metadata": self.metadata.get(role, {}),
+                        "bgr": bgr,
+                        "depth": captured.get("depth"),
+                        "depthCaptureIndex": local_capture_index if include_depth else None,
+                        "capturedAtUtc": captured_at,
+                        "capturedAtPerfCounterSeconds": captured_at_perf,
+                        "sequence": self.frame_sequence,
+                        "roleSequence": role_sequence,
+                    }
+                    self.latest[role] = frame_payload
+                    subscribers = list(self.subscribers.get(role) or [])
+                    self.role_errors[role] = None
+                    if not any(self.role_errors.values()):
                         self.last_error = None
-                except Exception as exc:  # pragma: no cover - hardware path
-                    with self.lock:
-                        self.last_error = str(exc)
-                    time.sleep(0.1)
+                for frame_queue in subscribers:
+                    try:
+                        frame_queue.put_nowait(frame_payload)
+                    except queue.Full:
+                        try:
+                            frame_queue.get_nowait()
+                            try:
+                                frame_queue.task_done()
+                            except ValueError:
+                                pass
+                        except queue.Empty:
+                            pass
+                        with self.lock:
+                            self.subscriber_drop_counts[role] = int(self.subscriber_drop_counts.get(role, 0)) + 1
+                        try:
+                            frame_queue.put_nowait(frame_payload)
+                        except queue.Full:
+                            pass
+                local_capture_index += 1
+            except Exception as exc:  # pragma: no cover - hardware path
+                message = str(exc)
+                with self.lock:
+                    self.role_errors[role] = message
+                    self.last_error = f"{role}: {message}"
+                time.sleep(0.1)
 
     def _signature(self, config: FlexivRealSenseConfig) -> tuple[Any, ...]:
         serials = tuple(sorted(self._camera_serials(config).items()))
@@ -994,6 +1440,9 @@ class RealSenseStreamHub:
             int(config.width),
             int(config.height),
             int(config.fps),
+            bool(config.record_depth),
+            bool(config.record_depth_align_to_color),
+            max(1, int(config.record_depth_every_n_frames)),
             bool(config.realsense_auto_exposure),
             config.realsense_exposure,
             config.realsense_gain,
@@ -1022,6 +1471,7 @@ class RobotRealsenseSession:
         robot_alignment_result: dict[str, Any] | None = None,
         require_controller_alignment: bool = False,
         control_mode: str = ROBOT_SESSION_CONTROL_TELEOP,
+        record_mode: str = ROBOT_SESSION_RECORD_SYNC,
     ) -> None:
         self.root = root.resolve()
         self.record_id = record_id
@@ -1032,30 +1482,65 @@ class RobotRealsenseSession:
         self.control_mode = (
             control_mode if control_mode in ROBOT_SESSION_CONTROL_MODES else ROBOT_SESSION_CONTROL_RECORD_ONLY
         )
+        self.record_mode = record_mode if record_mode in ROBOT_SESSION_RECORD_MODES else ROBOT_SESSION_RECORD_SYNC
         self.directory = self.root / "robot_realsense"
         self.image_dir = self.directory / "images"
         self.video_dir = self.directory / "videos"
+        self.depth_dir = self.directory / "depth"
         self.samples_path = self.directory / "samples.jsonl"
+        self.robot_states_path = self.directory / "robot_states.jsonl"
         self.motion_path = self.directory / "controller_motion.jsonl"
         self.gripper_path = self.directory / "gripper_commands.jsonl"
         self.video_frames_path = self.directory / "video_frames.jsonl"
         self.summary_path = self.directory / "session_summary.json"
         self.samples_handle: Any | None = None
+        self.robot_states_handle: Any | None = None
         self.motion_handle: Any | None = None
         self.gripper_handle: Any | None = None
         self.video_frames_handle: Any | None = None
         self.video_writers: dict[str, cv2.VideoWriter] = {}
         self.video_paths: dict[str, str] = {}
         self.video_frame_counts: dict[str, int] = {}
-        self.lock = threading.Lock()
+        self.depth_stream_handles: dict[str, Any] = {}
+        self.depth_stream_paths: dict[str, str] = {}
+        self.camera_frame_queues: dict[str, queue.Queue[Any]] = {}
+        self.camera_writer_threads: dict[str, threading.Thread] = {}
+        self.video_role_locks: dict[str, threading.RLock] = {}
+        self.camera_queue_drop_counts: dict[str, int] = {}
+        self.camera_subscriber_drop_start_counts: dict[str, int] = {}
+        self.camera_queue_max_sizes: dict[str, int] = {}
+        self.camera_writer_thread_alive_on_close: dict[str, bool] = {}
+        self.close_errors: list[dict[str, Any]] = []
+        self.depth_count = 0
+        self.latest_video_frame_rows: dict[str, dict[str, Any]] = {}
+        self.latest_video_sequences: dict[str, Any] = {}
+        self.recording_start_perf_counter: float | None = None
+        self.recording_start_unix_seconds: float | None = None
+        self.robot_state_perf_stats = OnlineTimeSeriesStats()
+        self.video_frame_perf_stats_by_role: dict[str, OnlineTimeSeriesStats] = {}
+        self.depth_frame_perf_stats_by_role: dict[str, OnlineTimeSeriesStats] = {}
+        self.camera_write_duration_stats_by_role: dict[str, OnlineNumericStats] = {}
+        self.camera_capture_to_write_latency_stats_by_role: dict[str, OnlineNumericStats] = {}
+        self.lock = threading.RLock()
+        self.video_io_lock = threading.RLock()
+        self.stop_event: threading.Event | None = None
+        self.robot_state_thread: threading.Thread | None = None
+        self.camera_record_thread: threading.Thread | None = None
         self.next_capture_perf = 0.0
         self.sample_count = 0
+        self.robot_state_count = 0
+        self.quest_aligned_sample_count = 0
         self.image_count = 0
         self.video_frame_count = 0
         self.error_count = 0
+        self.robot_state_error_count = 0
+        self.camera_record_error_count = 0
         self.closed = False
         self.last_error: str | None = None
+        self.last_robot_state_error: str | None = None
+        self.last_camera_record_error: str | None = None
         self.camera_metadata: dict[str, dict[str, Any]] = {}
+        self.latest_robot_state_row: dict[str, Any] | None = None
         self.controller_anchor_world: np.ndarray | None = None
         self.controller_anchor_rotation_world: np.ndarray | None = None
         self.robot_anchor_tcp_pose: list[float] | None = None
@@ -1066,9 +1551,22 @@ class RobotRealsenseSession:
         self.gripper_command_count = 0
         self.gripper_skip_count = 0
         self.gripper_error_count = 0
+        self.gripper_available = False
         self.last_gripper_event: dict[str, Any] | None = None
         self.last_gripper_closed: bool | None = None
+        self.last_gripper_unavailable_closed: bool | None = None
         self.ee_pose_history: list[np.ndarray] = []
+        self.text_pending_rows = {
+            "samples": 0,
+            "robot_states": 0,
+            "motion": 0,
+            "gripper": 0,
+        }
+        self.video_pending_rows = 0
+        now_perf = time.perf_counter()
+        self.text_last_flush_perf = now_perf
+        self.video_last_flush_perf = now_perf
+        self.next_async_sample_write_perf = 0.0
         self.robot_alignment_result = robot_alignment_result if isinstance(robot_alignment_result, dict) else None
         self.require_controller_alignment = require_controller_alignment
         self.t_ee_end_camera = self._alignment_transform("end_camera", "T_ee_realsense")
@@ -1078,23 +1576,58 @@ class RobotRealsenseSession:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.image_dir.mkdir(parents=True, exist_ok=True)
         self.video_dir.mkdir(parents=True, exist_ok=True)
+        self.depth_dir.mkdir(parents=True, exist_ok=True)
         self.samples_handle = self.samples_path.open("a", encoding="utf-8", newline="\n")
+        self.robot_states_handle = self.robot_states_path.open("a", encoding="utf-8", newline="\n")
         self.motion_handle = self.motion_path.open("a", encoding="utf-8", newline="\n")
         self.gripper_handle = self.gripper_path.open("a", encoding="utf-8", newline="\n")
         self.video_frames_handle = self.video_frames_path.open("a", encoding="utf-8", newline="\n")
+        with self.lock:
+            self.recording_start_perf_counter = time.perf_counter()
+            self.recording_start_unix_seconds = time.time()
         config_payload = config_to_json(self.config)
         config_payload["recordId"] = self.record_id
         config_payload["controlMode"] = self.control_mode
+        config_payload["recordMode"] = self.record_mode
         config_payload["startedAtUtc"] = datetime.now(timezone.utc).isoformat()
         write_json(config_payload, self.directory / "capture_config.json")
         stream_status = self.stream_hub.start(self.config)
         metadata = stream_status.get("metadata") if isinstance(stream_status, dict) else None
         self.camera_metadata = metadata if isinstance(metadata, dict) else {}
+        self.camera_subscriber_drop_start_counts = dict(
+            stream_status.get("subscriberDropCounts")
+            if isinstance(stream_status.get("subscriberDropCounts"), dict)
+            else {}
+        )
         write_json(self.camera_metadata, self.directory / "cameras.json")
         if self.robot_alignment_result is not None:
             write_json(self.robot_alignment_result, self.directory / "robot_hand_eye_result.json")
         if self.config.gripper_enabled:
             self._try_initialize_gripper()
+        self.stop_event = threading.Event()
+        if self.record_mode == ROBOT_SESSION_RECORD_ASYNC:
+            self.robot_state_thread = threading.Thread(
+                target=self._robot_state_loop,
+                name=f"robot-state-record-{safe_filename(self.record_id)}",
+                daemon=True,
+            )
+            self.robot_state_thread.start()
+            for role in sorted(self.camera_metadata.keys()):
+                queue_size = async_camera_queue_size(self.config.fps)
+                frame_queue = self.stream_hub.subscribe(
+                    role,
+                    max_queue_size=queue_size,
+                )
+                self.camera_frame_queues[role] = frame_queue
+                self.camera_queue_max_sizes[role] = queue_size
+                thread = threading.Thread(
+                    target=self._camera_role_record_loop,
+                    args=(role, frame_queue),
+                    name=f"robot-camera-record-{safe_filename(self.record_id)}-{role}",
+                    daemon=True,
+                )
+                self.camera_writer_threads[role] = thread
+                thread.start()
         summary = self.summary("recording")
         self._publish({"type": "robot_status", "stage": "robot_realsense_recording", **summary})
         return summary
@@ -1116,16 +1649,18 @@ class RobotRealsenseSession:
                 "quest_sample_index": quest_sample.get("sampleIndex"),
                 "error": str(exc),
             }
+        should_record_event = self._should_record_motion_event(event)
         with self.lock:
             self.last_motion_event = event
-            if self.motion_handle is not None:
+            if should_record_event and self.motion_handle is not None:
                 self.motion_handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
-                self.motion_handle.flush()
+                self._note_text_write_locked("motion")
         if event.get("ok"):
             self.motion_command_count += 1
         else:
             self.motion_skip_count += 1
-        self._publish(robot_motion_event(event))
+        if should_record_event:
+            self._publish(robot_motion_event(event))
         return event
 
     def update_gripper(self, quest_sample: dict[str, Any]) -> dict[str, Any] | None:
@@ -1135,29 +1670,78 @@ class RobotRealsenseSession:
             if self.closed:
                 return None
         try:
-            event = self._update_gripper_unlocked(quest_sample)
+            if not self.gripper_available:
+                event = self._gripper_unavailable_event(quest_sample)
+            else:
+                event = self._update_gripper_unlocked(quest_sample)
         except Exception as exc:  # pragma: no cover - hardware path
+            self.gripper_available = False
             self.gripper_error_count += 1
             event = {
                 "ok": False,
+                "commandSent": False,
                 "record_id": self.record_id,
                 "captured_at": datetime.now(timezone.utc).isoformat(),
                 "quest_sample_index": quest_sample.get("sampleIndex"),
                 "error": str(exc),
+                "disabledAfterError": True,
             }
+        should_record_event = self._should_record_gripper_event(event)
         with self.lock:
             self.last_gripper_event = event
-            if self.gripper_handle is not None:
+            if should_record_event and self.gripper_handle is not None:
                 self.gripper_handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
-                self.gripper_handle.flush()
+                self._note_text_write_locked("gripper")
         if event.get("ok") and event.get("commandSent"):
             self.gripper_command_count += 1
         else:
             self.gripper_skip_count += 1
-        self._publish(robot_gripper_event(event))
+        if should_record_event:
+            self._publish(robot_gripper_event(event))
+        return event
+
+    @staticmethod
+    def _should_record_motion_event(event: dict[str, Any]) -> bool:
+        if event.get("ok") or event.get("error"):
+            return True
+        return event.get("teleopHeld") is True
+
+    @staticmethod
+    def _should_record_gripper_event(event: dict[str, Any]) -> bool:
+        if event.get("commandSent") or event.get("error") or event.get("disabledAfterError"):
+            return True
+        if event.get("reason") == "gripper_not_available" and event.get("triggerStateChanged"):
+            return True
+        return event.get("action") == "initialize"
+
+    def _gripper_unavailable_event(self, quest_sample: dict[str, Any]) -> dict[str, Any]:
+        controller = quest_sample.get("rightController")
+        trigger = controller_trigger_value(controller) if isinstance(controller, dict) else None
+        desired_closed: bool | None = None
+        if trigger is not None:
+            close_threshold = float(self.config.gripper_trigger_close_threshold)
+            open_threshold = float(self.config.gripper_trigger_open_threshold)
+            if trigger >= close_threshold:
+                desired_closed = True
+            elif trigger <= open_threshold:
+                desired_closed = False
+        changed = desired_closed is not None and self.last_gripper_unavailable_closed is not desired_closed
+        if desired_closed is not None:
+            self.last_gripper_unavailable_closed = desired_closed
+        event = self._gripper_skip_event(quest_sample, "gripper_not_available", trigger)
+        event["triggerState"] = (
+            "close" if desired_closed is True else "open" if desired_closed is False else "hysteresis"
+        )
+        event["triggerStateChanged"] = bool(changed)
+        event["status"] = self.robot.gripper_status()
         return event
 
     def record_sample(self, quest_sample: dict[str, Any]) -> dict[str, Any] | None:
+        if self.record_mode == ROBOT_SESSION_RECORD_ASYNC:
+            return self._record_async_sample(quest_sample)
+        return self._record_sync_sample(quest_sample)
+
+    def _record_sync_sample(self, quest_sample: dict[str, Any]) -> dict[str, Any] | None:
         now_perf = time.perf_counter()
         if now_perf < self.next_capture_perf:
             return None
@@ -1183,59 +1767,213 @@ class RobotRealsenseSession:
                     "quest_sample_index": quest_sample.get("sampleIndex"),
                     "quest_recording_timestamp_seconds": quest_sample.get("recordingTimestampSeconds"),
                 }
-            assert self.samples_handle is not None
-            self.samples_handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
-            self.samples_handle.flush()
-            self.sample_count += 1
             if row.get("ok"):
                 images = row.get("images") if isinstance(row.get("images"), dict) else {}
                 self.image_count += len(images)
-                t_base_ee = transform_from_json(row.get("T_base_ee"))
+                t_base_ee = self._row_tool_or_ee_transform(row)
                 if t_base_ee is not None:
-                    self.ee_pose_history.append(t_base_ee)
-                    row["poseDiversity"] = ee_pose_diversity(self.ee_pose_history)
+                    self._remember_ee_pose(t_base_ee)
+            assert self.samples_handle is not None
+            self.samples_handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+            self._note_text_write_locked("samples")
+            if self.robot_states_handle is not None:
+                self.robot_states_handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+                self._note_text_write_locked("robot_states")
+            self.sample_count += 1
+            self.robot_state_count += 1
+            self.latest_robot_state_row = row
             self._publish(robot_sample_event(row))
             return row
+
+    def _record_async_sample(self, quest_sample: dict[str, Any]) -> dict[str, Any] | None:
+        with self.lock:
+            if self.closed:
+                return None
+            aligned_index = self.quest_aligned_sample_count
+            self.quest_aligned_sample_count += 1
+        try:
+            row = self._compose_async_sample_row(quest_sample, sample_index=aligned_index)
+        except Exception as exc:
+            with self.lock:
+                self.error_count += 1
+                self.last_error = str(exc)
+            row = {
+                "sample_index": aligned_index,
+                "record_id": self.record_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "pc_perf_counter_seconds": time.perf_counter(),
+                "pc_unix_seconds": time.time(),
+                "ok": False,
+                "error": str(exc),
+                "quest_sample_index": quest_sample.get("sampleIndex"),
+                "quest_recording_timestamp_seconds": quest_sample.get("recordingTimestampSeconds"),
+            }
+
+        should_write = False
+        now_perf = time.perf_counter()
+        with self.lock:
+            if self.closed:
+                return row
+            if now_perf >= self.next_async_sample_write_perf or not row.get("ok"):
+                period = 1.0 / max(1.0, ASYNC_QUEST_ALIGNED_SAMPLE_HZ)
+                self.next_async_sample_write_perf = now_perf + period
+                should_write = True
+            if should_write and self.samples_handle is not None:
+                row["written_sample_index"] = self.sample_count
+                self.samples_handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+                self._note_text_write_locked("samples")
+                self.sample_count += 1
+        if should_write:
+            self._publish(robot_sample_event(row))
+        return row
 
     def close(self) -> dict[str, Any]:
         with self.lock:
             if self.closed:
                 return self.summary("already_closed")
             self.closed = True
+            stop_event = self.stop_event
+            robot_state_thread = self.robot_state_thread
+            camera_record_thread = self.camera_record_thread
+            camera_writer_threads = dict(self.camera_writer_threads)
+            camera_frame_queues = dict(self.camera_frame_queues)
+            self.stop_event = None
+            self.robot_state_thread = None
+            self.camera_record_thread = None
+            self.camera_writer_threads = {}
+            self.camera_frame_queues = {}
+        if stop_event is not None:
+            stop_event.set()
+        for role, frame_queue in camera_frame_queues.items():
+            self.stream_hub.unsubscribe(role, frame_queue)
+            sentinel_dropped = self._enqueue_camera_queue_sentinel(frame_queue)
+            if sentinel_dropped:
+                with self.lock:
+                    self.camera_queue_drop_counts[role] = (
+                        int(self.camera_queue_drop_counts.get(role, 0)) + sentinel_dropped
+                    )
+        for thread in [robot_state_thread, camera_record_thread, *camera_writer_threads.values()]:
+            if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=ROBOT_SESSION_THREAD_JOIN_SECONDS)
+        for role, thread in camera_writer_threads.items():
+            if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=ROBOT_SESSION_CAMERA_WRITER_FINAL_JOIN_SECONDS)
+                if thread.is_alive():
+                    self._note_close_error(
+                        "camera_writer_thread_alive",
+                        f"{role} camera writer did not stop before video finalization",
+                    )
+        for role, frame_queue in camera_frame_queues.items():
+            dropped = self._drain_camera_frame_queue(frame_queue)
+            if dropped:
+                with self.lock:
+                    self.camera_queue_drop_counts[role] = int(self.camera_queue_drop_counts.get(role, 0)) + dropped
+        with self.lock:
+            self.camera_writer_thread_alive_on_close = {
+                role: bool(thread is not None and thread.is_alive())
+                for role, thread in camera_writer_threads.items()
+            }
+            alive_camera_roles = {
+                role for role, alive in self.camera_writer_thread_alive_on_close.items() if alive
+            }
+        with self.lock:
+            self._flush_text_handles_locked()
             if self.samples_handle is not None:
                 self.samples_handle.close()
                 self.samples_handle = None
+            if self.robot_states_handle is not None:
+                self.robot_states_handle.close()
+                self.robot_states_handle = None
             if self.motion_handle is not None:
                 self.motion_handle.close()
                 self.motion_handle = None
             if self.gripper_handle is not None:
                 self.gripper_handle.close()
                 self.gripper_handle = None
+        with self.video_io_lock:
+            self._flush_video_handles_locked()
             if self.video_frames_handle is not None:
                 self.video_frames_handle.close()
                 self.video_frames_handle = None
-            for writer in self.video_writers.values():
+        for role in list(self.video_role_locks.keys()):
+            if self.camera_writer_thread_alive_on_close.get(role):
+                continue
+            role_lock = self._video_role_lock(role)
+            acquired = role_lock.acquire(timeout=ROBOT_SESSION_VIDEO_RELEASE_LOCK_SECONDS)
+            if not acquired:
+                self._note_close_error("video_release_lock_timeout", f"{role} video writer lock timed out")
+                continue
+            try:
+                writer = self.video_writers.pop(role, None)
+                if writer is not None:
+                    writer.release()
+                handle = self.depth_stream_handles.pop(role, None)
+                if handle is not None:
+                    handle.close()
+            finally:
+                role_lock.release()
+        with self.video_io_lock:
+            for role, handle in list(self.depth_stream_handles.items()):
+                if role in alive_camera_roles:
+                    continue
+                handle.close()
+                self.depth_stream_handles.pop(role, None)
+            for role, writer in list(self.video_writers.items()):
+                if role in alive_camera_roles:
+                    continue
                 writer.release()
-            self.video_writers.clear()
+                self.video_writers.pop(role, None)
+            for role in list(self.video_role_locks.keys()):
+                if role not in alive_camera_roles:
+                    self.video_role_locks.pop(role, None)
+        with self.lock:
+            stream_status = self.stream_hub.status()
+            subscriber_drops = self._camera_subscriber_drops_since_start(stream_status)
             summary = self.summary("closed")
+            summary["cameraSubscriberDrops"] = dict(subscriber_drops)
+            if self.close_errors:
+                summary["closeErrors"] = list(self.close_errors)
             write_json(summary, self.summary_path)
-            self._publish({"type": "robot_status", "stage": "robot_realsense_closed", **summary})
-            return summary
+        self._publish({"type": "robot_status", "stage": "robot_realsense_closed", **summary})
+        return summary
 
     def summary(self, stage: str) -> dict[str, Any]:
+        elapsed = None
+        if self.recording_start_perf_counter is not None:
+            elapsed = max(0.0, float(time.perf_counter() - self.recording_start_perf_counter))
+        subscriber_drops = self._camera_subscriber_drops_since_start()
         return {
-            "ok": self.error_count == 0,
+            "ok": (
+                self.error_count == 0
+                and self.robot_state_error_count == 0
+                and self.camera_record_error_count == 0
+                and not self.close_errors
+            ),
             "recordId": self.record_id,
             "stage": stage,
             "directory": str(self.directory),
+            "recordMode": self.record_mode,
+            "recordingDurationSeconds": elapsed,
+            "recordingStartUnixSeconds": self.recording_start_unix_seconds,
+            "robotStateHz": float(self.config.robot_state_hz),
             "cameraSerial": self.config.camera_serial,
             "thirdCameraSerial": self.config.third_camera_serial,
             "cameraRoles": sorted(self.camera_metadata.keys()),
             "samples": self.sample_count,
+            "questAlignedSamples": self.quest_aligned_sample_count,
+            "robotStateSamples": self.robot_state_count,
             "images": self.image_count,
             "videos": self.video_paths,
+            "depthStreams": self.depth_stream_paths,
             "videoFrames": self.video_frame_count,
+            "depthFrames": self.depth_count,
+            "cameraQueueDrops": dict(self.camera_queue_drop_counts),
+            "cameraSubscriberDrops": dict(subscriber_drops),
+            "cameraQueueMaxSize": dict(self.camera_queue_max_sizes),
+            "cameraWriterThreadsAliveOnClose": dict(self.camera_writer_thread_alive_on_close),
             "errors": self.error_count,
+            "robotStateErrors": self.robot_state_error_count,
+            "cameraRecordErrors": self.camera_record_error_count,
             "motionCommands": self.motion_command_count,
             "motionSkips": self.motion_skip_count,
             "motionErrors": self.motion_error_count,
@@ -1244,71 +1982,241 @@ class RobotRealsenseSession:
             "controllerAlignmentRequired": self.require_controller_alignment,
             "controllerAlignmentAvailable": self.t_base_world is not None,
             "gripperEnabled": self.config.gripper_enabled,
+            "gripperAvailable": self.gripper_available,
             "gripperCommands": self.gripper_command_count,
             "gripperSkips": self.gripper_skip_count,
             "gripperErrors": self.gripper_error_count,
             "lastGripper": self.last_gripper_event,
             "poseDiversity": ee_pose_diversity(self.ee_pose_history),
+            "performance": self._performance_summary(),
+            "closeErrors": list(self.close_errors),
             "lastError": self.last_error,
+            "lastRobotStateError": self.last_robot_state_error,
+            "lastCameraRecordError": self.last_camera_record_error,
         }
+
+    def _performance_summary(self) -> dict[str, Any]:
+        elapsed = None
+        if self.recording_start_perf_counter is not None:
+            elapsed = max(0.0, float(time.perf_counter() - self.recording_start_perf_counter))
+        target_camera_hz = float(self.config.fps)
+        depth_every = max(1, int(self.config.record_depth_every_n_frames))
+        target_depth_hz = target_camera_hz / depth_every if self.config.record_depth else 0.0
+        roles = sorted(
+            set(self.camera_metadata.keys())
+            | set(self.video_frame_perf_stats_by_role.keys())
+            | set(self.depth_frame_perf_stats_by_role.keys())
+        )
+        stream_status = self.stream_hub.status()
+        subscriber_drops = self._camera_subscriber_drops_since_start(stream_status)
+        cameras: dict[str, Any] = {}
+        for role in roles:
+            video_stats = self.video_frame_perf_stats_by_role.get(role) or OnlineTimeSeriesStats()
+            depth_stats = self.depth_frame_perf_stats_by_role.get(role) or OnlineTimeSeriesStats()
+            write_stats = self.camera_write_duration_stats_by_role.get(role) or OnlineNumericStats()
+            latency_stats = self.camera_capture_to_write_latency_stats_by_role.get(role) or OnlineNumericStats()
+            written = int(video_stats.count)
+            session_drops = int(self.camera_queue_drop_counts.get(role, 0))
+            hub_drops = int(subscriber_drops.get(role, 0))
+            drops = session_drops + hub_drops
+            cameras[role] = {
+                "video": video_stats.summary(target_camera_hz),
+                "depth": depth_stats.summary(target_depth_hz) if self.config.record_depth else {"count": 0},
+                "writeDurationSeconds": write_stats.summary(),
+                "captureToWriteLatencySeconds": latency_stats.summary(),
+                "queueDrops": drops,
+                "sessionQueueDrops": session_drops,
+                "hubSubscriberDrops": hub_drops,
+                "queueDropRatio": float(drops / max(1, written + drops)),
+                "videoFramesWritten": written,
+                "depthFramesWritten": int(depth_stats.count),
+            }
+        return {
+            "recordingDurationSeconds": elapsed,
+            "robotState": self.robot_state_perf_stats.summary(float(self.config.robot_state_hz)),
+            "cameras": cameras,
+            "targetCameraHz": target_camera_hz,
+            "recordDepth": bool(self.config.record_depth),
+            "recordDepthEveryNFrames": depth_every,
+            "targetDepthHz": target_depth_hz,
+        }
+
+    def _camera_subscriber_drops_since_start(
+        self,
+        stream_status: dict[str, Any] | None = None,
+    ) -> dict[str, int]:
+        if stream_status is None:
+            stream_status = self.stream_hub.status()
+        raw_counts = (
+            stream_status.get("subscriberDropCounts")
+            if isinstance(stream_status, dict) and isinstance(stream_status.get("subscriberDropCounts"), dict)
+            else {}
+        )
+        roles = set(raw_counts.keys()) | set(self.camera_subscriber_drop_start_counts.keys()) | set(self.camera_metadata.keys())
+        result: dict[str, int] = {}
+        for role in roles:
+            current = int(raw_counts.get(role, 0)) if is_number(raw_counts.get(role, 0)) else 0
+            start = (
+                int(self.camera_subscriber_drop_start_counts.get(role, 0))
+                if is_number(self.camera_subscriber_drop_start_counts.get(role, 0))
+                else 0
+            )
+            result[str(role)] = max(0, current - start)
+        return result
 
     def _capture_row(self, quest_sample: dict[str, Any]) -> dict[str, Any]:
         sample_index = self.sample_count
-        robot_state = self.robot.read_state()
-        robot_state["jointLimitGuard"] = self.robot.joint_limit_guard(
-            self.config.controller_joint_limit_buffer_rad,
-            self.config.controller_joint_limit_guard_enabled,
-        )
-        images: dict[str, str] = {}
+        row = self._build_robot_state_row(sample_index=sample_index)
         videos: dict[str, dict[str, Any]] = {}
         video_frames: dict[str, dict[str, Any]] = {}
         frames = self.stream_hub.snapshot_roles(sorted(self.camera_metadata.keys()), wait_timeout=2.0)
         for role, frame in frames.items():
             serial = frame.get("serial") or self.camera_serials().get(role) or role
-            frame_index = self._write_video_frame(role, serial, frame)
+            frame_row = self._write_video_frame(role, serial, frame, sample_index=sample_index)
             videos[role] = {
-                "path": self.video_paths.get(role),
-                "frameIndex": frame_index,
+                "path": frame_row.get("video"),
+                "frameIndex": frame_row.get("frame_index"),
                 "serial": serial,
             }
             video_frames[role] = {
                 "role": role,
                 "serial": serial,
-                "frameIndex": frame_index,
-                "capturedAtUtc": frame.get("capturedAtUtc"),
-                "streamSequence": frame.get("sequence"),
+                "frameIndex": frame_row.get("frame_index"),
+                "capturedAtUtc": frame_row.get("frame_captured_at_utc"),
+                "streamSequence": frame_row.get("stream_sequence"),
             }
-        t_base_ee = transform_from_json(robot_state.get("endEffectorPose"))
-        t_base_tool_tcp = self._tool_tcp_transform(robot_state, t_base_ee)
+        quest_gaze3d_pc_world = unity_vec3_to_pc(quest_sample.get("gazePoint3DWorld"))
+        right_controller_pc = controller_payload_to_pc_world(quest_sample.get("rightController"))
+        row.update(
+            {
+                "quest_sample_index": quest_sample.get("sampleIndex"),
+                "quest_recording_timestamp_seconds": quest_sample.get("recordingTimestampSeconds"),
+                "quest_pc_receive_perf_counter_seconds": quest_sample.get("pcReceivePerfCounterSeconds"),
+                "quest_gaze3d_world": quest_sample.get("gazePoint3DWorld"),
+                "quest_gaze3d_pc_world": quest_gaze3d_pc_world,
+                "quest_gaze3d_source": quest_sample.get("gazePoint3DSource") or quest_sample.get("gazeSource"),
+                "right_controller": visualizer_controller_payload(right_controller_pc),
+                "right_controller_unity": visualizer_controller_payload(quest_sample.get("rightController")),
+                "images": {},
+                "videos": videos,
+                "videoFrames": video_frames,
+            }
+        )
+        return row
+
+    def _build_robot_state_row(
+        self,
+        *,
+        sample_index: int | None = None,
+        captured_at: str | None = None,
+        pc_perf_counter_seconds: float | None = None,
+        pc_unix_seconds: float | None = None,
+        lightweight: bool = False,
+        derived_transforms: bool = True,
+    ) -> dict[str, Any]:
+        captured_at = captured_at or datetime.now(timezone.utc).isoformat()
+        pc_perf_counter_seconds = (
+            time.perf_counter() if pc_perf_counter_seconds is None else float(pc_perf_counter_seconds)
+        )
+        pc_unix_seconds = time.time() if pc_unix_seconds is None else float(pc_unix_seconds)
+        index = self.robot_state_count if sample_index is None else int(sample_index)
+        robot_state = self.robot.read_record_state(
+            self.config.controller_joint_limit_buffer_rad,
+            self.config.controller_joint_limit_guard_enabled,
+            lightweight=lightweight,
+        )
+        transform_encoder = transform_to_compact_json if lightweight else transform_to_json
+        t_base_ee = None
+        t_base_tool_tcp = None
         t_base_end_camera_payload = None
         t_world_tool_tcp_payload = None
         t_world_end_camera_payload = None
         t_display_tool_tcp_payload = None
         t_display_end_camera_payload = None
-        if t_base_tool_tcp is not None:
-            if self.t_ee_end_camera is not None:
-                t_base_end_camera = t_base_tool_tcp @ self.t_ee_end_camera
-                t_base_end_camera_payload = transform_to_json(t_base_end_camera)
-            if self.t_base_world is not None:
-                t_world_tool_tcp = invert_transform(self.t_base_world) @ t_base_tool_tcp
-                t_world_tool_tcp_payload = transform_to_json(t_world_tool_tcp, PC_WORLD_FRAME)
-                t_display_tool_tcp_payload = transform_to_json(t_world_tool_tcp, PC_WORLD_FRAME)
-                if t_base_end_camera_payload is not None:
-                    t_base_end_camera_matrix = transform_from_json(t_base_end_camera_payload)
-                    if t_base_end_camera_matrix is not None:
-                        t_world_end_camera = invert_transform(self.t_base_world) @ t_base_end_camera_matrix
-                        t_world_end_camera_payload = transform_to_json(t_world_end_camera, PC_WORLD_FRAME)
-                        t_display_end_camera_payload = transform_to_json(t_world_end_camera, PC_WORLD_FRAME)
+        if derived_transforms:
+            t_base_ee = transform_from_json(robot_state.get("endEffectorPose"))
+            if t_base_ee is None:
+                t_base_ee = robot_state_pose_transform(robot_state)
+            t_base_tool_tcp = self._tool_tcp_transform(robot_state, t_base_ee)
+            if t_base_tool_tcp is not None:
+                if self.t_ee_end_camera is not None:
+                    t_base_end_camera = t_base_tool_tcp @ self.t_ee_end_camera
+                    t_base_end_camera_payload = transform_encoder(t_base_end_camera)
+                if self.t_base_world is not None:
+                    t_world_tool_tcp = invert_transform(self.t_base_world) @ t_base_tool_tcp
+                    t_world_tool_tcp_payload = transform_encoder(t_world_tool_tcp, PC_WORLD_FRAME)
+                    t_display_tool_tcp_payload = transform_encoder(t_world_tool_tcp, PC_WORLD_FRAME)
+                    if t_base_end_camera_payload is not None:
+                        t_base_end_camera_matrix = transform_from_json(t_base_end_camera_payload)
+                        if t_base_end_camera_matrix is not None:
+                            t_world_end_camera = invert_transform(self.t_base_world) @ t_base_end_camera_matrix
+                            t_world_end_camera_payload = transform_encoder(t_world_end_camera, PC_WORLD_FRAME)
+                            t_display_end_camera_payload = transform_encoder(t_world_end_camera, PC_WORLD_FRAME)
         joint_pose = robot_state.get("jointPose")
+        t_base_ee_payload = transform_encoder(t_base_ee) if t_base_ee is not None else None
+        t_base_tool_tcp_payload = transform_encoder(t_base_tool_tcp) if t_base_tool_tcp is not None else None
+        return {
+            "schema": "robot_state_light_v1" if lightweight else "robot_state_full_v1",
+            "sample_index": index,
+            "record_id": self.record_id,
+            "captured_at": captured_at,
+            "pc_perf_counter_seconds": pc_perf_counter_seconds,
+            "pc_unix_seconds": pc_unix_seconds,
+            "ok": True,
+            "coordinate_frame": PC_WORLD_FRAME,
+            "pose_source": f"flexiv:{self.config.robot_pose_field}:{self.config.robot_sn}",
+            "robot_state": compact_robot_state_for_record(robot_state),
+            "T_base_ee": t_base_ee_payload,
+            "T_base_tool_tcp": t_base_tool_tcp_payload,
+            "T_world_tool_tcp": t_world_tool_tcp_payload,
+            "T_display_tool_tcp": t_display_tool_tcp_payload,
+            "T_base_end_camera": t_base_end_camera_payload,
+            "T_world_end_camera": t_world_end_camera_payload,
+            "T_display_end_camera": t_display_end_camera_payload,
+            "jointpose": joint_pose,
+            "jointpos": joint_pose,
+            "gripper": robot_state.get("gripper"),
+        }
+
+    def _compose_async_sample_row(self, quest_sample: dict[str, Any], *, sample_index: int) -> dict[str, Any]:
+        captured_at = datetime.now(timezone.utc).isoformat()
+        pc_perf_counter_seconds = time.perf_counter()
+        pc_unix_seconds = time.time()
+        state_row = self.latest_robot_state_row
+        if not isinstance(state_row, dict):
+            state_row = self._build_robot_state_row(
+                sample_index=self.robot_state_count,
+                captured_at=captured_at,
+                pc_perf_counter_seconds=pc_perf_counter_seconds,
+                pc_unix_seconds=pc_unix_seconds,
+                lightweight=True,
+            )
+        videos: dict[str, dict[str, Any]] = {}
+        video_frames: dict[str, dict[str, Any]] = {}
+        for role, frame_row in self.latest_video_frame_rows.items():
+            videos[role] = {
+                "path": frame_row.get("video"),
+                "frameIndex": frame_row.get("frameIndex"),
+                "serial": frame_row.get("serial"),
+            }
+            video_frames[role] = {
+                "role": role,
+                "serial": frame_row.get("serial"),
+                "frameIndex": frame_row.get("frameIndex"),
+                "capturedAtUtc": frame_row.get("capturedAtUtc"),
+                "streamSequence": frame_row.get("streamSequence"),
+            }
         quest_gaze3d_pc_world = unity_vec3_to_pc(quest_sample.get("gazePoint3DWorld"))
         right_controller_pc = controller_payload_to_pc_world(quest_sample.get("rightController"))
         return {
             "sample_index": sample_index,
             "record_id": self.record_id,
-            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "captured_at": captured_at,
+            "pc_perf_counter_seconds": pc_perf_counter_seconds,
+            "pc_unix_seconds": pc_unix_seconds,
             "ok": True,
             "coordinate_frame": PC_WORLD_FRAME,
-            "pose_source": f"flexiv:{self.config.robot_pose_field}:{self.config.robot_sn}",
+            "pose_source": state_row.get("pose_source") or f"flexiv:{self.config.robot_pose_field}:{self.config.robot_sn}",
             "quest_sample_index": quest_sample.get("sampleIndex"),
             "quest_recording_timestamp_seconds": quest_sample.get("recordingTimestampSeconds"),
             "quest_pc_receive_perf_counter_seconds": quest_sample.get("pcReceivePerfCounterSeconds"),
@@ -1317,63 +2225,312 @@ class RobotRealsenseSession:
             "quest_gaze3d_source": quest_sample.get("gazePoint3DSource") or quest_sample.get("gazeSource"),
             "right_controller": visualizer_controller_payload(right_controller_pc),
             "right_controller_unity": visualizer_controller_payload(quest_sample.get("rightController")),
-            "robot_state": robot_state,
-            "T_base_ee": robot_state.get("endEffectorPose"),
-            "T_base_tool_tcp": transform_to_json(t_base_tool_tcp) if t_base_tool_tcp is not None else None,
-            "T_world_tool_tcp": t_world_tool_tcp_payload,
-            "T_display_tool_tcp": t_display_tool_tcp_payload,
-            "T_base_end_camera": t_base_end_camera_payload,
-            "T_world_end_camera": t_world_end_camera_payload,
-            "T_display_end_camera": t_display_end_camera_payload,
-            "jointpose": joint_pose,
-            "jointpos": joint_pose,
-            "images": images,
+            "robot_state_sample_index": state_row.get("sample_index"),
+            "robot_state_captured_at": state_row.get("captured_at"),
+            "robot_state_pc_perf_counter_seconds": state_row.get("pc_perf_counter_seconds"),
+            "images": {},
             "videos": videos,
             "videoFrames": video_frames,
-            "gripper": self.robot.gripper_status(),
         }
 
-    def _write_video_frame(self, role: str, serial: str, frame: dict[str, Any]) -> int:
-        rgb = frame["rgb"]
-        if not isinstance(rgb, np.ndarray):
-            raise RuntimeError(f"{role} frame has no RGB image")
-        writer = self.video_writers.get(role)
-        if writer is None:
-            height, width = int(rgb.shape[0]), int(rgb.shape[1])
-            rel_path = Path("videos") / f"{role}_{safe_filename(serial)}.mp4"
-            path = self.directory / rel_path
-            path.parent.mkdir(parents=True, exist_ok=True)
-            fps = max(1.0, 1.0 / max(1e-6, float(self.config.capture_interval_seconds)))
-            writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-            if not writer.isOpened():
-                raise RuntimeError(f"could not open robot camera video writer: {path}")
-            self.video_writers[role] = writer
-            self.video_paths[role] = str(rel_path).replace("\\", "/")
-            self.video_frame_counts[role] = 0
-        frame_index = int(self.video_frame_counts.get(role, 0))
-        writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-        self.video_frame_counts[role] = frame_index + 1
-        self.video_frame_count += 1
-        row = {
-            "sample_index": self.sample_count,
-            "record_id": self.record_id,
-            "role": role,
-            "serial": serial,
-            "frame_index": frame_index,
-            "video": self.video_paths.get(role),
-            "captured_at": datetime.now(timezone.utc).isoformat(),
-            "frame_captured_at_utc": frame.get("capturedAtUtc"),
-            "stream_sequence": frame.get("sequence"),
+    def _robot_state_loop(self) -> None:
+        stop_event = self.stop_event
+        if stop_event is None:
+            return
+        period = 1.0 / max(1.0, float(self.config.robot_state_hz))
+        while not stop_event.is_set():
+            started = time.perf_counter()
+            try:
+                row = self._build_robot_state_row(lightweight=True, derived_transforms=False)
+                with self.lock:
+                    if self.closed or self.robot_states_handle is None:
+                        return
+                line = json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+                with self.lock:
+                    if self.closed or self.robot_states_handle is None:
+                        return
+                    self.robot_states_handle.write(line)
+                    self._note_text_write_locked("robot_states")
+                    self.robot_state_count += 1
+                    self.latest_robot_state_row = row
+                    self.robot_state_perf_stats.add(row.get("pc_perf_counter_seconds") or time.perf_counter())
+            except Exception as exc:  # pragma: no cover - hardware path
+                with self.lock:
+                    self.robot_state_error_count += 1
+                    self.last_robot_state_error = str(exc)
+                    self.last_error = str(exc)
+            elapsed = time.perf_counter() - started
+            stop_event.wait(max(0.0, period - elapsed))
+
+    def _camera_record_loop(self) -> None:
+        stop_event = self.stop_event
+        if stop_event is None:
+            return
+        roles = sorted(self.camera_metadata.keys())
+        while not stop_event.is_set():
+            wrote_any = False
+            for role in roles:
+                if stop_event.is_set():
+                    return
+                try:
+                    frame = self.stream_hub.get_latest(
+                        role,
+                        wait_timeout=0.2,
+                        copy_arrays=False,
+                        include_depth=bool(self.config.record_depth),
+                    )
+                    sequence = frame.get("sequence")
+                    with self.lock:
+                        if self.closed:
+                            return
+                        if self.latest_video_sequences.get(role) == sequence:
+                            continue
+                        serial = frame.get("serial") or self.camera_serials().get(role) or role
+                    frame_row = self._write_video_frame(role, serial, frame, sample_index=None)
+                    with self.lock:
+                        self.latest_video_sequences[role] = frame.get("sequence")
+                        self.latest_video_frame_rows[role] = {
+                            "role": role,
+                            "serial": serial,
+                            "frameIndex": frame_row.get("frame_index"),
+                            "video": frame_row.get("video"),
+                            "capturedAtUtc": frame.get("capturedAtUtc"),
+                            "streamSequence": frame.get("sequence"),
+                            "depth": frame_row.get("depth"),
+                        }
+                    wrote_any = True
+                except Exception as exc:  # pragma: no cover - hardware path
+                    if "No " in str(exc) and " frame is available yet" in str(exc):
+                        stop_event.wait(0.01)
+                        continue
+                    with self.lock:
+                        self.camera_record_error_count += 1
+                        self.last_camera_record_error = str(exc)
+                        self.last_error = str(exc)
+                    stop_event.wait(0.02)
+            if not wrote_any:
+                stop_event.wait(0.005)
+
+    def _camera_role_record_loop(self, role: str, frame_queue: queue.Queue[Any]) -> None:
+        while True:
+            try:
+                frame = frame_queue.get(timeout=0.2)
+            except queue.Empty:
+                if self.closed:
+                    return
+                continue
+            try:
+                if frame is None:
+                    return
+                serial = frame.get("serial") or self.camera_serials().get(role) or role
+                frame_row = self._write_video_frame(role, serial, frame, sample_index=None)
+                with self.lock:
+                    self.latest_video_sequences[role] = frame.get("sequence")
+                    self.latest_video_frame_rows[role] = {
+                        "role": role,
+                        "serial": serial,
+                        "frameIndex": frame_row.get("frame_index"),
+                        "video": frame_row.get("video"),
+                        "capturedAtUtc": frame.get("capturedAtUtc"),
+                        "streamSequence": frame.get("sequence"),
+                        "depth": frame_row.get("depth"),
+                    }
+            except Exception as exc:  # pragma: no cover - hardware path
+                with self.lock:
+                    self.camera_record_error_count += 1
+                    self.last_camera_record_error = str(exc)
+                    self.last_error = str(exc)
+            finally:
+                frame_queue.task_done()
+
+    @staticmethod
+    def _drain_camera_frame_queue(frame_queue: queue.Queue[Any]) -> int:
+        dropped = 0
+        while True:
+            try:
+                item = frame_queue.get_nowait()
+            except queue.Empty:
+                return dropped
+            if item is not None:
+                dropped += 1
+            try:
+                frame_queue.task_done()
+            except ValueError:
+                pass
+
+    @staticmethod
+    def _enqueue_camera_queue_sentinel(frame_queue: queue.Queue[Any]) -> int:
+        dropped = 0
+        while True:
+            try:
+                frame_queue.put_nowait(None)
+                return dropped
+            except queue.Full:
+                try:
+                    item = frame_queue.get_nowait()
+                except queue.Empty:
+                    time.sleep(0.001)
+                    continue
+                try:
+                    if item is None:
+                        return dropped
+                    dropped += 1
+                finally:
+                    try:
+                        frame_queue.task_done()
+                    except ValueError:
+                        pass
+
+    def _remember_ee_pose(self, pose: np.ndarray) -> None:
+        self.ee_pose_history.append(np.asarray(pose, dtype=float))
+        max_history = 512 if self.record_mode == ROBOT_SESSION_RECORD_ASYNC else 2048
+        if len(self.ee_pose_history) > max_history:
+            del self.ee_pose_history[: len(self.ee_pose_history) - max_history]
+
+    def _row_tool_or_ee_transform(self, row: dict[str, Any]) -> np.ndarray | None:
+        return robot_row_tool_transform(row)
+
+    def _write_video_frame(
+        self,
+        role: str,
+        serial: str,
+        frame: dict[str, Any],
+        *,
+        sample_index: int | None,
+    ) -> dict[str, Any]:
+        write_started_perf = time.perf_counter()
+        bgr = frame.get("bgr")
+        if not isinstance(bgr, np.ndarray):
+            rgb = frame.get("rgb")
+            if isinstance(rgb, np.ndarray):
+                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        if not isinstance(bgr, np.ndarray):
+            raise RuntimeError(f"{role} frame has no BGR image")
+        with self._video_role_lock(role):
+            writer = self.video_writers.get(role)
+            if writer is None:
+                height, width = int(bgr.shape[0]), int(bgr.shape[1])
+                rel_path = Path("videos") / f"{role}_{safe_filename(serial)}.mp4"
+                path = self.directory / rel_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if self.record_mode == ROBOT_SESSION_RECORD_ASYNC:
+                    fps = max(1.0, float(self.config.fps))
+                else:
+                    fps = max(1.0, 1.0 / max(1e-6, float(self.config.capture_interval_seconds)))
+                writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+                if not writer.isOpened():
+                    raise RuntimeError(f"could not open robot camera video writer: {path}")
+                self.video_writers[role] = writer
+                self.video_paths[role] = str(rel_path).replace("\\", "/")
+                self.video_frame_counts[role] = 0
+            frame_index = int(self.video_frame_counts.get(role, 0))
+            writer.write(bgr)
+            self.video_frame_counts[role] = frame_index + 1
+            depth_info = self._write_depth_frame(role, serial, frame, frame_index)
+            write_finished_perf = time.perf_counter()
+            row = {
+                "sample_index": sample_index,
+                "record_id": self.record_id,
+                "role": role,
+                "serial": serial,
+                "frame_index": frame_index,
+                "video": self.video_paths.get(role),
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "pc_perf_counter_seconds": write_finished_perf,
+                "write_duration_seconds": float(write_finished_perf - write_started_perf),
+                "frame_captured_at_utc": frame.get("capturedAtUtc"),
+                "frame_captured_perf_counter_seconds": frame.get("capturedAtPerfCounterSeconds"),
+                "stream_sequence": frame.get("sequence"),
+                "depth": depth_info,
+            }
+        with self.video_io_lock:
+            self.video_frame_count += 1
+            self.video_frame_perf_stats_by_role.setdefault(role, OnlineTimeSeriesStats()).add(write_finished_perf)
+            self.camera_write_duration_stats_by_role.setdefault(role, OnlineNumericStats()).add(
+                float(write_finished_perf - write_started_perf)
+            )
+            captured_perf = frame.get("capturedAtPerfCounterSeconds")
+            if is_number(captured_perf):
+                self.camera_capture_to_write_latency_stats_by_role.setdefault(role, OnlineNumericStats()).add(
+                    float(write_finished_perf - float(captured_perf))
+                )
+            if depth_info is not None:
+                self.depth_frame_perf_stats_by_role.setdefault(role, OnlineTimeSeriesStats()).add(write_finished_perf)
+            if self.video_frames_handle is not None:
+                self.video_frames_handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+                self._note_video_write_locked()
+        return row
+
+    def _video_role_lock(self, role: str) -> threading.RLock:
+        role_name = str(role or "").strip().lower() or "camera"
+        with self.lock:
+            lock = self.video_role_locks.get(role_name)
+            if lock is None:
+                lock = threading.RLock()
+                self.video_role_locks[role_name] = lock
+            return lock
+
+    def _depth_stream_handle(self, role: str, serial: str) -> tuple[Any, str]:
+        handle = self.depth_stream_handles.get(role)
+        rel_path = self.depth_stream_paths.get(role)
+        if handle is not None and isinstance(rel_path, str) and rel_path:
+            return handle, rel_path
+        rel = Path("depth") / f"{role}_{safe_filename(serial)}.u16le.bin"
+        path = self.directory / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("ab")
+        rel_path = str(rel).replace("\\", "/")
+        self.depth_stream_handles[role] = handle
+        self.depth_stream_paths[role] = rel_path
+        return handle, rel_path
+
+    def _write_depth_frame(
+        self,
+        role: str,
+        serial: str,
+        frame: dict[str, Any],
+        frame_index: int,
+    ) -> dict[str, Any] | None:
+        depth = frame.get("depth")
+        if not isinstance(depth, np.ndarray):
+            return None
+        every_n = max(1, int(self.config.record_depth_every_n_frames))
+        if frame.get("depthCaptureIndex") is None and every_n > 1 and int(frame_index) % every_n != 0:
+            return None
+        if depth.dtype != np.uint16:
+            depth = depth.astype(np.uint16, copy=False)
+        if not depth.flags.c_contiguous:
+            depth = np.ascontiguousarray(depth)
+        metadata = frame.get("metadata") if isinstance(frame.get("metadata"), dict) else {}
+        handle, rel_path = self._depth_stream_handle(role, serial)
+        byte_offset = int(handle.tell())
+        byte_length = int(depth.nbytes)
+        depth.tofile(handle)
+        self.depth_count += 1
+        depth_aligned = bool(metadata.get("depthAlignedToColor"))
+        return {
+            "path": rel_path,
+            "encoding": "uint16_raw_aligned_to_color" if depth_aligned else "uint16_raw_camera_native",
+            "dtype": "uint16",
+            "endianness": "little",
+            "layout": "row_major",
+            "alignedToColor": depth_aligned,
+            "byteOffset": byte_offset,
+            "byteLength": byte_length,
+            "captureIndex": frame.get("depthCaptureIndex"),
+            "depthScaleM": metadata.get("depthScaleM"),
+            "width": int(depth.shape[1]),
+            "height": int(depth.shape[0]),
+            "strideBytes": int(depth.shape[1]) * int(depth.dtype.itemsize),
         }
-        if self.video_frames_handle is not None:
-            self.video_frames_handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
-            self.video_frames_handle.flush()
-        return frame_index
 
     def _tool_tcp_transform(self, robot_state: dict[str, Any], fallback: np.ndarray | None) -> np.ndarray | None:
         tcp = robot_state.get("tcp_pose")
         if isinstance(tcp, dict):
             matrix = transform_from_json(tcp.get("T_base_pose"))
+            if matrix is not None:
+                return matrix
+            matrix = flexiv_pose_payload_to_transform(tcp.get("pose"))
             if matrix is not None:
                 return matrix
         if self.config.robot_pose_field == "tcp_pose" and fallback is not None:
@@ -1384,18 +2541,72 @@ class RobotRealsenseSession:
         if self.publish_event is not None:
             self.publish_event(event)
 
+    def _note_close_error(self, stage: str, error: Any) -> None:
+        payload = {
+            "stage": stage,
+            "error": str(error),
+        }
+        self.close_errors.append(payload)
+        self.last_error = payload["error"]
+
+    def _flush_text_handles_locked(self) -> None:
+        for handle in (self.samples_handle, self.robot_states_handle, self.motion_handle, self.gripper_handle):
+            if handle is not None:
+                handle.flush()
+        for key in self.text_pending_rows:
+            self.text_pending_rows[key] = 0
+        self.text_last_flush_perf = time.perf_counter()
+
+    def _note_text_write_locked(self, key: str) -> None:
+        if self.record_mode != ROBOT_SESSION_RECORD_ASYNC:
+            self._flush_text_handles_locked()
+            return
+        self.text_pending_rows[key] = int(self.text_pending_rows.get(key, 0)) + 1
+        now_perf = time.perf_counter()
+        if (
+            self.text_pending_rows[key] >= ASYNC_JSONL_FLUSH_ROWS
+            or (now_perf - self.text_last_flush_perf) >= ASYNC_JSONL_FLUSH_INTERVAL_SECONDS
+        ):
+            self._flush_text_handles_locked()
+
+    def _flush_video_handles_locked(self) -> None:
+        if self.video_frames_handle is not None:
+            self.video_frames_handle.flush()
+        self.video_pending_rows = 0
+        self.video_last_flush_perf = time.perf_counter()
+
+    def _note_video_write_locked(self) -> None:
+        if self.record_mode != ROBOT_SESSION_RECORD_ASYNC:
+            self._flush_video_handles_locked()
+            return
+        self.video_pending_rows += 1
+        now_perf = time.perf_counter()
+        if (
+            self.video_pending_rows >= ASYNC_JSONL_FLUSH_ROWS
+            or (now_perf - self.video_last_flush_perf) >= ASYNC_JSONL_FLUSH_INTERVAL_SECONDS
+        ):
+            self._flush_video_handles_locked()
+
     def _try_initialize_gripper(self) -> None:
         try:
-            status = self.robot.enable_gripper(self.config.gripper_device)
+            status = self.robot.enable_gripper(
+                self.config.gripper_device,
+                init_on_enable=self.config.gripper_init_on_enable,
+            )
+            self.gripper_available = True
             event = {
                 "ok": True,
                 "commandSent": False,
                 "record_id": self.record_id,
                 "captured_at": datetime.now(timezone.utc).isoformat(),
                 "action": "initialize",
+                "device": status.get("device") if isinstance(status, dict) else None,
                 "status": status,
             }
         except Exception as exc:  # pragma: no cover - hardware path
+            gripper_status = self.robot.gripper_status()
+            device_status = self.robot.status().get("devices") if self.robot is not None else None
+            self.gripper_available = False
             self.gripper_error_count += 1
             event = {
                 "ok": False,
@@ -1404,6 +2615,8 @@ class RobotRealsenseSession:
                 "captured_at": datetime.now(timezone.utc).isoformat(),
                 "action": "initialize",
                 "error": str(exc),
+                "status": gripper_status,
+                "devices": device_status,
             }
         self.last_gripper_event = event
         if self.gripper_handle is not None:
@@ -1502,8 +2715,8 @@ class RobotRealsenseSession:
             raw_offset = mapping_rotation @ raw_offset_world
             mapping_mode = "unaligned_pc_z_up_identity"
         raw_rotation = mapping_rotation @ raw_rotation_world @ mapping_rotation.T
-        offset = clamp_vector_norm(raw_offset, float(self.config.controller_max_offset_m))
-        rotation_delta = clamp_rotation_angle(raw_rotation, float(self.config.controller_max_rotation_deg))
+        offset = raw_offset
+        rotation_delta = raw_rotation
         target = list(self.robot_anchor_tcp_pose)
         target[:3] = [float(target[i] + offset[i]) for i in range(3)]
         anchor_rotation = quaternion_wxyz_to_matrix(target[3:7])
@@ -1559,9 +2772,10 @@ class RobotRealsenseSession:
                 "joint_limit_guard": joint_guard,
                 "limits": {
                     "scale": self.config.controller_translation_scale,
-                    "maxOffsetM": self.config.controller_max_offset_m,
+                    "workspaceLimitEnabled": False,
+                    "maxOffsetM": None,
                     "maxStepM": self.config.controller_max_step_m,
-                    "maxRotationDeg": self.config.controller_max_rotation_deg,
+                    "maxRotationDeg": None,
                     "maxRotationStepDeg": self.config.controller_max_rotation_step_deg,
                     "jointLimitBufferRad": self.config.controller_joint_limit_buffer_rad,
                     "jointLimitGuardEnabled": self.config.controller_joint_limit_guard_enabled,
@@ -1603,9 +2817,10 @@ class RobotRealsenseSession:
             "joint_limit_guard": joint_guard,
             "limits": {
                 "scale": self.config.controller_translation_scale,
-                "maxOffsetM": self.config.controller_max_offset_m,
+                "workspaceLimitEnabled": False,
+                "maxOffsetM": None,
                 "maxStepM": self.config.controller_max_step_m,
-                "maxRotationDeg": self.config.controller_max_rotation_deg,
+                "maxRotationDeg": None,
                 "maxRotationStepDeg": self.config.controller_max_rotation_step_deg,
                 "jointLimitBufferRad": self.config.controller_joint_limit_buffer_rad,
                 "jointLimitGuardEnabled": self.config.controller_joint_limit_guard_enabled,
@@ -1687,7 +2902,6 @@ class RobotRealsenseSession:
             "quest_recording_timestamp_seconds": quest_sample.get("recordingTimestampSeconds"),
             "trigger": trigger,
             "reason": reason,
-            "status": self.robot.gripper_status(),
         }
 
     def camera_serials(self) -> dict[str, str]:
@@ -1736,6 +2950,16 @@ class FlexivRealSenseManager:
                 "lastError": self.last_error,
             }
 
+    def _stream_config_snapshot(self) -> FlexivRealSenseConfig:
+        with self.lock:
+            source = self.active_session.config if self.active_session is not None else self.config
+            return copy.deepcopy(source)
+
+    def _ensure_stream_for_current_config(self) -> FlexivRealSenseConfig:
+        config = self._stream_config_snapshot()
+        self.stream_hub.start(config)
+        return config
+
     def configure(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
             if "robotSn" in payload:
@@ -1764,6 +2988,12 @@ class FlexivRealSenseManager:
             ):
                 if key in payload and is_number(payload[key]):
                     setattr(self.config, attr, int(payload[key]))
+            if "robotStateHz" in payload and is_number(payload["robotStateHz"]):
+                self.config.robot_state_hz = max(1.0, float(payload["robotStateHz"]))
+            if "recordDepth" in payload:
+                self.config.record_depth = bool(payload["recordDepth"])
+            if "recordDepthEveryNFrames" in payload and is_number(payload["recordDepthEveryNFrames"]):
+                self.config.record_depth_every_n_frames = max(1, int(payload["recordDepthEveryNFrames"]))
             if "captureIntervalSeconds" in payload and is_number(payload["captureIntervalSeconds"]):
                 self.config.capture_interval_seconds = float(payload["captureIntervalSeconds"])
             if "realsenseAutoExposure" in payload:
@@ -1793,12 +3023,8 @@ class FlexivRealSenseManager:
                 self.config.controller_motion_enabled = bool(payload["controllerMotionEnabled"])
             if "controllerTranslationScale" in payload and is_number(payload["controllerTranslationScale"]):
                 self.config.controller_translation_scale = float(payload["controllerTranslationScale"])
-            if "controllerMaxOffsetM" in payload and is_number(payload["controllerMaxOffsetM"]):
-                self.config.controller_max_offset_m = float(payload["controllerMaxOffsetM"])
             if "controllerMaxStepM" in payload and is_number(payload["controllerMaxStepM"]):
                 self.config.controller_max_step_m = float(payload["controllerMaxStepM"])
-            if "controllerMaxRotationDeg" in payload and is_number(payload["controllerMaxRotationDeg"]):
-                self.config.controller_max_rotation_deg = float(payload["controllerMaxRotationDeg"])
             if "controllerMaxRotationStepDeg" in payload and is_number(payload["controllerMaxRotationStepDeg"]):
                 self.config.controller_max_rotation_step_deg = float(payload["controllerMaxRotationStepDeg"])
             if "controllerJointLimitBufferRad" in payload and is_number(payload["controllerJointLimitBufferRad"]):
@@ -1809,6 +3035,8 @@ class FlexivRealSenseManager:
                 self.config.gripper_enabled = bool(payload["gripperEnabled"])
             if "gripperDevice" in payload:
                 self.config.gripper_device = str(payload.get("gripperDevice") or DEFAULT_GRIPPER_DEVICE).strip() or DEFAULT_GRIPPER_DEVICE
+            if "gripperInitOnEnable" in payload:
+                self.config.gripper_init_on_enable = bool(payload["gripperInitOnEnable"])
             for key, attr in (
                 ("gripperOpenWidthM", "gripper_open_width_m"),
                 ("gripperCloseWidthM", "gripper_close_width_m"),
@@ -1898,14 +3126,19 @@ class FlexivRealSenseManager:
 
     def start_realsense_stream(self) -> dict[str, Any]:
         try:
-            stream = self.stream_hub.start(self.config)
+            self._ensure_stream_for_current_config()
             self.last_error = None
-            return {"ok": True, "stream": stream, "status": self.status()}
+            status = self.status()
+            return {"ok": True, "stream": status.get("realsenseStream"), "status": status}
         except Exception as exc:  # pragma: no cover - hardware path
             self.last_error = str(exc)
             return {"ok": False, "error": self.last_error, "status": self.status()}
 
     def stop_realsense_stream(self) -> dict[str, Any]:
+        with self.lock:
+            if self.active_session is not None:
+                self.last_error = "Cannot stop RealSense stream while robot recording is active"
+                return {"ok": False, "error": self.last_error, "status": self.status()}
         self.stream_hub.stop()
         return {"ok": True, "status": self.status()}
 
@@ -1916,13 +3149,16 @@ class FlexivRealSenseManager:
         role = str(role or "end").strip().lower()
         if role not in ("end", "third"):
             raise RuntimeError(f"Unsupported RealSense camera role: {role}")
-        with self.lock:
-            configured_serial = self.config.third_camera_serial if role == "third" else self.config.camera_serial
-            serial = str(configured_serial or "").strip()
+        config = self._ensure_stream_for_current_config()
+        configured_serial = config.third_camera_serial if role == "third" else config.camera_serial
+        serial = str(configured_serial or "").strip()
         if not serial:
             raise RuntimeError(f"RealSense {role} camera serial is empty")
-        frame = self.stream_hub.get_latest(role, wait_timeout=5.0)
-        return frame["jpeg"], {
+        frame = self.stream_hub.get_latest(role, wait_timeout=5.0, copy_arrays=False, include_depth=False)
+        bgr = frame.get("bgr")
+        if not isinstance(bgr, np.ndarray):
+            raise RuntimeError(f"RealSense {role} preview frame has no BGR image")
+        return encode_bgr_jpeg(bgr, quality=86), {
             "createdAtUtc": frame.get("capturedAtUtc") or datetime.now(timezone.utc).isoformat(),
             "camera": frame.get("metadata"),
             "sequence": frame.get("sequence"),
@@ -1931,16 +3167,16 @@ class FlexivRealSenseManager:
         }
 
     def capture_end_camera_overlay_jpeg(self) -> tuple[bytes, dict[str, Any]]:
-        with self.lock:
-            serial = str(self.config.camera_serial or "").strip()
+        config = self._ensure_stream_for_current_config()
+        serial = str(config.camera_serial or "").strip()
         if not serial:
             raise RuntimeError("RealSense end camera serial is empty")
         frame = self.stream_hub.get_latest("end", wait_timeout=5.0)
-        rgb = frame["rgb"]
-        overlay_rgb, board = checkerboard_overlay_rgb(
-            rgb,
-            self.config.pattern_cols,
-            self.config.pattern_rows,
+        bgr = frame["bgr"]
+        overlay_bgr, board = checkerboard_overlay_bgr(
+            bgr,
+            config.pattern_cols,
+            config.pattern_rows,
         )
         meta = {
             "createdAtUtc": frame.get("capturedAtUtc") or datetime.now(timezone.utc).isoformat(),
@@ -1950,25 +3186,25 @@ class FlexivRealSenseManager:
             "overlay": True,
             "board": board,
         }
-        return encode_rgb_jpeg(overlay_rgb, quality=86), meta
+        return encode_bgr_jpeg(overlay_bgr, quality=86), meta
 
     def check_end_camera_board(self, output_root: Path) -> dict[str, Any]:
         output_dir = output_root.resolve() / "end_camera"
         output_dir.mkdir(parents=True, exist_ok=True)
-        self.stream_hub.start(self.config)
+        config = self._ensure_stream_for_current_config()
         frame = self.stream_hub.get_latest("end", wait_timeout=2.0)
         metadata = frame.get("metadata") or {}
-        rgb = frame["rgb"]
-        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        bgr = frame["bgr"]
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         brightness = {
             "mean": float(np.mean(gray)),
             "median": float(np.median(gray)),
             "p95": float(np.percentile(gray, 95)),
         }
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
-        serial_name = safe_filename(self.config.camera_serial or "camera")
+        serial_name = safe_filename(config.camera_serial or "camera")
         image_path = output_dir / f"end_camera_board_check_{serial_name}_{stamp}.jpg"
-        save_rgb_jpeg(rgb, image_path)
+        save_bgr_jpeg(bgr, image_path)
         overlay_dir = output_dir / "overlays"
         overlay_dir.mkdir(parents=True, exist_ok=True)
         sample = {
@@ -1981,9 +3217,9 @@ class FlexivRealSenseManager:
             sample=sample,
             t_base_ee=np.eye(4, dtype=float),
             camera=metadata,
-            cols=self.config.pattern_cols,
-            rows=self.config.pattern_rows,
-            square_size_m=self.config.square_size_m,
+            cols=config.pattern_cols,
+            rows=config.pattern_rows,
+            square_size_m=config.square_size_m,
             overlay_dir=overlay_dir,
         )
         result = {
@@ -1991,9 +3227,9 @@ class FlexivRealSenseManager:
             "createdAtUtc": datetime.now(timezone.utc).isoformat(),
             "camera": metadata,
             "pattern": {
-                "cols": self.config.pattern_cols,
-                "rows": self.config.pattern_rows,
-                "squareSizeM": self.config.square_size_m,
+                "cols": config.pattern_cols,
+                "rows": config.pattern_rows,
+                "squareSizeM": config.square_size_m,
             },
             "brightness": brightness,
             "imagePath": str(image_path),
@@ -2002,12 +3238,11 @@ class FlexivRealSenseManager:
                 "sequence": frame.get("sequence"),
                 "serial": frame.get("serial"),
             },
-            "detectedCorners": self.config.pattern_cols * self.config.pattern_rows if observation is not None else 0,
+            "detectedCorners": config.pattern_cols * config.pattern_rows if observation is not None else 0,
             "method": observation.get("method") if observation is not None else None,
             "bestReprojectionRmsePx": None,
             "bestReprojectionMedianPx": None,
             "appearanceAnchor": observation.get("appearance_anchor") if observation is not None else None,
-            "redAnchor": observation.get("red_anchor") if observation is not None else None,
             "overlayPath": None,
             "message": board_check_message(observation is not None, brightness),
         }
@@ -2028,9 +3263,12 @@ class FlexivRealSenseManager:
         robot_alignment_result: dict[str, Any] | None = None,
         require_controller_alignment: bool = False,
         control_mode: str = ROBOT_SESSION_CONTROL_TELEOP,
+        record_mode: str = ROBOT_SESSION_RECORD_SYNC,
     ) -> RobotRealsenseSession | None:
         if control_mode not in ROBOT_SESSION_CONTROL_MODES:
             control_mode = ROBOT_SESSION_CONTROL_TELEOP
+        if record_mode not in ROBOT_SESSION_RECORD_MODES:
+            record_mode = ROBOT_SESSION_RECORD_SYNC
         with self.lock:
             if self.active_session is not None:
                 previous = self.active_session
@@ -2051,16 +3289,19 @@ class FlexivRealSenseManager:
                 if publish_event is not None:
                     publish_event({"type": "robot_status", "ok": False, "stage": "no_camera", "error": self.last_error})
                 return None
+            session_config = copy.deepcopy(self.config)
+            session_config.controller_motion_enabled = control_mode == ROBOT_SESSION_CONTROL_TELEOP
             session = RobotRealsenseSession(
                 parent_directory,
                 record_id,
-                self.config,
+                session_config,
                 self.robot,
                 self.stream_hub,
                 publish_event,
                 robot_alignment_result=robot_alignment_result,
                 require_controller_alignment=require_controller_alignment,
                 control_mode=control_mode,
+                record_mode=record_mode,
             )
             try:
                 session.start()
@@ -2076,9 +3317,9 @@ class FlexivRealSenseManager:
                     self.config.controller_motion_enabled = False
                     stage = "freedrive_enabled"
                 elif control_mode == ROBOT_SESSION_CONTROL_TELEOP:
-                    self.robot.arm_motion()
+                    self.robot.disable_freedrive()
                     self.config.controller_motion_enabled = True
-                    stage = "motion_armed"
+                    stage = "teleop_ready"
                 else:
                     self.robot.disarm_motion()
                     self.robot.disable_freedrive()
@@ -2125,13 +3366,14 @@ class FlexivRealSenseManager:
         publish_event: Callable[[dict[str, Any]], None] | None,
     ) -> dict[str, Any]:
         try:
+            calibration_config = self._session_calibration_config(session_dir)
             result = calibrate_robot_realsense_run(
                 session_dir,
-                self.config.pattern_cols,
-                self.config.pattern_rows,
-                self.config.square_size_m,
-                self.config.min_hand_eye_detections,
-                self.config,
+                calibration_config.pattern_cols,
+                calibration_config.pattern_rows,
+                calibration_config.square_size_m,
+                calibration_config.min_hand_eye_detections,
+                calibration_config,
             )
             result["questAlignment"] = build_quest_robot_alignment(result, quest_calibration_event)
             write_json(result, session_dir / "robot_hand_eye_result.json")
@@ -2168,6 +3410,12 @@ class FlexivRealSenseManager:
             if publish_event is not None:
                 publish_event(failure)
             return failure
+
+    def _session_calibration_config(self, session_dir: Path) -> FlexivRealSenseConfig:
+        with self.lock:
+            fallback = copy.deepcopy(self.config)
+        payload = read_json_if_exists(session_dir / "capture_config.json")
+        return config_from_json(payload, fallback)
 
 
 def import_flexivrdk(flexiv_rdk: Path | None) -> Any:
@@ -2265,6 +3513,15 @@ def safe_filename(value: str) -> str:
     return name or "camera"
 
 
+def async_camera_queue_size(fps: Any) -> int:
+    try:
+        fps_value = max(1.0, float(fps))
+    except (TypeError, ValueError):
+        fps_value = float(DEFAULT_REALSENSE_FPS)
+    desired = int(math.ceil(fps_value * ASYNC_CAMERA_QUEUE_SECONDS))
+    return max(ASYNC_CAMERA_QUEUE_MIN_FRAMES, min(ASYNC_CAMERA_QUEUE_MAX_FRAMES, desired))
+
+
 def board_check_message(detected: bool, brightness: dict[str, float]) -> str:
     if detected:
         return "checkerboard detected"
@@ -2292,6 +3549,22 @@ def camera_metadata_from_profile(profile: Any, serial: str) -> dict[str, Any]:
         "distortion_model": str(intr.model),
         "distortion_coeffs": [float(v) for v in intr.coeffs],
     }
+
+
+def depth_scale_from_profile(profile: Any) -> float | None:
+    try:
+        device = profile.get_device()
+        try:
+            depth_sensor = device.first_depth_sensor()
+            return float(depth_sensor.get_depth_scale())
+        except Exception:
+            pass
+        for sensor in device.query_sensors():
+            if hasattr(sensor, "get_depth_scale"):
+                return float(sensor.get_depth_scale())
+    except Exception:
+        return None
+    return None
 
 
 def device_info(device: Any, key: Any) -> str:
@@ -2332,9 +3605,7 @@ def calibrate_robot_realsense_run(
         for sample in selected_samples:
             if not sample.get("ok"):
                 continue
-            t_base_ee = transform_from_json(sample.get("T_base_tool_tcp"))
-            if t_base_ee is None:
-                t_base_ee = transform_from_json(sample.get("T_base_ee"))
+            t_base_ee = robot_row_tool_transform(sample)
             if t_base_ee is None:
                 continue
             frame_payload = load_end_observation_frame(run_dir, sample, video_cache)
@@ -2370,9 +3641,6 @@ def calibrate_robot_realsense_run(
             counts=counts,
             observations=observations,
         )
-    red_anchor_global = infer_observation_red_anchor_target(observations, cols, rows)
-    apply_global_red_anchor_target(observations, red_anchor_global, cols, rows)
-
     diversity = observation_pose_diversity(observations)
     try:
         require_hand_eye_pose_diversity(diversity)
@@ -2398,9 +3666,6 @@ def calibrate_robot_realsense_run(
             "rot180_selected": int(sum(obs["selected"] == 1 for obs in observations)),
             "appearance_anchor_ok": int(sum(bool((obs.get("appearance_anchor") or {}).get("ok")) for obs in observations)),
             "appearance_anchor_rot180": int(sum((obs.get("appearance_anchor") or {}).get("order") == "rot180" for obs in observations)),
-            "red_anchor_ok": int(sum(bool((obs.get("red_anchor") or {}).get("ok")) for obs in observations)),
-            "red_anchor_rot180": int(sum((obs.get("red_anchor") or {}).get("order") == "rot180" for obs in observations)),
-            "red_anchor_global": red_anchor_global,
         },
         "diversity": diversity,
         "end_camera": {
@@ -2466,9 +3731,7 @@ def select_diverse_hand_eye_samples(
     for index, sample in enumerate(samples):
         if not sample.get("ok"):
             continue
-        transform = transform_from_json(sample.get("T_base_tool_tcp"))
-        if transform is None:
-            transform = transform_from_json(sample.get("T_base_ee"))
+        transform = robot_row_tool_transform(sample)
         if transform is None:
             continue
         candidates.append((index, sample, transform))
@@ -2675,8 +3938,6 @@ def detect_end_observation(
         min_contrast=APPEARANCE_ANCHOR_MIN_CONTRAST,
     )
     appearance_order = appearance_anchor.get("order") if appearance_anchor.get("ok") else None
-    red_anchor = detect_red_corner_anchor(image, corners.reshape(-1, 2), cols, rows)
-    anchor_order = red_anchor.get("order") if red_anchor.get("ok") else None
     camera_matrix, distortion = camera_intrinsics(camera)
     candidates = []
     for order, obj in (
@@ -2695,7 +3956,6 @@ def detect_end_observation(
                 "reprojection_rmse_px": float(np.sqrt(np.mean(error * error))),
                 "reprojection_median_px": float(np.median(error)),
                 "matches_appearance_anchor": bool(order == appearance_order) if appearance_order in ("identity", "rot180") else None,
-                "matches_red_anchor": bool(order == anchor_order) if anchor_order in ("identity", "rot180") else None,
             }
         )
     if not candidates:
@@ -2703,7 +3963,6 @@ def detect_end_observation(
     overlay_path = overlay_dir / f"sample_{int(sample.get('sample_index', 0)):06d}_end_overlay.jpg"
     overlay = image.copy()
     cv2.drawChessboardCorners(overlay, pattern, corners, True)
-    draw_red_anchor_overlay(overlay, corners.reshape(-1, 2), red_anchor, cols, rows)
     draw_checkerboard_appearance_anchor_overlay(overlay, corners.reshape(-1, 2), appearance_anchor, cols, rows)
     cv2.imwrite(str(overlay_path), overlay, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
     return {
@@ -2715,21 +3974,19 @@ def detect_end_observation(
         "method": method,
         "T_base_ee": t_base_ee,
         "appearance_anchor": appearance_anchor,
-        "red_anchor": red_anchor,
         "candidates": candidates,
         "selected": 0,
     }
 
 
-def checkerboard_overlay_rgb(rgb: np.ndarray, cols: int, rows: int) -> tuple[np.ndarray, dict[str, Any]]:
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+def checkerboard_overlay_bgr(bgr: np.ndarray, cols: int, rows: int) -> tuple[np.ndarray, dict[str, Any]]:
     overlay = bgr.copy()
     pattern = (int(cols), int(rows))
     ok = False
     corners = None
     method = "findChessboardCorners"
     try:
-        scale = min(1.0, 640.0 / max(1, max(rgb.shape[0], rgb.shape[1])))
+        scale = min(1.0, 640.0 / max(1, max(bgr.shape[0], bgr.shape[1])))
         if scale < 1.0:
             small = cv2.resize(bgr, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
         else:
@@ -2764,26 +4021,22 @@ def checkerboard_overlay_rgb(rgb: np.ndarray, cols: int, rows: int) -> tuple[np.
             int(rows),
             min_contrast=APPEARANCE_ANCHOR_MIN_CONTRAST,
         )
-        red_anchor = detect_red_corner_anchor(bgr, corners.reshape(-1, 2), int(cols), int(rows))
         cv2.drawChessboardCorners(overlay, pattern, corners, True)
-        draw_red_anchor_overlay(overlay, corners.reshape(-1, 2), red_anchor, int(cols), int(rows))
         draw_checkerboard_appearance_anchor_overlay(overlay, corners.reshape(-1, 2), appearance_anchor, int(cols), int(rows))
         status = f"checkerboard detected: {len(corners)}/{int(cols) * int(rows)}"
         color = (80, 220, 120)
     else:
         appearance_anchor = None
-        red_anchor = None
         status = "checkerboard not detected"
         color = (80, 120, 255)
     cv2.rectangle(overlay, (10, 10), (min(520, overlay.shape[1] - 10), 46), (20, 24, 28), -1)
     cv2.putText(overlay, status, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
-    return cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB), {
+    return overlay, {
         "ok": bool(ok and corners is not None),
         "detectedCorners": int(len(corners)) if ok and corners is not None else 0,
         "expectedCorners": int(cols) * int(rows),
         "method": method,
         "appearanceAnchor": appearance_anchor,
-        "redAnchor": red_anchor,
     }
 
 
@@ -2839,85 +4092,7 @@ def initial_candidate_index(obs: dict[str, Any]) -> int:
         for index, candidate in enumerate(obs.get("candidates") or []):
             if candidate.get("order") == appearance_order:
                 return int(index)
-    red_anchor = obs.get("red_anchor") if isinstance(obs.get("red_anchor"), dict) else {}
-    anchor_order = red_anchor.get("order") if red_anchor.get("ok") else None
-    if anchor_order in ("identity", "rot180"):
-        for index, candidate in enumerate(obs.get("candidates") or []):
-            if candidate.get("order") == anchor_order:
-                return int(index)
     return 0
-
-
-def infer_observation_red_anchor_target(observations: list[dict[str, Any]], cols: int, rows: int) -> dict[str, Any]:
-    total = int(cols) * int(rows)
-    order_180 = np.arange(total).reshape(int(rows), int(cols))[::-1, ::-1].reshape(-1)
-    counts: dict[int, int] = {}
-    observed_counts: dict[int, int] = {}
-    score_sum: dict[int, float] = {}
-    for obs in observations:
-        anchor = obs.get("red_anchor") if isinstance(obs.get("red_anchor"), dict) else {}
-        if not anchor.get("ok"):
-            continue
-        observed = int(anchor.get("observedIndex", -1))
-        if observed < 0 or observed >= total:
-            continue
-        target = int(min(observed, int(order_180[observed])))
-        counts[target] = counts.get(target, 0) + 1
-        observed_counts[observed] = observed_counts.get(observed, 0) + 1
-        score_sum[target] = score_sum.get(target, 0.0) + float(anchor.get("bestScore") or 0.0)
-    if not counts:
-        return {
-            "target_index": None,
-            "source": "none_detected",
-            "ok_frames": 0,
-            "counts": {},
-            "observed_counts": {},
-            "note": "Red anchor is optional; observations without red use identity/rot180 hand-eye residual matching.",
-        }
-    target = max(counts, key=lambda idx: (counts[idx], score_sum.get(idx, 0.0)))
-    return {
-        "target_index": int(target),
-        "source": "auto_from_any_reliable_red_anchor",
-        "ok_frames": int(sum(counts.values())),
-        "counts": {str(key): int(value) for key, value in sorted(counts.items())},
-        "observed_counts": {str(key): int(value) for key, value in sorted(observed_counts.items())},
-        "score_sum": {str(key): float(value) for key, value in sorted(score_sum.items())},
-        "note": "A reliable red anchor frame orients the global 180-degree pair; observations without red remain valid and fall back to residual matching.",
-    }
-
-
-def apply_global_red_anchor_target(observations: list[dict[str, Any]], summary: dict[str, Any], cols: int, rows: int) -> None:
-    target = summary.get("target_index") if isinstance(summary, dict) else None
-    if target is None:
-        return
-    total = int(cols) * int(rows)
-    order_180 = np.arange(total).reshape(int(rows), int(cols))[::-1, ::-1].reshape(-1)
-    for obs in observations:
-        anchor = obs.get("red_anchor") if isinstance(obs.get("red_anchor"), dict) else {}
-        if not anchor.get("ok"):
-            continue
-        observed = int(anchor.get("observedIndex", -1))
-        if observed < 0 or observed >= total:
-            anchor["targetIndex"] = int(target)
-            anchor["order"] = None
-            anchor["orderReason"] = "observed_index_out_of_range"
-            continue
-        if observed == int(target):
-            order = "identity"
-        elif int(order_180[observed]) == int(target):
-            order = "rot180"
-        else:
-            anchor["targetIndex"] = int(target)
-            anchor["order"] = None
-            anchor["orderReason"] = "observed_corner_not_in_global_target_180_pair"
-            for candidate in obs.get("candidates") or []:
-                candidate["matches_red_anchor"] = None
-            continue
-        anchor["targetIndex"] = int(target)
-        anchor["order"] = order
-        anchor["orderReason"] = "global_red_anchor_target"
-        for candidate in obs.get("candidates") or []:
-            candidate["matches_red_anchor"] = bool(candidate.get("order") == order)
 
 
 def observation_pose_diversity(observations: list[dict[str, Any]]) -> dict[str, Any]:
@@ -3003,12 +4178,6 @@ def choose_candidate(obs: dict[str, Any], t_ee_camera: np.ndarray, t_base_board:
     if appearance_order in ("identity", "rot180"):
         for index, candidate in enumerate(obs.get("candidates") or []):
             if candidate.get("order") == appearance_order:
-                return int(index)
-    red_anchor = obs.get("red_anchor") if isinstance(obs.get("red_anchor"), dict) else {}
-    anchor_order = red_anchor.get("order") if red_anchor.get("ok") else None
-    if anchor_order in ("identity", "rot180"):
-        for index, candidate in enumerate(obs.get("candidates") or []):
-            if candidate.get("order") == anchor_order:
                 return int(index)
     scores = []
     for index in range(len(obs["candidates"])):
@@ -3131,9 +4300,11 @@ def robot_gripper_event(row: dict[str, Any]) -> dict[str, Any]:
         "capturedAt": row.get("captured_at"),
         "commandSent": bool(row.get("commandSent")),
         "action": row.get("action"),
+        "device": row.get("device"),
         "trigger": row.get("trigger"),
         "targetWidthM": row.get("target_width_m"),
         "status": row.get("status"),
+        "devices": row.get("devices"),
         "reason": row.get("reason"),
         "error": row.get("error"),
     }
@@ -3376,6 +4547,17 @@ def transform_to_json(matrix: np.ndarray, coordinate_frame: str | None = None) -
     return payload
 
 
+def transform_to_compact_json(matrix: np.ndarray, coordinate_frame: str | None = None) -> dict[str, Any]:
+    quat = matrix_to_quaternion_wxyz(matrix)
+    payload = {
+        "translation_m": [float(value) for value in matrix[:3, 3]],
+        "quaternion_wxyz": quat,
+    }
+    if coordinate_frame:
+        payload["coordinateFrame"] = coordinate_frame
+    return payload
+
+
 def transform_from_json(payload: Any) -> np.ndarray | None:
     if not isinstance(payload, dict):
         return None
@@ -3392,6 +4574,48 @@ def transform_from_json(payload: Any) -> np.ndarray | None:
             quaternion_wxyz_to_matrix([float(v) for v in quat[:4]]),
             np.asarray([float(v) for v in translation[:3]], dtype=float),
         )
+    return None
+
+
+def flexiv_pose_payload_to_transform(payload: Any) -> np.ndarray | None:
+    if not isinstance(payload, list) or len(payload) < 7:
+        return None
+    try:
+        pose = np.asarray([float(payload[index]) for index in range(7)], dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if not np.all(np.isfinite(pose)):
+        return None
+    return flexiv_pose_to_transform(pose)
+
+
+def robot_state_pose_transform(state: dict[str, Any], key: str = "rawEndEffectorPoseWxyz") -> np.ndarray | None:
+    if not isinstance(state, dict):
+        return None
+    direct = transform_from_json(state.get("endEffectorPose"))
+    if direct is not None and key == "rawEndEffectorPoseWxyz":
+        return direct
+    return flexiv_pose_payload_to_transform(state.get(key))
+
+
+def robot_row_tool_transform(row: dict[str, Any]) -> np.ndarray | None:
+    transform = transform_from_json(row.get("T_base_tool_tcp"))
+    if transform is not None:
+        return transform
+    transform = transform_from_json(row.get("T_base_ee"))
+    if transform is not None:
+        return transform
+    state = row.get("robot_state") if isinstance(row.get("robot_state"), dict) else {}
+    tcp = state.get("tcp_pose") if isinstance(state, dict) and isinstance(state.get("tcp_pose"), dict) else None
+    if isinstance(tcp, dict):
+        transform = transform_from_json(tcp.get("T_base_pose"))
+        if transform is not None:
+            return transform
+        transform = flexiv_pose_payload_to_transform(tcp.get("pose"))
+        if transform is not None:
+            return transform
+    if isinstance(state, dict):
+        return robot_state_pose_transform(state)
     return None
 
 
@@ -3478,6 +4702,34 @@ def numeric_stats(values: np.ndarray) -> dict[str, Any]:
     }
 
 
+def monotonic_time_series_summary(times: list[float], target_hz: float | None = None) -> dict[str, Any]:
+    values = np.asarray([float(value) for value in times if math.isfinite(float(value))], dtype=float)
+    if values.size == 0:
+        return {"count": 0}
+    duration = float(max(0.0, values[-1] - values[0])) if values.size >= 2 else 0.0
+    hz = float((values.size - 1) / duration) if duration > 1e-9 and values.size >= 2 else None
+    gaps = np.diff(values) if values.size >= 2 else np.asarray([], dtype=float)
+    payload: dict[str, Any] = {
+        "count": int(values.size),
+        "durationSeconds": duration,
+        "effectiveHz": hz,
+        "firstPerfCounterSeconds": float(values[0]),
+        "lastPerfCounterSeconds": float(values[-1]),
+    }
+    if target_hz is not None and target_hz > 0:
+        payload["targetHz"] = float(target_hz)
+        if hz is not None:
+            payload["targetRatio"] = float(hz / float(target_hz))
+    if gaps.size:
+        payload["gapSeconds"] = numeric_stats(gaps)
+    return payload
+
+
+def duration_series_summary(values: list[float]) -> dict[str, Any]:
+    finite = np.asarray([float(value) for value in values if math.isfinite(float(value))], dtype=float)
+    return numeric_stats(finite)
+
+
 def camera_intrinsics(camera: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
     matrix = np.asarray(
         [
@@ -3489,136 +4741,6 @@ def camera_intrinsics(camera: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
     )
     coeffs = np.asarray(camera.get("distortion_coeffs") or [0, 0, 0, 0, 0], dtype=float).reshape(-1, 1)
     return matrix, coeffs
-
-
-def checkerboard_corner_indices(cols: int, rows: int) -> list[int]:
-    return [0, cols - 1, (rows - 1) * cols, rows * cols - 1]
-
-
-def red_anchor_order_for_observed(observed_index: int, target_index: int, order_180: np.ndarray) -> str | None:
-    if observed_index < 0 or target_index < 0:
-        return None
-    if int(observed_index) == int(target_index):
-        return "identity"
-    if int(order_180[int(observed_index)]) == int(target_index):
-        return "rot180"
-    return None
-
-
-def red_anchor_target_index_for_observed(observed_index: int, cols: int, rows: int) -> int | None:
-    total = int(cols) * int(rows)
-    if observed_index < 0 or observed_index >= total:
-        return None
-    order_180 = np.arange(total).reshape(int(rows), int(cols))[::-1, ::-1].reshape(-1)
-    paired = int(order_180[int(observed_index)])
-    return int(min(int(observed_index), paired))
-
-
-def corner_grid_spacing_px(corners: np.ndarray, cols: int, rows: int) -> float:
-    points = np.asarray(corners, dtype=float).reshape(rows, cols, 2)
-    diffs: list[np.ndarray] = []
-    if cols >= 2:
-        diffs.append(np.linalg.norm(np.diff(points, axis=1), axis=2).reshape(-1))
-    if rows >= 2:
-        diffs.append(np.linalg.norm(np.diff(points, axis=0), axis=2).reshape(-1))
-    if not diffs:
-        return 12.0
-    values = np.concatenate(diffs)
-    values = values[np.isfinite(values) & (values > 1.0)]
-    return float(np.median(values)) if values.size else 12.0
-
-
-def red_mask_bgr(image: np.ndarray) -> np.ndarray:
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
-    hsv_mask = (((h <= 10) | (h >= 170)) & (s >= 70) & (v >= 45))
-    b, g, r = cv2.split(image)
-    rgb_mask = (r >= 80) & (r.astype(np.float32) >= 1.25 * g.astype(np.float32)) & (r.astype(np.float32) >= 1.25 * b.astype(np.float32))
-    return (hsv_mask | rgb_mask).astype(np.uint8)
-
-
-def detect_red_corner_anchor(image: np.ndarray, corners: np.ndarray, cols: int, rows: int) -> dict[str, Any]:
-    points = np.asarray(corners, dtype=float).reshape(-1, 2)
-    corner_indices = checkerboard_corner_indices(cols, rows)
-    spacing = corner_grid_spacing_px(points, cols, rows)
-    radius = max(8.0, RED_ANCHOR_RADIUS_GRID_SPACING * spacing)
-    radius = min(radius, 0.35 * float(min(image.shape[:2])))
-    mask = red_mask_bgr(image)
-    height, width = mask.shape[:2]
-    scores: dict[str, float] = {}
-    red_pixels: dict[str, int] = {}
-    areas: dict[str, int] = {}
-    centers: dict[str, list[float]] = {}
-    for index in corner_indices:
-        x, y = points[index]
-        centers[str(index)] = [float(x), float(y)]
-        x0 = max(0, int(np.floor(x - radius)))
-        x1 = min(width, int(np.ceil(x + radius + 1)))
-        y0 = max(0, int(np.floor(y - radius)))
-        y1 = min(height, int(np.ceil(y + radius + 1)))
-        if x0 >= x1 or y0 >= y1:
-            scores[str(index)] = 0.0
-            red_pixels[str(index)] = 0
-            areas[str(index)] = 0
-            continue
-        yy, xx = np.ogrid[y0:y1, x0:x1]
-        circle = (xx - x) * (xx - x) + (yy - y) * (yy - y) <= radius * radius
-        roi = mask[y0:y1, x0:x1]
-        area = int(np.count_nonzero(circle))
-        count = int(np.count_nonzero(roi[circle]))
-        scores[str(index)] = float(count / max(1, area))
-        red_pixels[str(index)] = count
-        areas[str(index)] = area
-    ranked = sorted(corner_indices, key=lambda idx: (scores[str(idx)], red_pixels[str(idx)]), reverse=True)
-    best = ranked[0]
-    second = ranked[1] if len(ranked) > 1 else best
-    best_score = float(scores[str(best)])
-    second_score = float(scores[str(second)]) if second != best else 0.0
-    score_ratio = float(best_score / max(second_score, 1e-9))
-    ok = (
-        red_pixels[str(best)] >= RED_ANCHOR_MIN_PIXELS
-        and best_score >= RED_ANCHOR_MIN_RATIO
-        and score_ratio >= RED_ANCHOR_MIN_BEST_SECOND_RATIO
-    )
-    target = red_anchor_target_index_for_observed(int(best), cols, rows) if ok else None
-    order_180 = np.arange(int(cols) * int(rows)).reshape(int(rows), int(cols))[::-1, ::-1].reshape(-1)
-    order = red_anchor_order_for_observed(int(best), int(target), order_180) if target is not None else None
-    return {
-        "ok": bool(ok),
-        "observedIndex": int(best) if ok else -1,
-        "targetIndex": int(target) if target is not None else -1,
-        "order": order,
-        "bestIndex": int(best),
-        "secondIndex": int(second),
-        "bestScore": best_score,
-        "secondScore": second_score,
-        "scoreRatio": score_ratio,
-        "redPixels": red_pixels,
-        "areas": areas,
-        "scoresByCorner": scores,
-        "centersByCorner": centers,
-        "radiusPx": float(radius),
-        "gridSpacingPx": float(spacing),
-        "cornerIndices": [int(v) for v in corner_indices],
-        "reason": "ok" if ok else "weak_or_ambiguous_red_corner",
-    }
-
-
-def draw_red_anchor_overlay(out: np.ndarray, corners: np.ndarray, anchor: dict[str, Any] | None, cols: int, rows: int) -> None:
-    if not anchor:
-        return
-    points = np.asarray(corners, dtype=float).reshape(-1, 2)
-    radius = int(round(float(anchor.get("radiusPx") or 0.0)))
-    scores = anchor.get("scoresByCorner") if isinstance(anchor.get("scoresByCorner"), dict) else {}
-    observed = int(anchor.get("observedIndex", -1))
-    best = int(anchor.get("bestIndex", -1))
-    for index in checkerboard_corner_indices(cols, rows):
-        x, y = points[index]
-        color = (0, 0, 255) if index == observed else ((0, 180, 255) if index == best else (200, 200, 200))
-        if radius > 0:
-            cv2.circle(out, (int(round(x)), int(round(y))), radius, color, 2, cv2.LINE_AA)
-        label = f"{index}:{float(scores.get(str(index), 0.0)):.3f}"
-        cv2.putText(out, label, (int(round(x)) + 6, int(round(y)) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
 
 def object_points(cols: int, rows: int, square_size_m: float) -> np.ndarray:
@@ -3662,7 +4784,6 @@ def observations_to_json(observations: list[dict[str, Any]]) -> list[dict[str, A
                 "method": obs.get("method"),
                 "selected": obs.get("selected"),
                 "appearance_anchor": obs.get("appearance_anchor"),
-                "red_anchor": obs.get("red_anchor"),
                 "candidates": obs.get("candidates"),
             }
         )
@@ -3812,17 +4933,53 @@ def joint_limit_guard_state(
     }
 
 
-def save_rgb_jpeg(rgb: np.ndarray, path: Path) -> None:
+def compact_joint_limit_guard_for_record(guard: Any) -> dict[str, Any] | None:
+    if not isinstance(guard, dict):
+        return None
+    compact = {
+        "enabled": guard.get("enabled"),
+        "ok": guard.get("ok"),
+        "reason": guard.get("reason"),
+        "bufferRad": guard.get("bufferRad"),
+        "minMarginRad": guard.get("minMarginRad"),
+    }
+    violations = guard.get("violations")
+    if isinstance(violations, list) and violations:
+        compact["violations"] = violations
+    return compact
+
+
+def compact_robot_state_for_record(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": state.get("ok"),
+        "robotSn": state.get("robotSn"),
+        "poseField": state.get("poseField"),
+        "readUnixSeconds": state.get("readUnixSeconds"),
+        "rawEndEffectorPoseWxyz": state.get("rawEndEffectorPoseWxyz"),
+        "jointPose": state.get("jointPose"),
+        "jointLimitGuard": compact_joint_limit_guard_for_record(state.get("jointLimitGuard")),
+        "gripper": state.get("gripper"),
+    }
+
+
+def save_bgr_jpeg(bgr: np.ndarray, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(encode_rgb_jpeg(rgb, quality=92))
+    path.write_bytes(encode_bgr_jpeg(bgr, quality=92))
 
 
-def encode_rgb_jpeg(rgb: np.ndarray, quality: int = 92) -> bytes:
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+def encode_bgr_jpeg(bgr: np.ndarray, quality: int = 92) -> bytes:
     ok, buffer = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
     if not ok:
         raise RuntimeError("could not encode image")
     return bytes(buffer)
+
+
+def save_rgb_jpeg(rgb: np.ndarray, path: Path) -> None:
+    save_bgr_jpeg(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), path)
+
+
+def encode_rgb_jpeg(rgb: np.ndarray, quality: int = 92) -> bytes:
+    return encode_bgr_jpeg(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), quality=quality)
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -3831,7 +4988,10 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
         for line in handle:
             if not line.strip():
                 continue
-            row = json.loads(line)
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
             if isinstance(row, dict):
                 rows.append(row)
     return rows
@@ -3840,6 +5000,106 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 def write_json(payload: Any, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_json_if_exists(path: Path) -> Any:
+    try:
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def config_from_json(payload: Any, fallback: FlexivRealSenseConfig | None = None) -> FlexivRealSenseConfig:
+    config = copy.deepcopy(fallback) if fallback is not None else FlexivRealSenseConfig()
+    if not isinstance(payload, dict):
+        return config
+
+    string_fields = (
+        ("robotSn", "robot_sn"),
+        ("poseField", "robot_pose_field"),
+        ("cameraSerial", "camera_serial"),
+        ("thirdCameraSerial", "third_camera_serial"),
+        ("gripperDevice", "gripper_device"),
+    )
+    for key, attr in string_fields:
+        if key in payload and payload[key] is not None:
+            setattr(config, attr, str(payload[key]).strip())
+
+    if "flexivRdk" in payload:
+        config.flexiv_rdk = Path(payload["flexivRdk"]) if payload["flexivRdk"] else None
+    if "networkInterfaces" in payload:
+        config.flexiv_network_interfaces = normalize_network_interfaces(payload["networkInterfaces"])
+
+    int_fields = (
+        ("width", "width"),
+        ("height", "height"),
+        ("fps", "fps"),
+        ("recordDepthEveryNFrames", "record_depth_every_n_frames"),
+        ("warmupFrames", "warmup_frames"),
+        ("boardCheckWarmupFrames", "board_check_warmup_frames"),
+        ("minHandEyeDetections", "min_hand_eye_detections"),
+        ("handEyeMaxDiverseSamples", "hand_eye_max_diverse_samples"),
+        ("handEyeMinDiverseSamples", "hand_eye_min_diverse_samples"),
+    )
+    for key, attr in int_fields:
+        if key in payload and is_number(payload[key]):
+            setattr(config, attr, int(payload[key]))
+    config.record_depth_every_n_frames = max(1, int(config.record_depth_every_n_frames))
+
+    required_float_fields = (
+        ("robotStateHz", "robot_state_hz"),
+        ("captureIntervalSeconds", "capture_interval_seconds"),
+        ("squareSizeM", "square_size_m"),
+        ("handEyeDiverseTranslationScaleM", "hand_eye_diverse_translation_scale_m"),
+        ("handEyeDiverseRotationScaleDeg", "hand_eye_diverse_rotation_scale_deg"),
+        ("handEyeDiverseMinScore", "hand_eye_diverse_min_score"),
+        ("controllerTranslationScale", "controller_translation_scale"),
+        ("controllerMaxStepM", "controller_max_step_m"),
+        ("controllerMaxRotationStepDeg", "controller_max_rotation_step_deg"),
+        ("controllerJointLimitBufferRad", "controller_joint_limit_buffer_rad"),
+        ("gripperOpenWidthM", "gripper_open_width_m"),
+        ("gripperCloseWidthM", "gripper_close_width_m"),
+        ("gripperSpeedMps", "gripper_speed_mps"),
+        ("gripperForceN", "gripper_force_n"),
+        ("gripperTriggerCloseThreshold", "gripper_trigger_close_threshold"),
+        ("gripperTriggerOpenThreshold", "gripper_trigger_open_threshold"),
+    )
+    for key, attr in required_float_fields:
+        if key in payload and is_number(payload[key]):
+            setattr(config, attr, float(payload[key]))
+
+    optional_float_fields = (
+        ("realsenseExposure", "realsense_exposure"),
+        ("realsenseGain", "realsense_gain"),
+    )
+    for key, attr in optional_float_fields:
+        if key in payload:
+            setattr(config, attr, float(payload[key]) if is_number(payload[key]) else None)
+
+    bool_fields = (
+        ("recordDepth", "record_depth"),
+        ("recordDepthAlignToColor", "record_depth_align_to_color"),
+        ("realsenseAutoExposure", "realsense_auto_exposure"),
+        ("runHandEye", "run_hand_eye"),
+        ("handEyeDisableDiverseSelection", "hand_eye_disable_diverse_selection"),
+        ("controllerMotionEnabled", "controller_motion_enabled"),
+        ("controllerJointLimitGuardEnabled", "controller_joint_limit_guard_enabled"),
+        ("gripperEnabled", "gripper_enabled"),
+        ("gripperInitOnEnable", "gripper_init_on_enable"),
+    )
+    for key, attr in bool_fields:
+        if key in payload:
+            setattr(config, attr, bool(payload[key]))
+
+    pattern = payload.get("pattern")
+    if isinstance(pattern, list) and len(pattern) >= 2 and is_number(pattern[0]) and is_number(pattern[1]):
+        config.pattern_cols = int(pattern[0])
+        config.pattern_rows = int(pattern[1])
+    if config.third_camera_serial and config.third_camera_serial == config.camera_serial:
+        config.third_camera_serial = ""
+    return config
 
 
 def config_to_json(config: FlexivRealSenseConfig) -> dict[str, Any]:
@@ -3853,6 +5113,10 @@ def config_to_json(config: FlexivRealSenseConfig) -> dict[str, Any]:
         "width": config.width,
         "height": config.height,
         "fps": config.fps,
+        "robotStateHz": config.robot_state_hz,
+        "recordDepth": config.record_depth,
+        "recordDepthAlignToColor": config.record_depth_align_to_color,
+        "recordDepthEveryNFrames": config.record_depth_every_n_frames,
         "warmupFrames": config.warmup_frames,
         "realsenseAutoExposure": config.realsense_auto_exposure,
         "realsenseExposure": config.realsense_exposure,
@@ -3871,9 +5135,10 @@ def config_to_json(config: FlexivRealSenseConfig) -> dict[str, Any]:
         "handEyeDisableDiverseSelection": config.hand_eye_disable_diverse_selection,
         "controllerMotionEnabled": config.controller_motion_enabled,
         "controllerTranslationScale": config.controller_translation_scale,
-        "controllerMaxOffsetM": config.controller_max_offset_m,
+        "controllerWorkspaceLimitEnabled": False,
+        "controllerMaxOffsetM": None,
         "controllerMaxStepM": config.controller_max_step_m,
-        "controllerMaxRotationDeg": config.controller_max_rotation_deg,
+        "controllerMaxRotationDeg": None,
         "controllerMaxRotationStepDeg": config.controller_max_rotation_step_deg,
         "controllerJointLimitBufferRad": config.controller_joint_limit_buffer_rad,
         "controllerJointLimitGuardEnabled": config.controller_joint_limit_guard_enabled,
@@ -3885,6 +5150,7 @@ def config_to_json(config: FlexivRealSenseConfig) -> dict[str, Any]:
         "gripperForceN": config.gripper_force_n,
         "gripperTriggerCloseThreshold": config.gripper_trigger_close_threshold,
         "gripperTriggerOpenThreshold": config.gripper_trigger_open_threshold,
+        "gripperInitOnEnable": config.gripper_init_on_enable,
     }
 
 
@@ -3905,6 +5171,17 @@ def safe_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
+
+
+def clamp_optional_range(value: float, lower: Any, upper: Any) -> float:
+    result = float(value)
+    low = safe_float(lower)
+    high = safe_float(upper)
+    if low is not None:
+        result = max(low, result)
+    if high is not None:
+        result = min(high, result)
+    return result
 
 
 def normalize_network_interfaces(value: Any) -> list[str]:

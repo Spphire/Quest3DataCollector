@@ -26,6 +26,13 @@ Runtime artifacts are written under `pc/offline_calibration/pc_recordings/`, `pc
 
 For a step-by-step operator flow, see [docs/usage.md](docs/usage.md).
 
+On the lab PC at `10.128.0.227`, use:
+
+```bash
+cd /ssd1/shenyibo/Quest3DataCollector
+pc/offline_calibration/scripts/start_lab_receiver.sh --restart
+```
+
 ## Flexiv / RealSense
 
 The receiver includes an optional Flexiv/RealSense panel. Select the end-mounted RealSense camera, enter the robot serial number, click `Connect Robot`, then use Quest B to start/stop PC calibration capture.
@@ -44,4 +51,4 @@ The recorded robot session includes:
 - end-camera MP4 video
 - camera serials and intrinsics in `robot_realsense/cameras.json` and `capture_config.json`
 
-The checkerboard calibration uses 11x8 inner corners with 25 mm squares. A single red marker near one board corner can be used as a global 180-degree orientation hint, but it is optional per frame and may appear in only one frame of a record.
+The checkerboard calibration uses 11x8 inner corners with 25 mm squares. The 180-degree corner-order ambiguity is resolved from the board's black/white corner appearance first, then by identity-vs-rot180 reprojection or hand-eye residual matching when appearance is inconclusive.

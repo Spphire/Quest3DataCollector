@@ -38,6 +38,7 @@ from flexiv_realsense_bridge import (
     DEFAULT_GRIPPER_CLOSE_WIDTH_M,
     DEFAULT_GRIPPER_DEVICE,
     DEFAULT_GRIPPER_FORCE_N,
+    DEFAULT_GRIPPER_INIT_ON_ENABLE,
     DEFAULT_GRIPPER_OPEN_WIDTH_M,
     DEFAULT_GRIPPER_SPEED_MPS,
     DEFAULT_GRIPPER_TRIGGER_CLOSE_THRESHOLD,
@@ -47,10 +48,13 @@ from flexiv_realsense_bridge import (
     DEFAULT_HAND_EYE_DIVERSE_TRANSLATION_SCALE_M,
     DEFAULT_HAND_EYE_MAX_DIVERSE_SAMPLES,
     DEFAULT_HAND_EYE_MIN_DIVERSE_SAMPLES,
+    DEFAULT_RECORD_DEPTH_EVERY_N_FRAMES,
+    DEFAULT_ROBOT_STATE_HZ,
     DEFAULT_CONTROLLER_JOINT_LIMIT_BUFFER_RAD,
     DEFAULT_CONTROLLER_MAX_STEP_M,
-    DEFAULT_CONTROLLER_MAX_ROTATION_DEG,
     DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG,
+    DEFAULT_CONTROLLER_TRANSLATION_SCALE,
+    ROBOT_SESSION_RECORD_ASYNC,
     ROBOT_SESSION_CONTROL_FREEDRIVE,
     ROBOT_SESSION_CONTROL_TELEOP,
     FlexivRealSenseConfig,
@@ -58,6 +62,7 @@ from flexiv_realsense_bridge import (
     RobotRealsenseSession,
     compact_robot_result,
     ee_pose_diversity,
+    robot_row_tool_transform,
     transform_from_json,
 )
 from flexiv_realsense_diagnostics import DEFAULT_PORTS as DEFAULT_ROBOT_DIAGNOSTIC_PORTS
@@ -90,13 +95,31 @@ DEFAULT_QUEST_LOCAL_ROOT = WORKSPACE_ROOT / "raw"
 DEFAULT_CALIBRATION_OUTPUT_ROOT = WORKSPACE_ROOT / "outputs" / "pc_live_calibration"
 DEFAULT_RIZON_URDF = WORKSPACE_ROOT / "assets" / "urdf" / "flexiv_Rizon4_kinematics.urdf"
 LATE_RECORDING_SAMPLE_GRACE_SECONDS = 5.0
+RECENTLY_CLOSED_RECORD_REOPEN_GUARD_SECONDS = 30.0
 MAX_CALIBRATION_HTTP_BODY_BYTES = 8 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
-ALLOWED_ARTIFACT_SUFFIXES = {".html", ".json", ".jsonl", ".log", ".jpg", ".jpeg", ".png", ".mp4"}
+ARTIFACT_STREAM_CHUNK_BYTES = 1024 * 1024
+ALLOWED_ARTIFACT_SUFFIXES = {".html", ".json", ".jsonl", ".log", ".jpg", ".jpeg", ".png", ".mp4", ".bin"}
 QUEST_RECORD_COMMAND_PATH = "/sdcard/Android/data/com.Apricity.EyeTrackingTest/files/record_command.txt"
 DEFAULT_ADB = Path(
     r"C:\Program Files\Unity\Hub\Editor\6000.0.60f1\Editor\Data\PlaybackEngines\AndroidPlayer\SDK\platform-tools\adb.exe"
 )
+DEFAULT_RECEIVE_FLUSH_EVERY = 32
+DEFAULT_RECEIVE_FLUSH_INTERVAL_SECONDS = 0.25
+DEFAULT_SAMPLE_LOG_INTERVAL_SECONDS = 1.0
+DEFAULT_UDP_RECEIVE_BUFFER_BYTES = 4 * 1024 * 1024
+DEFAULT_RECORDING_IDLE_TIMEOUT_SECONDS = 2.0
+SESSION_WRITE_QUEUE_MAX = 2048
+SESSION_WRITE_QUEUE_CLOSE_DRAIN_SECONDS = 2.0
+ROBOT_SESSION_ASYNC_SAMPLE_HZ = 5.0
+SESSION_RAW_SAMPLE_HZ = 5.0
+SESSION_CONTROLLER_CSV_HZ = 5.0
+LIVE_VISUALIZER_SAMPLE_HZ = 30.0
+SESSION_CONTROL_THREAD_JOIN_SECONDS = 1.0
+SESSION_WRITER_THREAD_JOIN_SECONDS = 10.0
+SESSION_CLOSE_THREAD_JOIN_SECONDS = 0.05
+REPLAY_VISUALIZATION_CACHE = "replay_visualization.json"
+REPLAY_VISUALIZATION_CACHE_VERSION = 3
 
 
 def main() -> int:
@@ -138,8 +161,47 @@ def main() -> int:
     receive_parser.add_argument(
         "--flush-every",
         type=int,
-        default=1,
-        help="Flush output every N messages. Default: 1 for safest recording.",
+        default=DEFAULT_RECEIVE_FLUSH_EVERY,
+        help=(
+            "Flush PC telemetry text files every N messages. "
+            f"Default: {DEFAULT_RECEIVE_FLUSH_EVERY}."
+        ),
+    )
+    receive_parser.add_argument(
+        "--flush-interval-seconds",
+        type=float,
+        default=DEFAULT_RECEIVE_FLUSH_INTERVAL_SECONDS,
+        help=(
+            "Flush PC telemetry text files at least this often while messages arrive. "
+            f"Default: {DEFAULT_RECEIVE_FLUSH_INTERVAL_SECONDS:g}s."
+        ),
+    )
+    receive_parser.add_argument(
+        "--sample-log-interval-seconds",
+        type=float,
+        default=DEFAULT_SAMPLE_LOG_INTERVAL_SECONDS,
+        help=(
+            "Print at most one high-rate sample status line per interval; use 0 to print every sample. "
+            f"Default: {DEFAULT_SAMPLE_LOG_INTERVAL_SECONDS:g}s."
+        ),
+    )
+    receive_parser.add_argument(
+        "--udp-receive-buffer-bytes",
+        type=int,
+        default=DEFAULT_UDP_RECEIVE_BUFFER_BYTES,
+        help=(
+            "Requested UDP socket receive buffer size in bytes. "
+            f"Default: {DEFAULT_UDP_RECEIVE_BUFFER_BYTES}."
+        ),
+    )
+    receive_parser.add_argument(
+        "--recording-idle-timeout-seconds",
+        type=float,
+        default=DEFAULT_RECORDING_IDLE_TIMEOUT_SECONDS,
+        help=(
+            "Close an active PC recording if no more recording datagrams arrive for this many seconds. "
+            f"Default: {DEFAULT_RECORDING_IDLE_TIMEOUT_SECONDS:g}s."
+        ),
     )
     receive_parser.add_argument(
         "--quiet",
@@ -327,9 +389,29 @@ def main() -> int:
     receive_parser.add_argument("--realsense-width", type=int, default=1280, help="RealSense color width. Default: 1280")
     receive_parser.add_argument("--realsense-height", type=int, default=720, help="RealSense color height. Default: 720")
     receive_parser.add_argument("--realsense-fps", type=int, default=30, help="RealSense color FPS. Default: 30")
+    receive_parser.add_argument(
+        "--no-record-realsense-depth",
+        action="store_true",
+        help="Disable aligned uint16 depth stream recording for RealSense formal recordings.",
+    )
+    receive_parser.add_argument(
+        "--record-realsense-depth-every-n-frames",
+        type=int,
+        default=DEFAULT_RECORD_DEPTH_EVERY_N_FRAMES,
+        help=(
+            "Append aligned RealSense depth to the indexed raw stream every N RGB frames during formal recordings. "
+            f"Default: {DEFAULT_RECORD_DEPTH_EVERY_N_FRAMES}"
+        ),
+    )
     receive_parser.add_argument("--realsense-manual-exposure", action="store_true", help="Disable RealSense RGB auto exposure.")
     receive_parser.add_argument("--realsense-exposure", type=float, default=None, help="Manual RealSense RGB exposure value.")
     receive_parser.add_argument("--realsense-gain", type=float, default=None, help="RealSense RGB gain value.")
+    receive_parser.add_argument(
+        "--robot-state-hz",
+        type=float,
+        default=DEFAULT_ROBOT_STATE_HZ,
+        help=f"Robot state polling Hz for A-button formal recordings. Default: {DEFAULT_ROBOT_STATE_HZ:g}",
+    )
     receive_parser.add_argument(
         "--robot-capture-interval",
         type=float,
@@ -385,14 +467,14 @@ def main() -> int:
     receive_parser.add_argument(
         "--controller-motion-scale",
         type=float,
-        default=1.0,
-        help="Scale from right-controller displacement to robot TCP displacement. Default: 1.0",
+        default=DEFAULT_CONTROLLER_TRANSLATION_SCALE,
+        help=f"Scale from right-controller displacement to robot TCP displacement. Default: {DEFAULT_CONTROLLER_TRANSLATION_SCALE:g}",
     )
     receive_parser.add_argument(
         "--controller-motion-max-offset",
         type=float,
-        default=0.18,
-        help="Maximum robot TCP offset commanded from the controller anchor, in meters. Default: 0.18",
+        default=None,
+        help="Legacy no-op. Teleop no longer clamps cumulative TCP offset; use --controller-motion-max-step instead.",
     )
     receive_parser.add_argument(
         "--controller-motion-max-step",
@@ -403,8 +485,8 @@ def main() -> int:
     receive_parser.add_argument(
         "--controller-motion-max-rotation",
         type=float,
-        default=DEFAULT_CONTROLLER_MAX_ROTATION_DEG,
-        help=f"Maximum TCP rotation from the controller anchor, in degrees. Default: {DEFAULT_CONTROLLER_MAX_ROTATION_DEG}",
+        default=None,
+        help="Legacy no-op. Teleop no longer clamps cumulative TCP rotation; use --controller-motion-max-rotation-step instead.",
     )
     receive_parser.add_argument(
         "--controller-motion-max-rotation-step",
@@ -443,6 +525,15 @@ def main() -> int:
     receive_parser.add_argument("--gripper-close-width", type=float, default=DEFAULT_GRIPPER_CLOSE_WIDTH_M)
     receive_parser.add_argument("--gripper-speed", type=float, default=DEFAULT_GRIPPER_SPEED_MPS)
     receive_parser.add_argument("--gripper-force", type=float, default=DEFAULT_GRIPPER_FORCE_N)
+    receive_parser.add_argument(
+        "--gripper-init-on-enable",
+        action="store_true",
+        default=DEFAULT_GRIPPER_INIT_ON_ENABLE,
+        help=(
+            "Call Gripper.Init() after Gripper.Enable(). Leave off for Robotiq devices that initialize "
+            "automatically on power-up."
+        ),
+    )
     receive_parser.add_argument(
         "--gripper-trigger-close-threshold",
         type=float,
@@ -508,6 +599,52 @@ def main() -> int:
     )
     diagnose_parser.set_defaults(func=diagnose_gaze_depth)
 
+    perf_parser = subparsers.add_parser(
+        "audit-performance",
+        help="Audit robot/RealSense recording performance for a PC record.",
+    )
+    perf_parser.add_argument(
+        "--pc-session",
+        type=Path,
+        help="PC session folder. Defaults to the newest record_* folder under --output-root.",
+    )
+    perf_parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=DEFAULT_OUTPUT_ROOT,
+        help=f"Used only when --pc-session is omitted. Default: {DEFAULT_OUTPUT_ROOT}",
+    )
+    perf_parser.add_argument(
+        "--min-robot-target-ratio",
+        type=float,
+        default=0.80,
+        help="Minimum robot state effectiveHz / targetHz ratio. Default: 0.80.",
+    )
+    perf_parser.add_argument(
+        "--min-camera-target-ratio",
+        type=float,
+        default=0.80,
+        help="Minimum camera video effectiveHz / targetHz ratio for each recorded role. Default: 0.80.",
+    )
+    perf_parser.add_argument(
+        "--max-camera-drop-ratio",
+        type=float,
+        default=0.05,
+        help="Maximum queue drop ratio for each camera role. Default: 0.05.",
+    )
+    perf_parser.add_argument(
+        "--max-camera-latency-p95-seconds",
+        type=float,
+        default=1.0,
+        help="Maximum p95 capture-to-write latency for each camera role when available. Default: 1.0.",
+    )
+    perf_parser.add_argument(
+        "--output-json",
+        type=Path,
+        help="Optional path to write the audit JSON.",
+    )
+    perf_parser.set_defaults(func=audit_performance)
+
     args = parser.parse_args()
     return args.func(args)
 
@@ -522,6 +659,7 @@ class SessionWriter:
         pc_receive_unix_seconds: float,
         pc_receive_perf_counter_seconds: float,
         flush_every: int,
+        flush_interval_seconds: float,
         calibration_output_root: Path | None = None,
         calibration_raw_root: Path | None = None,
         robot_manager: FlexivRealSenseManager | None = None,
@@ -582,6 +720,8 @@ class SessionWriter:
         self.start_remote = f"{remote[0]}:{remote[1]}"
         self.start_message = first_message
         self.flush_every = max(1, flush_every)
+        self.flush_interval_seconds = max(0.0, float(flush_interval_seconds))
+        self.last_flush_perf = time.perf_counter()
         self.calibration_output_root = calibration_output_root
         self.calibration_raw_root = calibration_raw_root
         self.calibration_snapshot_start = recording_calibration_snapshot(calibration_output_root)
@@ -591,6 +731,29 @@ class SessionWriter:
         self.robot_session: RobotRealsenseSession | None = None
         self.robot_realsense_directory: Path | None = None
         self.robot_start_status: dict[str, Any] | None = None
+        self.lock = threading.RLock()
+        self.write_queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=SESSION_WRITE_QUEUE_MAX)
+        self.writer_error: str | None = None
+        self.writer_dropped_messages = 0
+        self.writer_dropped_on_enqueue = 0
+        self.writer_dropped_on_close = 0
+        self.robot_record_sample_calls = 0
+        self.robot_record_sample_skips = 0
+        self.next_robot_record_perf = 0.0
+        self.raw_messages_written = 0
+        self.raw_sample_skips = 0
+        self.next_raw_sample_perf = 0.0
+        self.controller_csv_rows_written = 0
+        self.controller_csv_sample_skips = 0
+        self.next_controller_csv_perf = 0.0
+        self.last_close_metrics: dict[str, Any] | None = None
+        self.close_errors: list[dict[str, Any]] = []
+        self.control_thread: threading.Thread | None = None
+        self.control_stop_event = threading.Event()
+        self.control_condition = threading.Condition()
+        self.latest_control_wrapper: dict[str, Any] | None = None
+        self.latest_control_sequence: Any = None
+        self.last_control_sequence: Any = None
 
         self.messages = 0
         self.samples = 0
@@ -603,6 +766,7 @@ class SessionWriter:
         self.right_missing_reasons: dict[str, int] = {}
         self.last_sample_index: int | None = None
         self.closed = False
+        self.closing = False
         self.robot_start_status = self._robot_start_status("not_started")
         if self.robot_manager is not None:
             robot_alignment = latest_robot_hand_eye_result(calibration_raw_root, calibration_output_root, output_root)
@@ -613,16 +777,107 @@ class SessionWriter:
                 robot_alignment_result=robot_alignment,
                 require_controller_alignment=True,
                 control_mode=ROBOT_SESSION_CONTROL_TELEOP,
+                record_mode=ROBOT_SESSION_RECORD_ASYNC,
             )
             if self.robot_session is not None:
                 self.robot_realsense_directory = self.robot_session.directory
+                self.control_thread = threading.Thread(
+                    target=self._control_loop,
+                    name=f"pc-session-control-{sanitize_name(self.record_id)}",
+                    daemon=True,
+                )
+                self.control_thread.start()
             self.robot_start_status = self._robot_start_status(
                 "recording" if self.robot_session is not None else "not_recording"
             )
+        self.writer_thread = threading.Thread(
+            target=self._writer_loop,
+            name=f"pc-session-writer-{sanitize_name(self.record_id)}",
+            daemon=True,
+        )
+        self.writer_thread.start()
 
     def write(self, wrapper: dict[str, Any]) -> None:
-        if self.closed:
+        if self.closing or self.closed:
             raise RuntimeError("session already closed")
+        message = wrapper.get("message")
+        if isinstance(message, dict) and message.get("type") == "sample":
+            self._publish_latest_control_sample(wrapper)
+        self._enqueue_write(wrapper)
+
+    def _enqueue_write(self, wrapper: dict[str, Any]) -> None:
+        try:
+            self.write_queue.put_nowait(wrapper)
+            return
+        except queue.Full:
+            pass
+
+        if self._drop_one_queued_write(reason="enqueue"):
+            try:
+                self.write_queue.put_nowait(wrapper)
+                return
+            except queue.Full:
+                pass
+
+        self.writer_dropped_messages += 1
+        self.writer_dropped_on_enqueue += 1
+
+    def _drop_one_queued_write(self, reason: str) -> bool:
+        try:
+            dropped = self.write_queue.get_nowait()
+        except queue.Empty:
+            return False
+        try:
+            if dropped is not None:
+                self.writer_dropped_messages += 1
+                if reason == "close":
+                    self.writer_dropped_on_close += 1
+                else:
+                    self.writer_dropped_on_enqueue += 1
+        finally:
+            self.write_queue.task_done()
+        return True
+
+    def _wait_for_writer_queue(self, timeout_seconds: float) -> int:
+        deadline = time.perf_counter() + max(0.0, float(timeout_seconds))
+        with self.write_queue.all_tasks_done:
+            while self.write_queue.unfinished_tasks:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                self.write_queue.all_tasks_done.wait(timeout=remaining)
+            return int(self.write_queue.unfinished_tasks)
+
+    def _drain_writer_queue_for_close(self) -> int:
+        dropped = 0
+        while self._drop_one_queued_write(reason="close"):
+            dropped += 1
+        return dropped
+
+    def _enqueue_writer_sentinel(self) -> None:
+        while True:
+            try:
+                self.write_queue.put_nowait(None)
+                return
+            except queue.Full:
+                if not self._drop_one_queued_write(reason="close"):
+                    time.sleep(0.001)
+
+    def _writer_loop(self) -> None:
+        while True:
+            wrapper = self.write_queue.get()
+            try:
+                if wrapper is None:
+                    return
+                self._write_now(wrapper)
+            except Exception as exc:  # pragma: no cover - background safety net
+                self.writer_error = str(exc)
+            finally:
+                self.write_queue.task_done()
+
+    def _write_now(self, wrapper: dict[str, Any]) -> None:
+        if self.closed:
+            return
 
         message = wrapper.get("message")
         if not isinstance(message, dict):
@@ -632,19 +887,73 @@ class SessionWriter:
         if output_directory:
             self.quest_output_directory = output_directory
 
-        self.raw_file.write(json_line(wrapper))
         self.messages += 1
+        if self._should_write_raw_wrapper(wrapper, message):
+            self.raw_file.write(json_line(wrapper))
+            self.raw_messages_written += 1
 
         if message.get("type") == "sample":
             self.samples += 1
             sample_index = message.get("sampleIndex")
             if is_number(sample_index):
                 self.last_sample_index = int(sample_index)
-            robot_row = self._write_robot_sample(wrapper, message)
+            robot_row = self._write_robot_sample_for_record(wrapper, message)
             self._write_sample(wrapper, message, robot_row)
 
-        if self.messages % self.flush_every == 0:
+        now_perf = time.perf_counter()
+        if (
+            self.messages % self.flush_every == 0
+            or (
+                self.flush_interval_seconds > 0
+                and now_perf - self.last_flush_perf >= self.flush_interval_seconds
+            )
+        ):
             self.flush()
+
+    def _should_write_raw_wrapper(self, wrapper: dict[str, Any], message: dict[str, Any]) -> bool:
+        if message.get("type") != "sample":
+            return True
+        now_perf = wrapper.get("pcReceivePerfCounterSeconds")
+        now_perf = float(now_perf) if is_number(now_perf) else time.perf_counter()
+        if now_perf < self.next_raw_sample_perf:
+            self.raw_sample_skips += 1
+            return False
+        self.next_raw_sample_perf = now_perf + (1.0 / max(1.0, SESSION_RAW_SAMPLE_HZ))
+        return True
+
+    def _publish_latest_control_sample(self, wrapper: dict[str, Any]) -> None:
+        if self.robot_session is None or self.control_thread is None:
+            return
+        message = wrapper.get("message")
+        if not isinstance(message, dict):
+            return
+        with self.control_condition:
+            self.latest_control_wrapper = wrapper
+            self.latest_control_sequence = message.get("sequence")
+            self.control_condition.notify()
+
+    def _control_loop(self) -> None:
+        while not self.control_stop_event.is_set():
+            with self.control_condition:
+                self.control_condition.wait(timeout=0.02)
+                wrapper = self.latest_control_wrapper
+                sequence = self.latest_control_sequence
+            if wrapper is None or sequence == self.last_control_sequence:
+                continue
+            self.last_control_sequence = sequence
+            message = wrapper.get("message")
+            if not isinstance(message, dict) or message.get("type") != "sample":
+                continue
+            robot_session = self.robot_session
+            if robot_session is None:
+                continue
+            robot_sample = dict(message)
+            robot_sample["pcReceivePerfCounterSeconds"] = wrapper.get("pcReceivePerfCounterSeconds")
+            try:
+                robot_session.update_gripper(robot_sample)
+                robot_session.update_controller_motion(robot_sample)
+            except Exception as exc:  # pragma: no cover - hardware path
+                self.writer_error = str(exc)
 
     def _write_sample(
         self,
@@ -692,17 +1001,34 @@ class SessionWriter:
         if pc_world is not None:
             compact["pcWorld"] = pc_world
         self.samples_file.write(json_line(compact))
-        self._write_controller_csv_row(wrapper, message, "left")
-        self._write_controller_csv_row(wrapper, message, "right")
+        write_controller_csv = self._should_write_controller_csv(wrapper)
+        if not write_controller_csv:
+            self.controller_csv_sample_skips += 1
+        self._write_controller_csv_row(wrapper, message, "left", write_csv=write_controller_csv)
+        self._write_controller_csv_row(wrapper, message, "right", write_csv=write_controller_csv)
 
-    def _write_robot_sample(self, wrapper: dict[str, Any], message: dict[str, Any]) -> dict[str, Any] | None:
+    def _should_write_controller_csv(self, wrapper: dict[str, Any]) -> bool:
+        now_perf = wrapper.get("pcReceivePerfCounterSeconds")
+        now_perf = float(now_perf) if is_number(now_perf) else time.perf_counter()
+        if now_perf < self.next_controller_csv_perf:
+            return False
+        self.next_controller_csv_perf = now_perf + (1.0 / max(1.0, SESSION_CONTROLLER_CSV_HZ))
+        return True
+
+    def _write_robot_sample_for_record(self, wrapper: dict[str, Any], message: dict[str, Any]) -> dict[str, Any] | None:
         robot_session = self.robot_session
         if robot_session is None:
             return None
+        if getattr(robot_session, "record_mode", None) == ROBOT_SESSION_RECORD_ASYNC:
+            now_perf = wrapper.get("pcReceivePerfCounterSeconds")
+            now_perf = float(now_perf) if is_number(now_perf) else time.perf_counter()
+            if now_perf < self.next_robot_record_perf:
+                self.robot_record_sample_skips += 1
+                return None
+            self.next_robot_record_perf = now_perf + (1.0 / max(1.0, ROBOT_SESSION_ASYNC_SAMPLE_HZ))
         robot_sample = dict(message)
         robot_sample["pcReceivePerfCounterSeconds"] = wrapper.get("pcReceivePerfCounterSeconds")
-        robot_session.update_controller_motion(robot_sample)
-        robot_session.update_gripper(robot_sample)
+        self.robot_record_sample_calls += 1
         return robot_session.record_sample(robot_sample)
 
     @staticmethod
@@ -719,6 +1045,8 @@ class SessionWriter:
             "sampleIndex": row.get("sample_index"),
             "recordId": row.get("record_id"),
             "capturedAt": row.get("captured_at"),
+            "pcPerfCounterSeconds": row.get("pc_perf_counter_seconds"),
+            "pcUnixSeconds": row.get("pc_unix_seconds"),
             "ok": bool(row.get("ok")),
             "error": row.get("error"),
             "coordinateFrame": row.get("coordinate_frame") or PC_WORLD_FRAME,
@@ -726,6 +1054,9 @@ class SessionWriter:
             "questSampleIndex": row.get("quest_sample_index"),
             "questRecordingTimestampSeconds": row.get("quest_recording_timestamp_seconds"),
             "questPcReceivePerfCounterSeconds": row.get("quest_pc_receive_perf_counter_seconds"),
+            "robotStateSampleIndex": row.get("robot_state_sample_index"),
+            "robotStateCapturedAt": row.get("robot_state_captured_at"),
+            "robotStatePcPerfCounterSeconds": row.get("robot_state_pc_perf_counter_seconds"),
             "jointpose": joint_pose,
             "jointpos": joint_pose,
             "rawEndEffectorPoseWxyz": state.get("rawEndEffectorPoseWxyz"),
@@ -745,6 +1076,8 @@ class SessionWriter:
         wrapper: dict[str, Any],
         message: dict[str, Any],
         hand: str,
+        *,
+        write_csv: bool = True,
     ) -> None:
         controller = message.get(f"{hand}Controller")
         if not isinstance(controller, dict):
@@ -762,6 +1095,8 @@ class SessionWriter:
             if has_controller_pose(controller):
                 self.right_pose_samples += 1
 
+        if not write_csv:
+            return
         position = controller.get("position")
         rotation = controller.get("rotation")
         x, y, z = vec3_or_empty(position)
@@ -795,40 +1130,133 @@ class SessionWriter:
                 "qz": qz,
             }
         )
+        self.controller_csv_rows_written += 1
 
     def flush(self) -> None:
         self.raw_file.flush()
         self.samples_file.flush()
         self.controllers_file.flush()
+        self.last_flush_perf = time.perf_counter()
 
     def close(self, reason: str) -> dict[str, Any]:
-        if self.closed:
-            return self.summary(reason)
+        with self.lock:
+            if self.closed:
+                return self.summary(reason)
+            self.closing = True
 
-        self.calibration_snapshot_end = recording_calibration_snapshot(self.calibration_output_root)
-        preferred_snapshot = self.preferred_calibration_snapshot()
-        if preferred_snapshot is not None:
-            self.calibration_snapshot_path.write_text(
-                json.dumps(preferred_snapshot, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        self.flush()
-        self.raw_file.close()
-        self.samples_file.close()
-        self.controllers_file.close()
+        close_started_perf = time.perf_counter()
+        unfinished_before_drop = 0
+        dropped_on_close = 0
+        robot_summary = None
+        try:
+            unfinished_before_drop = self._wait_for_writer_queue(SESSION_WRITE_QUEUE_CLOSE_DRAIN_SECONDS)
+        except Exception as exc:  # pragma: no cover - defensive close path
+            self._note_close_error("writer_queue_wait", exc)
+        writer_drained_perf = time.perf_counter()
+        try:
+            dropped_on_close = self._drain_writer_queue_for_close() if unfinished_before_drop else 0
+        except Exception as exc:  # pragma: no cover - defensive close path
+            self._note_close_error("writer_queue_drain", exc)
+        writer_queue_dropped_perf = time.perf_counter()
+        try:
+            self._enqueue_writer_sentinel()
+            self.writer_thread.join(timeout=SESSION_WRITER_THREAD_JOIN_SECONDS)
+        except Exception as exc:  # pragma: no cover - defensive close path
+            self._note_close_error("writer_thread_join", exc)
+        writer_joined_perf = time.perf_counter()
+        try:
+            self.control_stop_event.set()
+            with self.control_condition:
+                self.control_condition.notify_all()
+            if self.control_thread is not None and self.control_thread.is_alive():
+                self.control_thread.join(timeout=SESSION_CONTROL_THREAD_JOIN_SECONDS)
+        except Exception as exc:  # pragma: no cover - defensive close path
+            self._note_close_error("control_thread_join", exc)
+        control_joined_perf = time.perf_counter()
+
+        try:
+            self.calibration_snapshot_end = recording_calibration_snapshot(self.calibration_output_root)
+            preferred_snapshot = self.preferred_calibration_snapshot()
+            if preferred_snapshot is not None:
+                self.calibration_snapshot_path.write_text(
+                    json.dumps(preferred_snapshot, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+        except Exception as exc:  # pragma: no cover - defensive close path
+            self._note_close_error("calibration_snapshot", exc)
+        self._safe_flush_close_file("pc_telemetry_raw", self.raw_file)
+        self._safe_flush_close_file("pc_samples", self.samples_file)
+        self._safe_flush_close_file("pc_controllers", self.controllers_file)
         robot_session = self.robot_session
         self.robot_session = None
-        robot_summary = None
         if self.robot_manager is not None and robot_session is not None:
             if robot_session is not None:
                 self.robot_realsense_directory = robot_session.directory
-            robot_summary = self.robot_manager.stop_session(robot_session)
+            try:
+                robot_summary = self.robot_manager.stop_session(robot_session)
+            except Exception as exc:  # pragma: no cover - hardware/close path
+                self._note_close_error("robot_session_stop", exc)
+        robot_stopped_perf = time.perf_counter()
+        self.last_close_metrics = {
+            "writerDrainSeconds": writer_drained_perf - close_started_perf,
+            "writerQueueDropSeconds": writer_queue_dropped_perf - writer_drained_perf,
+            "writerJoinSeconds": writer_joined_perf - writer_queue_dropped_perf,
+            "controlJoinSeconds": control_joined_perf - writer_joined_perf,
+            "robotStopSeconds": robot_stopped_perf - control_joined_perf,
+            "totalSeconds": robot_stopped_perf - close_started_perf,
+            "writerUnfinishedTasksBeforeDrop": unfinished_before_drop,
+            "writerDroppedOnClose": dropped_on_close,
+        }
         summary = self.summary(reason)
         if robot_summary is not None:
             summary["robotRealSense"] = robot_summary
-        self.summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._write_summary_safely(summary, "summary")
+        try:
+            cache_path = write_replay_visualization_cache(
+                self.directory,
+                self.record_id,
+                source="pc",
+                calibration_raw_root=self.calibration_raw_root,
+                calibration_output_root=self.calibration_output_root,
+            )
+            summary["replayVisualizationJson"] = str(cache_path)
+        except Exception as exc:
+            summary["replayVisualizationError"] = str(exc)
+            self._note_close_error("replay_visualization_cache", exc)
+        self._write_summary_safely(summary, "summary_final")
         self.closed = True
         return summary
+
+    def _note_close_error(self, stage: str, exc: Exception) -> None:
+        payload = {
+            "stage": stage,
+            "type": type(exc).__name__,
+            "error": str(exc),
+        }
+        self.close_errors.append(payload)
+        print(
+            f"[session-close-error] record={self.record_id} stage={stage} {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _safe_flush_close_file(self, label: str, handle: Any) -> None:
+        try:
+            handle.flush()
+        except Exception as exc:  # pragma: no cover - defensive close path
+            self._note_close_error(f"{label}_flush", exc)
+        try:
+            handle.close()
+        except Exception as exc:  # pragma: no cover - defensive close path
+            self._note_close_error(f"{label}_close", exc)
+
+    def _write_summary_safely(self, summary: dict[str, Any], stage: str) -> None:
+        if self.close_errors:
+            summary["closeErrors"] = list(self.close_errors)
+        try:
+            self.summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as exc:  # pragma: no cover - defensive close path
+            self._note_close_error(stage, exc)
 
     def summary(self, reason: str) -> dict[str, Any]:
         summary = {
@@ -843,6 +1271,10 @@ class SessionWriter:
             "messages": self.messages,
             "samples": self.samples,
             "lastSampleIndex": self.last_sample_index,
+            "rawMessagesWritten": self.raw_messages_written,
+            "rawSampleSkips": self.raw_sample_skips,
+            "controllerCsvRowsWritten": self.controller_csv_rows_written,
+            "controllerCsvSampleSkips": self.controller_csv_sample_skips,
             "leftPoseSamples": self.left_pose_samples,
             "rightPoseSamples": self.right_pose_samples,
             "leftSources": self.left_sources,
@@ -854,7 +1286,19 @@ class SessionWriter:
             "controllersCsv": str(self.controllers_csv_path),
             "robotRealSenseDirectory": str(self.robot_realsense_directory) if self.robot_realsense_directory is not None else None,
             "robotStartStatus": self.robot_start_status,
+            "writerQueueMax": SESSION_WRITE_QUEUE_MAX,
+            "writerQueueBacklog": self.write_queue.qsize(),
+            "writerDroppedMessages": self.writer_dropped_messages,
+            "writerDroppedOnEnqueue": self.writer_dropped_on_enqueue,
+            "writerDroppedOnClose": self.writer_dropped_on_close,
+            "robotRecordSampleCalls": self.robot_record_sample_calls,
+            "robotRecordSampleSkips": self.robot_record_sample_skips,
+            "writerError": self.writer_error,
         }
+        if self.close_errors:
+            summary["closeErrors"] = list(self.close_errors)
+        if self.last_close_metrics is not None:
+            summary["closeMetrics"] = dict(self.last_close_metrics)
         if self.calibration_snapshot_start is not None:
             summary["calibrationSnapshotAtStart"] = self.calibration_snapshot_start
         if self.calibration_snapshot_end is not None:
@@ -909,8 +1353,10 @@ class SessionWriter:
             reason = self.robot_manager.last_error or "robot free-drag mode is not enabled"
         elif active and active.get("controllerAlignmentRequired") and not active.get("controllerAlignmentAvailable"):
             reason = "recording; Quest-robot alignment is required before right-controller teleop"
+        elif control_mode == ROBOT_SESSION_CONTROL_TELEOP and not controller_motion:
+            reason = self.robot_manager.last_error or "controller teleop is disabled"
         elif not motion_armed:
-            reason = self.robot_manager.last_error or "robot motion is not armed"
+            reason = "recording; hold right middle-finger trigger to teleoperate"
         else:
             reason = "recording; hold right middle-finger trigger to teleoperate"
         return {
@@ -960,13 +1406,14 @@ class LiveTelemetryVisualizer:
         history_limit: int = 1200,
         robot_manager: FlexivRealSenseManager | None = None,
         adb_path: Path | None = None,
+        recording_root: Path | None = None,
         calibration_raw_root: Path | None = None,
         calibration_output_root: Path | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.history_limit = max(1, history_limit)
-        self.recording_root = DEFAULT_OUTPUT_ROOT.resolve()
+        self.recording_root = (recording_root or DEFAULT_OUTPUT_ROOT).resolve()
         self.calibration_raw_root = (calibration_raw_root or DEFAULT_QUEST_LOCAL_ROOT).resolve()
         self.calibration_output_root = (calibration_output_root or DEFAULT_CALIBRATION_OUTPUT_ROOT).resolve()
         self.robot_manager = robot_manager
@@ -975,6 +1422,14 @@ class LiveTelemetryVisualizer:
         self.clients: list[queue.Queue[str | None]] = []
         self.lock = threading.Lock()
         self.calibration_state_cleared = False
+        self.capture_state: dict[str, Any] = {
+            "phase": "live",
+            "recordId": None,
+            "detail": "not recording",
+            "sinceUnixSeconds": time.time(),
+            "updatedUtc": datetime.now(timezone.utc).isoformat(),
+            "source": "pc_receiver",
+        }
         self.udp_status: dict[str, Any] = {
             "listening": False,
             "bind": None,
@@ -989,7 +1444,9 @@ class LiveTelemetryVisualizer:
             "lastSampleIndex": None,
             "lastIsRecording": None,
             "lastBytes": None,
+            "receiveBufferBytes": None,
         }
+        self.next_sample_publish_perf = 0.0
         self.server = self._make_server()
         self.thread = threading.Thread(target=self.server.serve_forever, name="quest-telemetry-visualizer", daemon=True)
 
@@ -1014,15 +1471,28 @@ class LiveTelemetryVisualizer:
         self.server.server_close()
 
     def publish(self, message: dict[str, Any], wrapper: dict[str, Any]) -> None:
+        if message.get("type") == "sample" and not self._claim_sample_publish_slot(wrapper):
+            return
         event = visualizer_event_from_message(message, wrapper)
         if event is None:
             return
         self.publish_event(event)
 
-    def set_udp_listener(self, host: str, port: int) -> None:
+    def _claim_sample_publish_slot(self, wrapper: dict[str, Any]) -> bool:
+        now_perf = wrapper.get("pcReceivePerfCounterSeconds")
+        now_perf = float(now_perf) if is_number(now_perf) else time.perf_counter()
+        period = 1.0 / max(1.0, LIVE_VISUALIZER_SAMPLE_HZ)
+        with self.lock:
+            if now_perf < self.next_sample_publish_perf:
+                return False
+            self.next_sample_publish_perf = now_perf + period
+            return True
+
+    def set_udp_listener(self, host: str, port: int, receive_buffer_bytes: int | None = None) -> None:
         with self.lock:
             self.udp_status["listening"] = True
             self.udp_status["bind"] = f"{host}:{port}"
+            self.udp_status["receiveBufferBytes"] = receive_buffer_bytes
 
     def note_udp_datagram(self, message: dict[str, Any], wrapper: dict[str, Any], byte_count: int) -> None:
         msg_type = str(message.get("type") or "?")
@@ -1042,6 +1512,26 @@ class LiveTelemetryVisualizer:
             self.udp_status["lastSampleIndex"] = message.get("sampleIndex")
             self.udp_status["lastIsRecording"] = is_recording
             self.udp_status["lastBytes"] = int(byte_count)
+
+    def set_capture_state(self, phase: str, record_id: str | None, detail: str, **extra: Any) -> dict[str, Any]:
+        event = {
+            "type": "capture_state",
+            "phase": str(phase or "live"),
+            "recordId": str(record_id) if record_id else None,
+            "detail": str(detail or ""),
+            "sinceUnixSeconds": time.time(),
+            "updatedUtc": datetime.now(timezone.utc).isoformat(),
+            "source": "pc_receiver",
+            **extra,
+        }
+        with self.lock:
+            self.capture_state = dict(event)
+        self.publish_event(event)
+        return event
+
+    def capture_state_payload(self) -> dict[str, Any]:
+        with self.lock:
+            return dict(self.capture_state)
 
     def publish_event(self, event: dict[str, Any]) -> None:
         if event.get("type") in ("calibration_result", "robot_calibration_result"):
@@ -1117,11 +1607,21 @@ class LiveTelemetryVisualizer:
             last_sample = recent_samples[-1] if recent_samples else None
             controller_window = recent_controller_status(recent_samples)
             udp_status = dict(self.udp_status)
+            capture_state = dict(self.capture_state)
         robot_status = self.robot_status_payload()
         camera_status = self.camera_list_payload()
         board_status = self.latest_robot_board_check_payload()
         model_status = rizon4_model_payload()
-        return build_preflight_status(last_sample, controller_window, robot_status, camera_status, board_status, model_status, udp_status)
+        return build_preflight_status(
+            last_sample,
+            controller_window,
+            robot_status,
+            camera_status,
+            board_status,
+            model_status,
+            udp_status,
+            capture_state,
+        )
 
     def robot_board_check_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.robot_manager is None:
@@ -1383,6 +1883,13 @@ class LiveTelemetryVisualizer:
             def log_message(self, format: str, *args: Any) -> None:
                 return
 
+            def _write_response_body(self, data: bytes) -> bool:
+                try:
+                    self.wfile.write(data)
+                    return True
+                except (BrokenPipeError, ConnectionError, ConnectionResetError, ConnectionAbortedError, TimeoutError, OSError):
+                    return False
+
             def _send_html(self) -> None:
                 html = LIVE_VIEWER_HTML.encode("utf-8")
                 self.send_response(200)
@@ -1390,7 +1897,7 @@ class LiveTelemetryVisualizer:
                 self.send_header("Content-Length", str(len(html)))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
-                self.wfile.write(html)
+                self._write_response_body(html)
 
             def _send_recordings_html(self) -> None:
                 html = RECORDINGS_REPLAY_HTML.encode("utf-8")
@@ -1399,7 +1906,7 @@ class LiveTelemetryVisualizer:
                 self.send_header("Content-Length", str(len(html)))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
-                self.wfile.write(html)
+                self._write_response_body(html)
 
             def _send_json(self, payload: dict[str, Any]) -> None:
                 data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -1408,7 +1915,7 @@ class LiveTelemetryVisualizer:
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
-                self.wfile.write(data)
+                self._write_response_body(data)
 
             def _send_robot_camera_frame(self, parsed: Any, default_role: str = "end") -> None:
                 # Keep live preview on the shared stream hub, but do not run per-frame
@@ -1441,7 +1948,7 @@ class LiveTelemetryVisualizer:
                     if board.get("method"):
                         self.send_header("X-Checkerboard-Method", str(board["method"]))
                 self.end_headers()
-                self.wfile.write(data)
+                self._write_response_body(data)
 
             def _send_recording_replay_json(self, parsed: Any) -> None:
                 query = parse_qs(parsed.query)
@@ -1451,12 +1958,19 @@ class LiveTelemetryVisualizer:
                     return
                 try:
                     source = first_query(query, "source")
+                    compact = first_query(query, "compact")
+                    full = first_query(query, "full")
+                    use_compact = not (
+                        str(compact or "").lower() in ("0", "false", "no")
+                        or str(full or "").lower() in ("1", "true", "yes")
+                    )
                     payload = build_recording_replay_payload(
                         visualizer.recording_root,
                         record_id,
                         source=source,
                         calibration_raw_root=visualizer.calibration_raw_root,
                         calibration_output_root=visualizer.calibration_output_root,
+                        compact=use_compact,
                     )
                 except FileNotFoundError as exc:
                     self.send_error(404, str(exc))
@@ -1484,31 +1998,14 @@ class LiveTelemetryVisualizer:
                 if suffix not in ALLOWED_ARTIFACT_SUFFIXES:
                     self.send_error(403, "unsupported artifact type")
                     return
-                size = path.stat().st_size
-                if size > MAX_ARTIFACT_BYTES:
-                    self.send_error(413, "artifact too large")
-                    return
-                if suffix in (".jpg", ".jpeg"):
-                    content_type = "image/jpeg"
-                elif suffix == ".png":
-                    content_type = "image/png"
-                elif suffix == ".mp4":
-                    content_type = "video/mp4"
-                elif suffix == ".html":
-                    content_type = "text/html; charset=utf-8"
-                elif suffix in (".json", ".jsonl"):
-                    content_type = "application/json; charset=utf-8"
-                elif suffix == ".log":
-                    content_type = "text/plain; charset=utf-8"
-                else:
-                    content_type = "application/octet-stream"
-                data = path.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(size))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(data)
+                content_type = artifact_content_type(suffix)
+                try:
+                    send_http_path(self, path, content_type)
+                except ValueError:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{path.stat().st_size}")
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
 
             def _send_urdf(self) -> None:
                 if not DEFAULT_RIZON_URDF.exists():
@@ -1520,7 +2017,7 @@ class LiveTelemetryVisualizer:
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
-                self.wfile.write(data)
+                self._write_response_body(data)
 
             def _send_robot_mesh(self, parsed: Any) -> None:
                 query = parse_qs(parsed.query)
@@ -1550,7 +2047,7 @@ class LiveTelemetryVisualizer:
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
-                self.wfile.write(data)
+                self._write_response_body(data)
 
             def _send_events(self) -> None:
                 self.send_response(200)
@@ -1583,7 +2080,7 @@ class LiveTelemetryVisualizer:
                             visualizer.clients.remove(client)
 
             def _write_sse(self, payload: str) -> None:
-                self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                self._write_response_body(f"data: {payload}\n\n".encode("utf-8"))
 
         return ThreadingHTTPServer((self.host, self.port), Handler)
 
@@ -1640,6 +2137,9 @@ class PcCalibrationSession:
         self.trajectory_file = self.trajectory_path.open("w", encoding="utf-8", newline="\n")
         self.video_writers: dict[str, cv2.VideoWriter] = {}
         self.frame_counts = {"left": 0, "right": 0}
+        self.legacy_flip_vertical_params: set[bool] = set()
+        self.applied_vertical_flips: set[bool] = set()
+        self.pc_receiver_flip_policies: set[str] = set()
         self.sample_count = 0
         self.start_perf = time.perf_counter()
         self.closed = False
@@ -1657,6 +2157,12 @@ class PcCalibrationSession:
                 self.robot_realsense_directory = self.robot_session.directory
             self.robot_start_status = self._robot_start_status("recording" if self.robot_session is not None else "not_recording")
         self.metadata["robotStartStatus"] = self.robot_start_status
+        self.metadata["videoFrameConvention"] = "opencv_top_left_y_down"
+        self.metadata["pcReceiverVideoOrientation"] = "canonical_top_left_y_down"
+        self.metadata["pcReceiverFlipPolicy"] = (
+            "pcReceiverFlipVertical query param when present; otherwise invert legacy Unity flipVertical "
+            "for PC calibration JPEG frames"
+        )
         self.publish_status("recording", 0.0, "PC calibration recording", robotStartStatus=self.robot_start_status)
 
     def write_frame(self, side: str, query: dict[str, list[str]], body: bytes) -> None:
@@ -1668,18 +2174,28 @@ class PcCalibrationSession:
             camera_ts = float_param(query, "cameraTimestampSeconds", -1.0)
             width = int_param(query, "width", 0)
             height = int_param(query, "height", 0)
-            flip_vertical = bool_param(query, "flipVertical", True)
+            legacy_flip_vertical = bool_param(query, "flipVertical", True)
+            explicit_receiver_flip = first_query(query, "pcReceiverFlipVertical")
+            if explicit_receiver_flip is None:
+                applied_vertical_flip = not legacy_flip_vertical
+                flip_policy = "legacy_flipVertical_inverted"
+            else:
+                applied_vertical_flip = bool_param(query, "pcReceiverFlipVertical", False)
+                flip_policy = "explicit_pcReceiverFlipVertical"
             pose = float_list_param(query, "pose")
 
             array = np.frombuffer(body, dtype=np.uint8)
             frame = cv2.imdecode(array, cv2.IMREAD_COLOR)
             if frame is None:
                 raise ValueError("could not decode JPEG frame")
-            if flip_vertical:
+            if applied_vertical_flip:
                 frame = cv2.flip(frame, 0)
             if width > 0 and height > 0 and (frame.shape[1] != width or frame.shape[0] != height):
                 frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
 
+            self.legacy_flip_vertical_params.add(bool(legacy_flip_vertical))
+            self.applied_vertical_flips.add(bool(applied_vertical_flip))
+            self.pc_receiver_flip_policies.add(flip_policy)
             writer = self._video_writer(side, frame.shape[1], frame.shape[0])
             writer.write(frame)
             row = {
@@ -1687,6 +2203,10 @@ class PcCalibrationSession:
                 "cameraTimestampSeconds": camera_ts,
                 "unityTimestampSeconds": unity_ts,
                 "pose": pose,
+                "legacyFlipVerticalParam": legacy_flip_vertical,
+                "appliedVerticalFlip": applied_vertical_flip,
+                "pcReceiverFlipPolicy": flip_policy,
+                "videoFrameConvention": "opencv_top_left_y_down",
             }
             target = self.left_frames_file if side == "left" else self.right_frames_file
             target.write(json_line(row))
@@ -1732,6 +2252,9 @@ class PcCalibrationSession:
             self.metadata["leftFrameCount"] = self.frame_counts["left"]
             self.metadata["rightFrameCount"] = self.frame_counts["right"]
             self.metadata["trajectorySampleCount"] = self.sample_count
+            self.metadata["legacyFlipVerticalParams"] = sorted(self.legacy_flip_vertical_params)
+            self.metadata["appliedVerticalFlips"] = sorted(self.applied_vertical_flips)
+            self.metadata["pcReceiverFlipPolicies"] = sorted(self.pc_receiver_flip_policies)
             self.metadata["recordingQualitySummary"] = self._quality_summary()
             robot_session = self.robot_session
             self.robot_session = None
@@ -1837,8 +2360,10 @@ class PcCalibrationSession:
             reason = self.robot_manager.last_error or "robot free-drag mode is not enabled"
         elif active and active.get("controllerAlignmentRequired") and not active.get("controllerAlignmentAvailable"):
             reason = "recording; Quest-robot alignment is required before right-controller teleop"
+        elif control_mode == ROBOT_SESSION_CONTROL_TELEOP and not controller_motion:
+            reason = self.robot_manager.last_error or "controller teleop is disabled"
         elif not motion_armed:
-            reason = self.robot_manager.last_error or "robot motion is not armed"
+            reason = "recording; hold right middle-finger trigger to teleoperate"
         else:
             reason = "recording; hold right middle-finger trigger to teleoperate"
         return {
@@ -1917,6 +2442,8 @@ class PcCalibrationSession:
             str(self.calibration_options.get("diverse_rotation_scale", 3.0)),
             "--diverse-min-score",
             str(self.calibration_options.get("diverse_min_score", 0.75)),
+            "--image-y-axis",
+            "down",
         ]
         if bool(self.calibration_options.get("disable_diverse_frame_selection", False)):
             command.append("--disable-diverse-frame-selection")
@@ -2084,22 +2611,27 @@ class PcCalibrationHttpReceiver:
     def publish_calibration_rejected(self, record_id: str, preflight: dict[str, Any]) -> None:
         if self.visualizer is None:
             return
-        failed = [
-            check
-            for check in preflight.get("checks", [])
-            if isinstance(check, dict) and check.get("required", True) and not check.get("ok")
-        ]
-        detail = "; ".join(
-            f"{check.get('label') or check.get('id')}: {check.get('detail') or 'not ready'}"
-            for check in failed
-        )
+        if preflight.get("error") == "capture_busy":
+            detail = str(preflight.get("captureState", {}).get("detail") or "capture is busy")
+            message = "B calibration start rejected: PC is recording or saving"
+        else:
+            failed = [
+                check
+                for check in preflight.get("checks", [])
+                if isinstance(check, dict) and check.get("required", True) and not check.get("ok")
+            ]
+            detail = "; ".join(
+                f"{check.get('label') or check.get('id')}: {check.get('detail') or 'not ready'}"
+                for check in failed
+            )
+            message = "B calibration start rejected: preflight is not ready"
         self.visualizer.publish_event(
             {
                 "type": "calibration_status",
                 "recordId": record_id,
                 "stage": "rejected",
                 "progress": 0.0,
-                "message": "B calibration start rejected: preflight is not ready",
+                "message": message,
                 "preflight": preflight,
                 "detail": detail,
             }
@@ -2141,6 +2673,18 @@ class PcCalibrationHttpReceiver:
             def _handle_start(self, body: bytes) -> None:
                 message = json.loads(body.decode("utf-8"))
                 record_id = sanitize_name(str(message.get("recordId") or f"record_pc_calib_{datetime.now():%Y%m%d_%H%M%S}"))
+                if receiver.visualizer is not None:
+                    capture_state = receiver.visualizer.capture_state_payload()
+                    if capture_state.get("phase") in ("recording", "saving"):
+                        payload = {
+                            "ok": False,
+                            "error": "capture_busy",
+                            "recordId": record_id,
+                            "captureState": capture_state,
+                        }
+                        receiver.visualizer.publish_calibration_rejected(record_id, payload)
+                        self._json_response(payload, status=409)
+                        return
                 allow_unready = bool(
                     message.get("allowUnready")
                     or message.get("startAnyway")
@@ -2173,6 +2717,8 @@ class PcCalibrationHttpReceiver:
                     )
                     receiver.sessions[record_id] = session
                 print(f"Started PC calibration raw record: {session.directory}", flush=True)
+                if receiver.visualizer is not None:
+                    receiver.visualizer.set_capture_state("recording", record_id, "B calibration recording")
                 self._json_response({
                     "ok": True,
                     "recordId": record_id,
@@ -2212,8 +2758,17 @@ class PcCalibrationHttpReceiver:
                 if session is None:
                     self._json_response({"ok": False, "error": "unknown_record"})
                     return
+                if receiver.visualizer is not None:
+                    receiver.visualizer.set_capture_state("saving", record_id, "Saving B calibration recording")
                 summary = session.close(message)
                 print(f"Stopped PC calibration raw record: {summary}", flush=True)
+                if receiver.visualizer is not None:
+                    receiver.visualizer.set_capture_state(
+                        "live",
+                        record_id,
+                        "B calibration saved",
+                        summary=summary,
+                    )
                 self._json_response({"ok": True, "summary": summary})
 
             def _json_response(self, payload: dict[str, Any], status: int = 200) -> None:
@@ -2223,7 +2778,7 @@ class PcCalibrationHttpReceiver:
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
-                self.wfile.write(data)
+                write_http_body_safely(self, data)
 
         return ThreadingHTTPServer((self.host, self.port), Handler)
 
@@ -2244,6 +2799,9 @@ def receive(args: argparse.Namespace) -> int:
                 width=args.realsense_width,
                 height=args.realsense_height,
                 fps=args.realsense_fps,
+                robot_state_hz=args.robot_state_hz,
+                record_depth=not args.no_record_realsense_depth,
+                record_depth_every_n_frames=max(1, int(args.record_realsense_depth_every_n_frames)),
                 realsense_auto_exposure=not args.realsense_manual_exposure,
                 realsense_exposure=args.realsense_exposure,
                 realsense_gain=args.realsense_gain,
@@ -2256,9 +2814,7 @@ def receive(args: argparse.Namespace) -> int:
                 hand_eye_diverse_min_score=args.hand_eye_diverse_min_score,
                 hand_eye_disable_diverse_selection=args.disable_hand_eye_diverse_selection,
                 controller_translation_scale=args.controller_motion_scale,
-                controller_max_offset_m=args.controller_motion_max_offset,
                 controller_max_step_m=args.controller_motion_max_step,
-                controller_max_rotation_deg=args.controller_motion_max_rotation,
                 controller_max_rotation_step_deg=args.controller_motion_max_rotation_step,
                 controller_joint_limit_buffer_rad=args.controller_joint_limit_buffer,
                 controller_joint_limit_guard_enabled=not args.disable_controller_joint_limit_guard,
@@ -2270,6 +2826,7 @@ def receive(args: argparse.Namespace) -> int:
                 gripper_force_n=args.gripper_force,
                 gripper_trigger_close_threshold=args.gripper_trigger_close_threshold,
                 gripper_trigger_open_threshold=args.gripper_trigger_open_threshold,
+                gripper_init_on_enable=args.gripper_init_on_enable,
             )
         )
     visualizer = None
@@ -2280,6 +2837,7 @@ def receive(args: argparse.Namespace) -> int:
             args.visualize_history,
             robot_manager,
             args.viewer_adb,
+            output_root,
             args.calibration_raw_root.resolve(),
             args.calibration_output_root.resolve(),
         )
@@ -2299,30 +2857,166 @@ def receive(args: argparse.Namespace) -> int:
         calibration_receiver.start()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    requested_rcvbuf = max(0, int(args.udp_receive_buffer_bytes or 0))
+    if requested_rcvbuf > 0:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, requested_rcvbuf)
+    actual_rcvbuf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
     sock.settimeout(0.25)
     sock.bind((args.host, args.port))
     if visualizer is not None:
-        visualizer.set_udp_listener(args.host, int(args.port))
+        visualizer.set_udp_listener(args.host, int(args.port), actual_rcvbuf)
 
-    print(f"Listening on udp://{args.host}:{args.port}", flush=True)
+    print(f"Listening on udp://{args.host}:{args.port} rcvbuf={actual_rcvbuf}", flush=True)
     print(f"PC recording root: {output_root}", flush=True)
 
     active: SessionWriter | None = None
     recently_closed_records: dict[str, dict[str, Any]] = {}
+    recently_closed_lock = threading.Lock()
+    saving_record_id: str | None = None
+    close_threads: list[threading.Thread] = []
     total_messages = 0
     total_samples = 0
     last_datagram_perf = time.perf_counter()
+    last_active_recording_perf: float | None = None
+    last_sample_log_perf = float("-inf")
+
+    def remember_recently_closed(record_id: str, payload: dict[str, Any]) -> None:
+        with recently_closed_lock:
+            recently_closed_records[record_id] = dict(payload)
+
+    def prune_and_get_recently_closed(record_id: str, now_perf: float) -> dict[str, Any] | None:
+        with recently_closed_lock:
+            expired = [
+                key
+                for key, value in recently_closed_records.items()
+                if now_perf - float(value.get("closedPerfCounterSeconds", 0.0))
+                > RECENTLY_CLOSED_RECORD_REOPEN_GUARD_SECONDS
+            ]
+            for key in expired:
+                recently_closed_records.pop(key, None)
+            value = recently_closed_records.get(record_id)
+            return dict(value) if isinstance(value, dict) else None
+
+    def finalize_session(
+        session: SessionWriter,
+        reason: str,
+        *,
+        saving_detail: str,
+        closed_perf_counter: float | None = None,
+        async_close: bool | None = None,
+    ) -> dict[str, Any]:
+        nonlocal saving_record_id
+        closed_record_id = session.record_id
+        saving_record_id = closed_record_id
+        if visualizer is not None:
+            visualizer.set_capture_state("saving", closed_record_id, saving_detail)
+
+        def close_work() -> dict[str, Any]:
+            nonlocal saving_record_id
+            try:
+                summary = session.close(reason)
+                print_session_summary(summary, stream=sys.stderr)
+                handle_post_recording(summary, args)
+                remember_recently_closed(
+                    closed_record_id,
+                    {
+                        "closedPerfCounterSeconds": closed_perf_counter or time.perf_counter(),
+                        "lastSampleIndex": summary.get("lastSampleIndex"),
+                        "reason": summary.get("closedReason"),
+                    },
+                )
+                if visualizer is not None:
+                    visualizer.set_capture_state("live", closed_record_id, "PC recording saved", summary=summary)
+                return summary
+            except Exception as exc:  # pragma: no cover - defensive close path
+                error_summary = {
+                    "recordId": closed_record_id,
+                    "sessionDirectory": str(session.directory),
+                    "closedReason": reason,
+                    "closeError": f"{type(exc).__name__}: {exc}",
+                }
+                print(
+                    f"[session-close-fatal] record={closed_record_id} {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                remember_recently_closed(
+                    closed_record_id,
+                    {
+                        "closedPerfCounterSeconds": closed_perf_counter or time.perf_counter(),
+                        "lastSampleIndex": getattr(session, "last_sample_index", None),
+                        "reason": reason,
+                        "error": error_summary["closeError"],
+                    },
+                )
+                if visualizer is not None:
+                    visualizer.set_capture_state(
+                        "live",
+                        closed_record_id,
+                        "PC recording save failed",
+                        summary=error_summary,
+                    )
+                return error_summary
+            finally:
+                if saving_record_id == closed_record_id:
+                    saving_record_id = None
+
+        if async_close is None:
+            async_close = not bool(args.single_session)
+        if not async_close:
+            return close_work()
+
+        thread = threading.Thread(
+            target=close_work,
+            name=f"pc-session-close-{sanitize_name(closed_record_id)}",
+            daemon=True,
+        )
+        thread.start()
+        close_threads.append(thread)
+        close_threads[:] = [item for item in close_threads if item.is_alive()]
+        return {
+            "recordId": closed_record_id,
+            "sessionDirectory": str(session.directory),
+            "closedReason": reason,
+            "savingAsync": True,
+        }
 
     try:
         while True:
             try:
                 data, remote = sock.recvfrom(65535)
             except TimeoutError:
+                now_perf = time.perf_counter()
+                idle_timeout = max(0.0, float(args.recording_idle_timeout_seconds or 0.0))
+                if (
+                    active is not None
+                    and idle_timeout > 0
+                    and last_active_recording_perf is not None
+                    and now_perf - last_active_recording_perf >= idle_timeout
+                ):
+                    closed_record_id = active.record_id
+                    summary = finalize_session(
+                        active,
+                        "recording_idle_timeout",
+                        saving_detail="Saving PC recording after idle timeout",
+                        closed_perf_counter=now_perf,
+                    )
+                    active = None
+                    last_active_recording_perf = None
+                    if args.single_session:
+                        return 0
+                    continue
                 if args.timeout is not None and time.perf_counter() - last_datagram_perf >= args.timeout:
                     if active is not None:
-                        summary = active.close("timeout")
-                        print_session_summary(summary, stream=sys.stderr)
-                        handle_post_recording(summary, args)
+                        closed_record_id = active.record_id
+                        finalize_session(
+                            active,
+                            "timeout",
+                            saving_detail="Saving PC recording after timeout",
+                            closed_perf_counter=time.perf_counter(),
+                        )
+                        active = None
+                        last_active_recording_perf = None
                     if total_messages == 0:
                         print(f"Timed out with no UDP telemetry after {args.timeout:.3f}s.", file=sys.stderr)
                         return 2
@@ -2352,32 +3046,29 @@ def receive(args: argparse.Namespace) -> int:
             is_sample = msg_type == "sample"
             is_recording_sample = bool(message.get("isRecording", True))
             should_write = (not is_sample) or is_recording_sample or args.record_live_preview
-            recently_closed_records = {
-                key: value
-                for key, value in recently_closed_records.items()
-                if pc_receive_perf_counter_seconds - float(value.get("closedPerfCounterSeconds", 0.0))
-                <= LATE_RECORDING_SAMPLE_GRACE_SECONDS
-            }
-            recently_closed = recently_closed_records.get(record_id)
-            last_closed_sample_index = (
-                recently_closed.get("lastSampleIndex")
-                if isinstance(recently_closed, dict)
-                else None
-            )
+            is_stop_like_sample = is_sample and active is not None and active.record_id == record_id and not is_recording_sample
+            recently_closed = prune_and_get_recently_closed(record_id, pc_receive_perf_counter_seconds)
             sample_index = message.get("sampleIndex")
             is_late_closed_record_sample = (
                 is_sample
                 and is_recording_sample
                 and active is None
                 and recently_closed is not None
-                and (
-                    not is_number(last_closed_sample_index)
-                    or not is_number(sample_index)
-                    or int(sample_index) <= int(last_closed_sample_index)
-                )
             )
             if is_late_closed_record_sample:
                 should_write = False
+            if msg_type == "recording_start" and active is None and recently_closed is not None:
+                should_write = False
+            if active is None and saving_record_id is not None and (msg_type == "recording_start" or is_sample):
+                should_write = False
+            suppress_visualizer_event = bool(
+                active is None
+                and (recently_closed is not None or saving_record_id is not None)
+                and (
+                    msg_type == "recording_start"
+                    or (is_sample and is_recording_sample)
+                )
+            )
 
             wrapper = {
                 "pcReceiveUtc": datetime.fromtimestamp(pc_receive_unix_seconds, timezone.utc).isoformat(),
@@ -2392,17 +3083,77 @@ def receive(args: argparse.Namespace) -> int:
 
             if visualizer is not None:
                 visualizer.note_udp_datagram(message, wrapper, len(data))
-                visualizer.publish(message, wrapper)
+
+            if msg_type == "recording_stop" or is_stop_like_sample:
+                if active is not None and record_id == active.record_id:
+                    closed_record_id = active.record_id
+                    close_reason = "recording_stop" if msg_type == "recording_stop" else "recording_false_sample"
+                    finalize_session(
+                        active,
+                        close_reason,
+                        saving_detail="Saving PC recording",
+                        closed_perf_counter=time.perf_counter(),
+                    )
+                    active = None
+                    last_active_recording_perf = None
+                elif visualizer is not None:
+                    visualizer.publish_event(
+                        {
+                            "type": "capture_rejected",
+                            "recordId": record_id,
+                            "reason": "stop_without_active_session",
+                            "messageType": msg_type,
+                            "sampleIndex": sample_index,
+                        }
+                    )
+                if args.single_session:
+                    return 0
+                continue
 
             can_open_session = should_write and (msg_type == "recording_start" or is_sample)
+            if can_open_session and saving_record_id is not None:
+                can_open_session = False
+                should_write = False
+                if visualizer is not None:
+                    visualizer.publish_event(
+                        {
+                            "type": "capture_rejected",
+                            "recordId": record_id,
+                            "reason": "capture_saving",
+                            "savingRecordId": saving_record_id,
+                            "messageType": msg_type,
+                            "sampleIndex": sample_index,
+                        }
+                    )
+            if can_open_session and visualizer is not None:
+                capture_state = visualizer.capture_state_payload()
+                if capture_state.get("phase") == "saving":
+                    can_open_session = False
+                    should_write = False
+                    visualizer.publish_event(
+                        {
+                            "type": "capture_rejected",
+                            "recordId": record_id,
+                            "reason": "capture_saving",
+                            "captureState": capture_state,
+                            "messageType": msg_type,
+                            "sampleIndex": sample_index,
+                        }
+                    )
             if can_open_session and (active is None or (
                 msg_type == "recording_start"
                 and active.record_id != record_id
                 and active.messages > 0
             )):
                 if active is not None:
-                    summary = active.close("superseded_by_new_recording_start")
-                    print_session_summary(summary, stream=sys.stderr)
+                    closed_record_id = active.record_id
+                    finalize_session(
+                        active,
+                        "superseded_by_new_recording_start",
+                        saving_detail=f"Saving PC recording before starting {record_id}",
+                        closed_perf_counter=time.perf_counter(),
+                        async_close=False,
+                    )
                     if args.single_session:
                         return 0
 
@@ -2414,19 +3165,46 @@ def receive(args: argparse.Namespace) -> int:
                     pc_receive_unix_seconds,
                     pc_receive_perf_counter_seconds,
                     args.flush_every,
+                    args.flush_interval_seconds,
                     args.calibration_output_root.resolve() if not args.no_calibration_http else None,
                     args.calibration_raw_root.resolve() if not args.no_calibration_http else None,
                     robot_manager,
                     visualizer,
                 )
+                last_active_recording_perf = pc_receive_perf_counter_seconds
                 print(f"Started PC session: {active.directory}", flush=True)
+                if visualizer is not None:
+                    visualizer.set_capture_state("recording", record_id, "PC formal recording")
+
+            if active is not None and record_id == active.record_id and (
+                msg_type == "recording_start" or (is_sample and is_recording_sample)
+            ):
+                last_active_recording_perf = pc_receive_perf_counter_seconds
 
             if should_write and active is not None:
-                active.write(wrapper)
+                try:
+                    active.write(wrapper)
+                except Exception as exc:
+                    print(
+                        f"[session-write-error] record={active.record_id} type={msg_type} error={exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            if visualizer is not None and not suppress_visualizer_event:
+                visualizer.publish(message, wrapper)
             total_messages += 1
 
             if is_sample:
                 if not args.quiet:
+                    log_interval = max(0.0, float(args.sample_log_interval_seconds))
+                    should_log_sample = (
+                        log_interval <= 0.0
+                        or pc_receive_perf_counter_seconds - last_sample_log_perf >= log_interval
+                    )
+                else:
+                    should_log_sample = False
+                if should_log_sample:
+                    last_sample_log_perf = pc_receive_perf_counter_seconds
                     left = message.get("leftController")
                     right = message.get("rightController")
                     mode = message.get("telemetryMode") or ("recording" if is_recording_sample else "live_preview")
@@ -2447,27 +3225,20 @@ def receive(args: argparse.Namespace) -> int:
                     print_session_summary(summary, stream=sys.stderr)
                 return 0
 
-            if msg_type == "recording_stop":
-                if active is not None:
-                    closed_record_id = active.record_id
-                    summary = active.close("recording_stop")
-                    print_session_summary(summary, stream=sys.stderr)
-                    handle_post_recording(summary, args)
-                    active = None
-                    recently_closed_records[closed_record_id] = {
-                        "closedPerfCounterSeconds": pc_receive_perf_counter_seconds,
-                        "lastSampleIndex": summary.get("lastSampleIndex"),
-                    }
-                if args.single_session:
-                    return 0
-
     except KeyboardInterrupt:
         print("Interrupted.", flush=True)
         if active is not None:
-            summary = active.close("keyboard_interrupt")
-            print_session_summary(summary, stream=sys.stderr)
+            closed_record_id = active.record_id
+            finalize_session(
+                active,
+                "keyboard_interrupt",
+                saving_detail="Saving PC recording after interrupt",
+                async_close=False,
+            )
         return 130
     finally:
+        for thread in list(close_threads):
+            thread.join(timeout=SESSION_CLOSE_THREAD_JOIN_SECONDS)
         sock.close()
         if calibration_receiver is not None:
             calibration_receiver.stop()
@@ -2814,6 +3585,242 @@ def diagnose_gaze_depth(args: argparse.Namespace) -> int:
         print(f"Wrote gaze-depth diagnostic JSON: {args.output_json}", flush=True)
 
     return 0
+
+
+def audit_performance(args: argparse.Namespace) -> int:
+    session_dir = resolve_performance_audit_session(args.pc_session, args.output_root)
+    pc_summary = read_json_if_exists(session_dir / "pc_session_summary.json")
+    if not isinstance(pc_summary, dict):
+        pc_summary = {}
+    robot_summary = robot_realsense_record_summary(session_dir)
+    thresholds = {
+        "minRobotTargetRatio": float(args.min_robot_target_ratio),
+        "minCameraTargetRatio": float(args.min_camera_target_ratio),
+        "maxCameraDropRatio": float(args.max_camera_drop_ratio),
+        "maxCameraLatencyP95Seconds": float(args.max_camera_latency_p95_seconds),
+    }
+    audit = build_performance_audit(session_dir, robot_summary, thresholds, pc_summary=pc_summary)
+    if args.output_json is not None:
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        args.output_json.write_text(json.dumps(audit, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"Wrote performance audit JSON: {args.output_json}", flush=True)
+    print_performance_audit(audit)
+    return 0 if audit.get("ok") else 1
+
+
+def resolve_performance_audit_session(pc_session: Path | None, output_root: Path) -> Path:
+    if pc_session is not None:
+        path = pc_session.resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"PC session path not found: {path}")
+        return path.parent if path.is_file() else path
+    root = output_root.resolve()
+    candidates = [item for item in root.iterdir() if item.is_dir() and item.name.startswith("record_")] if root.exists() else []
+    if not candidates:
+        raise FileNotFoundError(f"No record_* folders under {root}")
+    return max(candidates, key=lambda item: item.stat().st_mtime)
+
+
+def pc_recording_integrity_checks(pc_summary: dict[str, Any]) -> list[dict[str, Any]]:
+    if not pc_summary:
+        return [
+            audit_item(
+                "pc_summary_present",
+                "PC session summary present",
+                False,
+                "pc_session_summary.json missing or invalid",
+            )
+        ]
+    close_errors = pc_summary.get("closeErrors") if isinstance(pc_summary.get("closeErrors"), list) else []
+    writer_error = pc_summary.get("writerError")
+    dropped = finite_int(pc_summary.get("writerDroppedMessages"), 0)
+    replay_cache = pc_summary.get("replayVisualizationJson")
+    replay_cache_ok = isinstance(replay_cache, str) and Path(replay_cache).exists()
+    checks = [
+        audit_item(
+            "pc_summary_present",
+            "PC session summary present",
+            True,
+            f"closedReason={pc_summary.get('closedReason') or 'n/a'}",
+        ),
+        audit_item(
+            "pc_writer_no_drops",
+            "PC writer queue drops",
+            dropped == 0,
+            f"{dropped} dropped message(s)",
+        ),
+        audit_item(
+            "pc_writer_no_error",
+            "PC writer background errors",
+            not writer_error,
+            "none" if not writer_error else str(writer_error),
+        ),
+        audit_item(
+            "pc_close_errors",
+            "PC close/save errors",
+            len(close_errors) == 0,
+            f"{len(close_errors)} close error(s)",
+            closeErrors=close_errors[:8],
+        ),
+        audit_item(
+            "pc_replay_cache",
+            "Replay visualization cache",
+            replay_cache_ok,
+            str(replay_cache) if replay_cache else "missing replayVisualizationJson",
+        ),
+    ]
+    return checks
+
+
+def build_performance_audit(
+    session_dir: Path,
+    robot_summary: dict[str, Any] | None,
+    thresholds: dict[str, float],
+    *,
+    pc_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    payload: dict[str, Any] = {
+        "ok": False,
+        "recordId": session_dir.name,
+        "sessionDirectory": str(session_dir),
+        "thresholds": thresholds,
+        "checks": checks,
+        "robotSummary": robot_summary,
+        "pcSummary": pc_summary,
+    }
+    pc_summary = pc_summary if isinstance(pc_summary, dict) else {}
+    checks.extend(pc_recording_integrity_checks(pc_summary))
+    if not isinstance(robot_summary, dict):
+        checks.append(
+            audit_item(
+                "robot_realsense_present",
+                "Robot/RealSense recording present",
+                False,
+                "missing robot_realsense folder or session summary",
+            )
+        )
+        payload["summary"] = audit_summary_text(checks)
+        return payload
+
+    checks.append(
+        audit_item(
+            "robot_realsense_present",
+            "Robot/RealSense recording present",
+            True,
+            f"status {robot_summary.get('status') or 'n/a'}",
+        )
+    )
+    performance = effective_performance_payload(
+        robot_summary.get("performance") if isinstance(robot_summary.get("performance"), dict) else {}
+    )
+    robot_perf = performance.get("robotState") if isinstance(performance.get("robotState"), dict) else {}
+    robot_ratio = robot_perf.get("targetRatio")
+    checks.append(
+        audit_item(
+            "robot_state_rate",
+            "Robot state effective rate",
+            bool(is_number(robot_ratio) and float(robot_ratio) >= thresholds["minRobotTargetRatio"]),
+            robot_rate_detail(robot_perf),
+            performance=robot_perf,
+        )
+    )
+    robot_gap = robot_perf.get("gapSeconds") if isinstance(robot_perf.get("gapSeconds"), dict) else {}
+    if isinstance(robot_gap, dict) and is_number(robot_gap.get("p95")):
+        target_hz = max(1e-6, finite_float(robot_perf.get("targetHz"), 90.0))
+        checks.append(
+            audit_item(
+                "robot_state_gap_p95",
+                "Robot state p95 gap",
+                float(robot_gap["p95"]) <= (2.5 / target_hz),
+                f"gap p95 {format_seconds(robot_gap.get('p95'))}",
+                performance=robot_gap,
+                required=False,
+            )
+        )
+
+    camera_perf = performance.get("cameras") if isinstance(performance.get("cameras"), dict) else {}
+    close_errors = robot_summary.get("closeErrors") if isinstance(robot_summary.get("closeErrors"), list) else []
+    checks.append(
+        audit_item(
+            "robot_close_errors",
+            "Robot/RealSense close errors",
+            len(close_errors) == 0,
+            f"{len(close_errors)} close error(s)",
+            closeErrors=close_errors[:8],
+        )
+    )
+    alive_threads = robot_summary.get("cameraWriterThreadsAliveOnClose")
+    alive_roles = [
+        str(role)
+        for role, alive in (alive_threads.items() if isinstance(alive_threads, dict) else [])
+        if alive
+    ]
+    checks.append(
+        audit_item(
+            "camera_writer_threads_closed",
+            "Camera writer threads closed",
+            not alive_roles,
+            "all camera writer threads closed" if not alive_roles else "alive roles: " + ", ".join(alive_roles),
+        )
+    )
+    if not camera_perf:
+        checks.append(audit_item("camera_streams", "Camera streams", False, "no camera performance rows"))
+    for role, role_perf_value in sorted(camera_perf.items()):
+        role_perf = role_perf_value if isinstance(role_perf_value, dict) else {}
+        video_perf = role_perf.get("video") if isinstance(role_perf.get("video"), dict) else {}
+        video_ratio = video_perf.get("targetRatio")
+        drop_ratio = role_perf.get("queueDropRatio")
+        latency = (
+            role_perf.get("captureToWriteLatencySeconds")
+            if isinstance(role_perf.get("captureToWriteLatencySeconds"), dict)
+            else {}
+        )
+        latency_p95 = latency.get("p95") if isinstance(latency, dict) else None
+        checks.append(
+            audit_item(
+                f"camera_{role}_rate",
+                f"{role} camera effective rate",
+                bool(is_number(video_ratio) and float(video_ratio) >= thresholds["minCameraTargetRatio"]),
+                camera_rate_detail(role, role_perf),
+                performance=role_perf,
+            )
+        )
+        checks.append(
+            audit_item(
+                f"camera_{role}_drop",
+                f"{role} camera queue drops",
+                bool((not is_number(drop_ratio)) or float(drop_ratio) <= thresholds["maxCameraDropRatio"]),
+                camera_queue_detail(role, role_perf),
+                performance=role_perf,
+            )
+        )
+        if is_number(latency_p95):
+            checks.append(
+                audit_item(
+                    f"camera_{role}_latency_p95",
+                    f"{role} camera capture-to-write latency p95",
+                    float(latency_p95) <= thresholds["maxCameraLatencyP95Seconds"],
+                    f"{role}: latency p95 {format_seconds(latency_p95)}",
+                    performance=latency,
+                )
+            )
+
+    payload["ok"] = all(check.get("ok") or check.get("required") is False for check in checks)
+    payload["summary"] = audit_summary_text(checks)
+    payload["performance"] = performance
+    return payload
+
+
+def print_performance_audit(audit: dict[str, Any]) -> None:
+    print(
+        f"Performance audit {audit.get('recordId')}: "
+        f"{'PASS' if audit.get('ok') else 'FAIL'} ({audit.get('summary')})",
+        flush=True,
+    )
+    for check in audit.get("checks") or []:
+        status = "ok" if check.get("ok") else "FAIL"
+        print(f"  [{status}] {check.get('label')}: {check.get('detail')}", flush=True)
 
 
 def resolve_quest_trajectory(path: Path) -> Path:
@@ -3312,6 +4319,8 @@ def recording_replay_list(
             )
             if record is None:
                 continue
+            if is_late_tail_record(record):
+                continue
             sample_count = int(record["samples"]) if is_number(record.get("samples")) else 0
             has_calibration = bool(record.get("hasCalibrationSnapshot"))
             sortable_records.append(((1 if has_calibration else 0, sample_count, directory.stat().st_mtime), record))
@@ -3365,6 +4374,18 @@ def recording_replay_list_record(
     }
 
 
+def is_late_tail_record(record: dict[str, Any]) -> bool:
+    record_id = str(record.get("recordId") or "")
+    if not record_id.rsplit("_", 1)[-1].isdigit():
+        return False
+    samples = int(record.get("samples") or 0) if is_number(record.get("samples")) else 0
+    if samples > 3:
+        return False
+    if record.get("closedReason") != "recording_idle_timeout":
+        return False
+    return True
+
+
 def robot_realsense_record_summary(session_dir: Path) -> dict[str, Any] | None:
     robot_dir = session_dir / "robot_realsense"
     if not robot_dir.exists():
@@ -3393,6 +4414,7 @@ def robot_realsense_record_summary(session_dir: Path) -> dict[str, Any] | None:
     else:
         counts = {}
         diversity = session.get("poseDiversity")
+    performance = robot_realsense_performance_summary(robot_dir, session, config)
     last_motion = session.get("lastMotion") if isinstance(session.get("lastMotion"), dict) else {}
     residual = None
     if isinstance(result, dict):
@@ -3406,11 +4428,22 @@ def robot_realsense_record_summary(session_dir: Path) -> dict[str, Any] | None:
     return {
         "status": status,
         "samples": session.get("samples"),
+        "questAlignedSamples": session.get("questAlignedSamples"),
+        "robotStateSamples": session.get("robotStateSamples"),
         "images": session.get("images"),
+        "videoFrames": session.get("videoFrames"),
+        "depthFrames": session.get("depthFrames"),
+        "recordDepth": config.get("recordDepth"),
+        "recordDepthEveryNFrames": config.get("recordDepthEveryNFrames"),
+        "performance": performance,
         "motionCommands": session.get("motionCommands"),
         "motionSkips": session.get("motionSkips"),
         "motionErrors": session.get("motionErrors"),
         "lastMotionReason": last_motion.get("reason") or last_motion.get("error"),
+        "closeErrors": session.get("closeErrors") if isinstance(session.get("closeErrors"), list) else [],
+        "cameraWriterThreadsAliveOnClose": session.get("cameraWriterThreadsAliveOnClose")
+        if isinstance(session.get("cameraWriterThreadsAliveOnClose"), dict)
+        else {},
         "detections": counts.get("detections") if isinstance(counts, dict) else None,
         "requiredDetections": config.get("minHandEyeDetections"),
         "translationSpanM": diversity.get("eeTranslationSpanM") if isinstance(diversity, dict) else None,
@@ -3418,6 +4451,87 @@ def robot_realsense_record_summary(session_dir: Path) -> dict[str, Any] | None:
         "residualMedianMm": residual.get("median") if isinstance(residual, dict) else None,
         "failureReason": failure.get("error") if isinstance(failure, dict) else None,
     }
+
+
+def robot_realsense_performance_summary(
+    robot_dir: Path,
+    session: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    existing = session.get("performance") if isinstance(session.get("performance"), dict) else None
+    robot_states = read_jsonl_relaxed(robot_dir / "robot_states.jsonl")
+    video_frames = read_jsonl_relaxed(robot_dir / "video_frames.jsonl")
+    target_robot_hz = max(1e-6, finite_float(config.get("robotStateHz") or session.get("robotStateHz"), 90.0))
+    target_camera_hz = max(1e-6, finite_float(config.get("fps"), 30.0))
+    depth_every = max(1, finite_int(config.get("recordDepthEveryNFrames"), 1))
+    record_depth = config.get("recordDepth") is not False
+    target_depth_hz = target_camera_hz / depth_every if record_depth else 0.0
+
+    robot_times = [float(row["pc_perf_counter_seconds"]) for row in robot_states if is_number(row.get("pc_perf_counter_seconds"))]
+    by_role: dict[str, list[dict[str, Any]]] = {}
+    for row in video_frames:
+        role = str(row.get("role") or "camera")
+        by_role.setdefault(role, []).append(row)
+    cameras: dict[str, Any] = {}
+    queue_drops = session.get("cameraQueueDrops") if isinstance(session.get("cameraQueueDrops"), dict) else {}
+    subscriber_drops = (
+        session.get("cameraSubscriberDrops")
+        if isinstance(session.get("cameraSubscriberDrops"), dict)
+        else {}
+    )
+    for role, rows in sorted(by_role.items()):
+        video_times = [
+            timestamp
+            for row in rows
+            for timestamp in [row_time_seconds(row, "pc_perf_counter_seconds", "captured_at")]
+            if timestamp is not None
+        ]
+        write_durations = [
+            float(row["write_duration_seconds"])
+            for row in rows
+            if is_number(row.get("write_duration_seconds"))
+        ]
+        latencies = []
+        for row in rows:
+            latency = row_capture_to_write_latency_seconds(row)
+            if latency is not None:
+                latencies.append(latency)
+        depth_rows = [row for row in rows if isinstance(row.get("depth"), dict) and row["depth"].get("path")]
+        depth_times = [
+            timestamp
+            for row in depth_rows
+            for timestamp in [row_time_seconds(row, "pc_perf_counter_seconds", "captured_at")]
+            if timestamp is not None
+        ]
+        session_drops = finite_int(queue_drops.get(role), 0)
+        hub_drops = finite_int(subscriber_drops.get(role), 0)
+        drops = session_drops + hub_drops
+        cameras[role] = {
+            "video": time_series_summary(video_times, target_camera_hz),
+            "depth": time_series_summary(depth_times, target_depth_hz) if record_depth else {"count": 0},
+            "writeDurationSeconds": stats_summary(write_durations),
+            "captureToWriteLatencySeconds": stats_summary(latencies),
+            "queueDrops": drops,
+            "sessionQueueDrops": session_drops,
+            "hubSubscriberDrops": hub_drops,
+            "queueDropRatio": float(drops / max(1, len(rows) + drops)),
+            "videoFramesWritten": len(rows),
+            "depthFramesWritten": len(depth_rows),
+        }
+    computed = {
+        "robotState": time_series_summary(robot_times, target_robot_hz),
+        "cameras": cameras,
+        "targetRobotStateHz": target_robot_hz,
+        "targetCameraHz": target_camera_hz,
+        "recordDepth": record_depth,
+        "recordDepthEveryNFrames": depth_every,
+        "targetDepthHz": target_depth_hz,
+    }
+    if existing:
+        merged = dict(existing)
+        merged["computedFromJsonl"] = computed
+        return merged
+    return computed
 
 
 def replay_samples_path(session_dir: Path, source: str) -> Path | None:
@@ -3597,6 +4711,7 @@ def build_recording_replay_payload(
     source: str | None = None,
     calibration_raw_root: Path | None = None,
     calibration_output_root: Path | None = None,
+    compact: bool = True,
 ) -> dict[str, Any]:
     safe_id = sanitize_name(record_id)
     if safe_id != record_id:
@@ -3607,6 +4722,30 @@ def build_recording_replay_payload(
         source,
         calibration_raw_root,
     )
+    if compact:
+        return replay_visualization_payload(
+            session_dir,
+            safe_id,
+            resolved_source,
+            recording_root=recording_root,
+            calibration_raw_root=calibration_raw_root,
+            calibration_output_root=calibration_output_root,
+        )
+    return build_recording_replay_payload_uncached(
+        session_dir,
+        safe_id,
+        resolved_source,
+        calibration_output_root=calibration_output_root,
+    )
+
+
+def build_recording_replay_payload_uncached(
+    session_dir: Path,
+    safe_id: str,
+    resolved_source: str,
+    *,
+    calibration_output_root: Path | None = None,
+) -> dict[str, Any]:
     samples_path = replay_samples_path(session_dir, resolved_source)
     if samples_path is None or not samples_path.exists():
         raise FileNotFoundError(f"missing samples file for {safe_id}")
@@ -3624,17 +4763,8 @@ def build_recording_replay_payload(
         board_origin_world = matrix_translation(board_matrix_world)
         board_matrix_display = translated_matrix_4x4(board_matrix_world, board_origin_world)
 
-    raw_rows: list[dict[str, Any]] = []
-    samples: list[dict[str, Any]] = []
-    with samples_path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if not isinstance(row, dict):
-                continue
-            raw_rows.append(row)
-            samples.append(recording_replay_sample(row, board_origin_world))
+    raw_rows = read_jsonl_relaxed(samples_path)
+    samples = [recording_replay_sample(row, board_origin_world) for row in raw_rows]
 
     gaze_diagnostics = build_gaze_depth_diagnostics(raw_rows, snapshot)
     enrich_replay_samples_with_gaze_diagnostics(samples, gaze_diagnostics, board_origin_world)
@@ -3662,6 +4792,378 @@ def build_recording_replay_payload(
         "rawArtifacts": raw_artifacts,
         "samples": samples,
     }
+
+
+def replay_visualization_path(session_dir: Path) -> Path:
+    return session_dir / REPLAY_VISUALIZATION_CACHE
+
+
+def replay_visualization_payload(
+    session_dir: Path,
+    safe_id: str,
+    resolved_source: str,
+    *,
+    recording_root: Path | None = None,
+    calibration_raw_root: Path | None = None,
+    calibration_output_root: Path | None = None,
+) -> dict[str, Any]:
+    cache_path = replay_visualization_path(session_dir)
+    cached = read_json_if_exists(cache_path)
+    samples_path = replay_samples_path(session_dir, resolved_source)
+    source_mtime = max(
+        [
+            path.stat().st_mtime
+            for path in (
+                samples_path,
+                session_dir / "pc_session_summary.json",
+                session_dir / "pc_calibration_snapshot.json",
+                session_dir / "robot_realsense" / "samples.jsonl",
+                session_dir / "robot_realsense" / "robot_states.jsonl",
+                session_dir / "robot_realsense" / "session_summary.json",
+                session_dir / "robot_realsense" / "robot_hand_eye_result.json",
+                session_dir / "robot_realsense" / "robot_hand_eye_failure.json",
+            )
+            if path is not None and path.exists()
+        ]
+        or [0.0]
+    )
+    if (
+        isinstance(cached, dict)
+        and cached.get("ok")
+        and cached.get("cacheVersion") == REPLAY_VISUALIZATION_CACHE_VERSION
+        and cached.get("recordId") == safe_id
+        and cached.get("source") == resolved_source
+        and cache_path.stat().st_mtime >= source_mtime
+    ):
+        cached["cacheHit"] = True
+        cached["cachePath"] = str(cache_path)
+        return cached
+    if recording_root is None:
+        recording_root = DEFAULT_OUTPUT_ROOT
+    return build_and_write_replay_visualization_cache(
+        session_dir,
+        safe_id,
+        resolved_source,
+        recording_root=recording_root,
+        calibration_raw_root=calibration_raw_root,
+        calibration_output_root=calibration_output_root,
+        source_mtime=source_mtime,
+    )
+
+
+def write_replay_visualization_cache(
+    session_dir: Path,
+    record_id: str,
+    *,
+    source: str = "pc",
+    calibration_raw_root: Path | None = None,
+    calibration_output_root: Path | None = None,
+) -> Path:
+    safe_id = session_dir.name
+    payload = build_and_write_replay_visualization_cache(
+        session_dir,
+        safe_id,
+        source,
+        recording_root=session_dir.parent,
+        calibration_raw_root=calibration_raw_root,
+        calibration_output_root=calibration_output_root,
+    )
+    return Path(payload["cachePath"])
+
+
+def build_and_write_replay_visualization_cache(
+    session_dir: Path,
+    safe_id: str,
+    resolved_source: str,
+    *,
+    recording_root: Path,
+    calibration_raw_root: Path | None,
+    calibration_output_root: Path | None,
+    source_mtime: float | None = None,
+) -> dict[str, Any]:
+    payload = build_recording_replay_payload_uncached(
+        session_dir,
+        safe_id,
+        resolved_source,
+        calibration_output_root=calibration_output_root,
+    )
+    payload = compact_recording_replay_payload(payload)
+    payload["cacheVersion"] = REPLAY_VISUALIZATION_CACHE_VERSION
+    payload["cacheHit"] = False
+    payload["cacheCreatedUtc"] = datetime.now(timezone.utc).isoformat()
+    payload["sourceMtime"] = float(source_mtime if source_mtime is not None else time.time())
+    payload["cachePath"] = str(replay_visualization_path(session_dir))
+    cache_path = replay_visualization_path(session_dir)
+    cache_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    return payload
+
+
+def compact_recording_replay_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    result = dict(payload)
+    result["summary"] = compact_replay_summary(result.get("summary"))
+    samples = result.get("samples")
+    if isinstance(samples, list):
+        result["samples"] = [compact_replay_sample(row) for row in samples if isinstance(row, dict)]
+    robot_realsense = result.get("robotRealSense")
+    if isinstance(robot_realsense, dict):
+        result["robotRealSense"] = compact_robot_replay(robot_realsense)
+    result["payloadMode"] = "visualization_cache"
+    return result
+
+
+def compact_replay_summary(summary: Any) -> dict[str, Any]:
+    if not isinstance(summary, dict):
+        return {}
+    keep = (
+        "recordId",
+        "sessionDirectory",
+        "questOutputDirectory",
+        "closedReason",
+        "startUtc",
+        "messages",
+        "samples",
+        "lastSampleIndex",
+        "leftPoseSamples",
+        "rightPoseSamples",
+        "robotStartStatus",
+        "robotRealSenseDirectory",
+        "closeMetrics",
+        "replayVisualizationJson",
+        "replayVisualizationError",
+    )
+    return {key: summary.get(key) for key in keep if key in summary}
+
+
+def compact_robot_replay(robot_realsense: dict[str, Any]) -> dict[str, Any]:
+    result = dict(robot_realsense)
+    sample_rows = [row for row in robot_realsense.get("samples", []) if isinstance(row, dict)]
+    state_rows = [row for row in robot_realsense.get("robotStates", []) if isinstance(row, dict)]
+    result["samples"] = [compact_robot_media_row(row) for row in sample_rows]
+    result["robotStates"] = [compact_robot_pose_row(row) for row in state_rows]
+    if not result["robotStates"]:
+        result["robotStates"] = [compact_robot_pose_row(row) for row in sample_rows]
+    return result
+
+
+def compact_robot_pose_row(row: dict[str, Any]) -> dict[str, Any]:
+    result = compact_row_scalars(
+        row,
+        (
+            "sampleIndex",
+            "questSampleIndex",
+            "recordingTimestampSeconds",
+            "pcPerfCounterSeconds",
+            "ok",
+            "sourceStream",
+            "error",
+        ),
+    )
+    for key in (
+        "T_base_ee",
+        "T_base_tool_tcp",
+        "T_display_tool_tcp",
+        "T_display_ee",
+        "T_base_end_camera",
+        "T_display_end_camera",
+    ):
+        compact = compact_matrix_payload(row.get(key))
+        if compact is not None:
+            result[key] = compact
+    jointpose = compact_number_list(row.get("jointpose") or row.get("jointpos"), digits=6)
+    if jointpose:
+        result["jointpose"] = jointpose
+    return result
+
+
+def compact_robot_media_row(row: dict[str, Any]) -> dict[str, Any]:
+    result = compact_row_scalars(
+        row,
+        (
+            "sampleIndex",
+            "questSampleIndex",
+            "recordingTimestampSeconds",
+            "pcPerfCounterSeconds",
+            "ok",
+            "sourceStream",
+            "questGaze3DSource",
+            "error",
+        ),
+    )
+    images = compact_media_artifacts(row.get("images"))
+    if images:
+        result["images"] = images
+    videos = compact_media_artifacts(row.get("videos"))
+    if videos:
+        result["videos"] = videos
+    gaze = compact_number_list(row.get("questGaze3DWorld"), digits=6)
+    if gaze:
+        result["questGaze3DWorld"] = gaze
+    return result
+
+
+def compact_replay_sample(row: dict[str, Any]) -> dict[str, Any]:
+    result = compact_row_scalars(
+        row,
+        (
+            "sampleIndex",
+            "recordingTimestampSeconds",
+            "isRecording",
+        ),
+    )
+    for key in ("head", "leftEye", "rightEye", "left", "right"):
+        pose = compact_visual_pose(row.get(key))
+        if pose is not None:
+            result[key] = pose
+    for key in ("gaze", "gazeHit", "gazeFiltered", "gazeBoardPlane"):
+        point = compact_visual_point(row.get(key))
+        if point is not None:
+            result[key] = point
+    ray_origin = compact_number_list(row.get("gazeRayOrigin"), digits=6)
+    if ray_origin:
+        result["gazeRayOrigin"] = ray_origin
+    ray_direction = compact_number_list(row.get("gazeRayDirection"), digits=6)
+    if ray_direction:
+        result["gazeRayDirection"] = ray_direction
+    gaze_depth = compact_gaze_depth(row.get("gazeDepth"))
+    if gaze_depth:
+        result["gazeDepth"] = gaze_depth
+    return result
+
+
+def compact_visual_pose(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, Any] = {"ok": bool(value.get("ok"))}
+    source = value.get("source")
+    if source:
+        result["source"] = source
+    point = compact_number_list(value.get("p"), digits=6)
+    if point:
+        result["p"] = point
+    quat_value = compact_number_list(value.get("q"), digits=7)
+    if quat_value:
+        result["q"] = quat_value
+    controller_input = compact_controller_input(value.get("input"))
+    if controller_input:
+        result["input"] = controller_input
+    return result
+
+
+def compact_visual_point(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, Any] = {"ok": bool(value.get("ok"))}
+    point = compact_number_list(value.get("p"), digits=6)
+    if point:
+        result["p"] = point
+    source = value.get("source")
+    if source:
+        result["source"] = source
+    return result
+
+
+def compact_gaze_depth(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return compact_row_scalars(
+        value,
+        (
+            "source",
+            "rawDepthM",
+            "filteredDepthM",
+            "boardPlaneDepthM",
+            "boardDistanceM",
+            "depthMinusBoardPlaneM",
+            "filteredDepthMinusBoardPlaneM",
+        ),
+    )
+
+
+def compact_controller_input(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or not value.get("hasAny"):
+        return {}
+    return compact_row_scalars(
+        value,
+        (
+            "hasAny",
+            "handTrigger",
+            "indexTrigger",
+            "handTriggerPressed",
+            "indexTriggerPressed",
+            "aButton",
+            "bButton",
+            "teleopHeld",
+        ),
+    )
+
+
+def compact_matrix_payload(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    matrix = value.get("matrix_4x4")
+    if not isinstance(matrix, list) or len(matrix) < 4:
+        return None
+    rows: list[list[float | int]] = []
+    try:
+        for row in matrix[:4]:
+            if not isinstance(row, list) or len(row) < 4:
+                return None
+            rows.append([compact_float(row[col], digits=7) for col in range(4)])
+    except (TypeError, ValueError):
+        return None
+    return {"matrix_4x4": rows}
+
+
+def compact_media_artifacts(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for role, artifact in value.items():
+        if not isinstance(role, str) or not isinstance(artifact, dict):
+            continue
+        item: dict[str, Any] = {}
+        for key in ("url", "frameIndex", "serial", "error"):
+            if artifact.get(key) is not None:
+                item[key] = artifact.get(key)
+        if item:
+            result[role] = item
+    return result
+
+
+def compact_row_scalars(row: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key in keys:
+        if key not in row or row.get(key) is None:
+            continue
+        value = row.get(key)
+        if isinstance(value, float):
+            result[key] = compact_float(value)
+        elif isinstance(value, (int, bool, str)):
+            result[key] = value
+        else:
+            result[key] = value
+    return result
+
+
+def compact_number_list(value: Any, *, digits: int = 6) -> list[float | int] | None:
+    if not isinstance(value, list):
+        return None
+    result: list[float | int] = []
+    for item in value:
+        if not is_number(item):
+            return None
+        result.append(compact_float(item, digits=digits))
+    return result
+
+
+def compact_float(value: Any, *, digits: int = 6) -> float | int:
+    number = float(value)
+    if not math.isfinite(number):
+        return 0.0
+    rounded = round(number, digits)
+    if rounded == 0:
+        return 0
+    return rounded
 
 
 def replay_raw_artifacts(
@@ -3699,6 +5201,42 @@ def replay_raw_artifacts(
             path = root / filename
             if path.exists() and key not in artifacts:
                 artifacts[key] = artifact_payload(path, artifact_label(key))
+    robot_dir = session_dir / "robot_realsense"
+    if robot_dir.exists():
+        for key, filename, label in (
+            ("robotSamples", "samples.jsonl", "Robot quest-aligned samples"),
+            ("robotStates", "robot_states.jsonl", "Robot 90Hz states"),
+            ("robotVideoFrames", "video_frames.jsonl", "Robot camera frame index"),
+            ("robotGripper", "gripper_commands.jsonl", "Robot gripper commands"),
+            ("robotMotion", "controller_motion.jsonl", "Robot controller motion commands"),
+            ("robotSummary", "session_summary.json", "Robot recording summary"),
+            ("robotConfig", "capture_config.json", "Robot capture config"),
+            ("robotCameras", "cameras.json", "Robot camera metadata"),
+            ("robotHandEyeResult", "robot_hand_eye_result.json", "Robot hand-eye result"),
+            ("robotHandEyeFailure", "robot_hand_eye_failure.json", "Robot hand-eye failure"),
+        ):
+            path = robot_dir / filename
+            if path.exists():
+                artifacts[key] = artifact_payload(path, label)
+        session_payload = read_json_if_exists(robot_dir / "session_summary.json")
+        depth_streams = session_payload.get("depthStreams") if isinstance(session_payload, dict) else None
+        if isinstance(depth_streams, dict):
+            for role, rel_path in depth_streams.items():
+                if not isinstance(rel_path, str) or not rel_path:
+                    continue
+                path = (robot_dir / rel_path).resolve()
+                if path.exists():
+                    artifacts[f"robotDepth_{role}"] = artifact_payload(path, f"Robot depth stream {role}")
+        depth_dir = robot_dir / "depth"
+        if depth_dir.exists():
+            for path in sorted(depth_dir.glob("*.bin")):
+                key = f"robotDepth_{path.stem}"
+                if key not in artifacts:
+                    artifacts[key] = artifact_payload(path, f"Robot depth stream {path.name}")
+        video_dir = robot_dir / "videos"
+        if video_dir.exists():
+            for path in sorted(video_dir.glob("*.mp4")):
+                artifacts[f"robotVideo_{path.stem}"] = artifact_payload(path, f"Robot video {path.name}")
     return artifacts
 
 
@@ -3767,6 +5305,22 @@ def build_recording_audit(
             expectedRoles=expected_camera_roles,
         )
     )
+    depth_rows = read_jsonl_relaxed(robot_dir / "video_frames.jsonl")
+    expected_depth = not (isinstance(session_config, dict) and session_config.get("recordDepth") is False)
+    depth_count = sum(1 for row in depth_rows if isinstance(row.get("depth"), dict) and row["depth"].get("path"))
+    checks.append(
+        audit_item(
+            "robot_realsense_depth",
+            "RealSense aligned depth",
+            (not expected_depth) or depth_count > 0,
+            (
+                f"{depth_count}/{len(depth_rows)} video frame rows with indexed depth payload"
+                if expected_depth
+                else "depth recording disabled in capture_config"
+            ),
+            required=expected_depth,
+        )
+    )
     if robot_realsense is None:
         for id_value, label in (
             ("robot_tool_tcp", "Robot tool TCP trajectory"),
@@ -3779,44 +5333,178 @@ def build_recording_audit(
         return {"ok": ok, "checks": checks, "summary": audit_summary_text(checks)}
 
     robot_samples = robot_realsense.get("samples") if isinstance(robot_realsense.get("samples"), list) else []
-    tcp_count = sum(1 for row in robot_samples if isinstance(row.get("T_base_tool_tcp"), dict))
-    end_cam_count = sum(1 for row in robot_samples if isinstance(row.get("T_base_end_camera"), dict))
-    world_tcp_count = sum(1 for row in robot_samples if isinstance(row.get("T_world_tool_tcp"), dict) and isinstance(row.get("T_display_tool_tcp"), dict))
-    world_end_count = sum(1 for row in robot_samples if isinstance(row.get("T_world_end_camera"), dict) and isinstance(row.get("T_display_end_camera"), dict))
+    robot_states = robot_realsense.get("robotStates") if isinstance(robot_realsense.get("robotStates"), list) else []
+    performance = effective_performance_payload(
+        robot_realsense.get("performance") if isinstance(robot_realsense.get("performance"), dict) else {}
+    )
+    robot_pose_rows = robot_states or robot_samples
+    tcp_count = sum(1 for row in robot_pose_rows if isinstance(row.get("T_base_tool_tcp"), dict))
+    end_cam_count = sum(1 for row in robot_pose_rows if isinstance(row.get("T_base_end_camera"), dict))
+    world_tcp_count = sum(1 for row in robot_pose_rows if isinstance(row.get("T_world_tool_tcp"), dict) and isinstance(row.get("T_display_tool_tcp"), dict))
+    world_end_count = sum(1 for row in robot_pose_rows if isinstance(row.get("T_world_end_camera"), dict) and isinstance(row.get("T_display_end_camera"), dict))
     replay_video_count = sum(1 for row in robot_samples if any((item or {}).get("url") for item in (row.get("videos") or {}).values()))
     gaze_in_robot_count = sum(1 for row in robot_samples if isinstance(row.get("questGaze3DWorld"), list) and len(row.get("questGaze3DWorld")) >= 3)
     checks.extend(
         [
-            audit_item("robot_tool_tcp", "Robot tool TCP trajectory", tcp_count > 0, f"{tcp_count}/{len(robot_samples)} robot samples with T_base_tool_tcp"),
-            audit_item("robot_end_camera", "Robot end-camera trajectory", end_cam_count > 0, f"{end_cam_count}/{len(robot_samples)} robot samples with T_base_end_camera"),
+            audit_item(
+                "robot_state_stream",
+                "Robot high-rate state stream",
+                len(robot_states) > 0,
+                f"{len(robot_states)} robot_states rows; {len(robot_samples)} quest-aligned rows",
+            ),
+            audit_item("robot_tool_tcp", "Robot tool TCP trajectory", tcp_count > 0, f"{tcp_count}/{len(robot_pose_rows)} robot pose rows with T_base_tool_tcp"),
+            audit_item("robot_end_camera", "Robot end-camera trajectory", end_cam_count > 0, f"{end_cam_count}/{len(robot_pose_rows)} robot pose rows with T_base_end_camera"),
             audit_item(
                 "robot_unified_coords",
                 "Robot unified coordinates",
                 world_tcp_count > 0 and world_end_count > 0,
-                f"TCP world/display {world_tcp_count}/{len(robot_samples)}, end camera world/display {world_end_count}/{len(robot_samples)}",
+                f"TCP world/display {world_tcp_count}/{len(robot_pose_rows)}, end camera world/display {world_end_count}/{len(robot_pose_rows)}",
             ),
             audit_item("robot_replay_media", "Robot replay media", replay_video_count > 0, f"{replay_video_count}/{len(robot_samples)} samples with replayable video artifact"),
             audit_item("robot_gaze3d_copy", "gaze3D copied into robot samples", gaze_in_robot_count > 0, f"{gaze_in_robot_count}/{len(robot_samples)} robot samples with questGaze3DWorld"),
         ]
     )
-    result = robot_realsense.get("result") if isinstance(robot_realsense.get("result"), dict) else {}
-    red_counts = result.get("red_anchor_global") if isinstance(result.get("red_anchor_global"), dict) else None
+    robot_perf = performance.get("robotState") if isinstance(performance.get("robotState"), dict) else {}
+    robot_ratio = robot_perf.get("targetRatio")
     checks.append(
         audit_item(
-            "red_anchor_optional_global",
-            "Optional global red anchor",
-            True,
-            (red_counts or {}).get("note") if isinstance(red_counts, dict) else "red anchor optional; no red frames required for every detection",
-            globalAnchor=red_counts,
+            "robot_state_rate",
+            "Robot state effective rate",
+            bool(is_number(robot_ratio) and float(robot_ratio) >= 0.70),
+            robot_rate_detail(robot_perf),
+            performance=robot_perf,
         )
     )
+    camera_perf = performance.get("cameras") if isinstance(performance.get("cameras"), dict) else {}
+    for role in expected_camera_roles:
+        role_perf = camera_perf.get(role) if isinstance(camera_perf.get(role), dict) else {}
+        video_perf = role_perf.get("video") if isinstance(role_perf.get("video"), dict) else {}
+        video_ratio = video_perf.get("targetRatio")
+        drop_ratio = role_perf.get("queueDropRatio")
+        checks.append(
+            audit_item(
+                f"robot_camera_{role}_rate",
+                f"{role} camera effective rate",
+                bool(is_number(video_ratio) and float(video_ratio) >= 0.80),
+                camera_rate_detail(role, role_perf),
+                performance=role_perf,
+            )
+        )
+        checks.append(
+            audit_item(
+                f"robot_camera_{role}_queue",
+                f"{role} camera queue drops",
+                bool((not is_number(drop_ratio)) or float(drop_ratio) <= 0.05),
+                camera_queue_detail(role, role_perf),
+                performance=role_perf,
+            )
+        )
     ok = all(check["ok"] for check in checks)
     return {"ok": ok, "checks": checks, "summary": audit_summary_text(checks)}
 
 
+def robot_rate_detail(perf: dict[str, Any]) -> str:
+    hz = perf.get("effectiveHz")
+    target = perf.get("targetHz")
+    count = perf.get("count")
+    p95 = None
+    gaps = perf.get("gapSeconds") if isinstance(perf.get("gapSeconds"), dict) else None
+    if isinstance(gaps, dict):
+        p95 = gaps.get("p95")
+    return (
+        f"{format_hz(hz)} / target {format_hz(target)}, rows {count if count is not None else 'n/a'}, "
+        f"gap p95 {format_seconds(p95)}"
+    )
+
+
+def effective_performance_payload(performance: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(performance, dict):
+        return {}
+    robot = performance.get("robotState") if isinstance(performance.get("robotState"), dict) else {}
+    cameras = performance.get("cameras") if isinstance(performance.get("cameras"), dict) else {}
+    has_robot = is_number(robot.get("effectiveHz")) or finite_int(robot.get("count"), 0) > 0
+    has_camera = any(
+        isinstance(value, dict)
+        and isinstance(value.get("video"), dict)
+        and (
+            is_number(value["video"].get("effectiveHz"))
+            or finite_int(value["video"].get("count"), 0) > 0
+        )
+        for value in cameras.values()
+    )
+    if has_robot or has_camera:
+        return performance
+    computed = performance.get("computedFromJsonl")
+    return computed if isinstance(computed, dict) else performance
+
+
+def row_time_seconds(row: dict[str, Any], numeric_key: str, iso_key: str) -> float | None:
+    value = row.get(numeric_key)
+    if is_number(value):
+        return float(value)
+    timestamp = parse_iso_timestamp_seconds(row.get(iso_key))
+    return timestamp
+
+
+def row_capture_to_write_latency_seconds(row: dict[str, Any]) -> float | None:
+    write_t = row_time_seconds(row, "pc_perf_counter_seconds", "captured_at")
+    capture_t = row_time_seconds(row, "frame_captured_perf_counter_seconds", "frame_captured_at_utc")
+    if write_t is None or capture_t is None:
+        return None
+    return float(write_t - capture_t)
+
+
+def parse_iso_timestamp_seconds(value: Any) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return float(parsed.timestamp())
+
+
+def camera_rate_detail(role: str, perf: dict[str, Any]) -> str:
+    video = perf.get("video") if isinstance(perf.get("video"), dict) else {}
+    latency = perf.get("captureToWriteLatencySeconds") if isinstance(perf.get("captureToWriteLatencySeconds"), dict) else {}
+    return (
+        f"{role}: {format_hz(video.get('effectiveHz'))} / target {format_hz(video.get('targetHz'))}, "
+        f"frames {perf.get('videoFramesWritten', video.get('count', 'n/a'))}, "
+        f"latency p95 {format_seconds(latency.get('p95'))}"
+    )
+
+
+def camera_queue_detail(role: str, perf: dict[str, Any]) -> str:
+    drops = perf.get("queueDrops")
+    ratio = perf.get("queueDropRatio")
+    return f"{role}: drops {drops if drops is not None else 'n/a'}, ratio {format_percent(ratio)}"
+
+
+def format_hz(value: Any) -> str:
+    return f"{float(value):.1f}Hz" if is_number(value) else "n/a"
+
+
+def format_seconds(value: Any) -> str:
+    return f"{float(value) * 1000.0:.1f}ms" if is_number(value) else "n/a"
+
+
+def format_percent(value: Any) -> str:
+    return f"{float(value) * 100.0:.1f}%" if is_number(value) else "n/a"
+
+
 def audit_summary_text(checks: list[dict[str, Any]]) -> str:
-    passed = sum(1 for check in checks if check.get("ok"))
-    return f"{passed}/{len(checks)} checks passing"
+    required = [check for check in checks if check.get("required") is not False]
+    passed = sum(1 for check in required if check.get("ok"))
+    optional_failed = sum(1 for check in checks if check.get("required") is False and not check.get("ok"))
+    suffix = f", {optional_failed} optional warning(s)" if optional_failed else ""
+    return f"{passed}/{len(required)} required checks passing{suffix}"
 
 
 def artifact_label(key: str) -> str:
@@ -3847,12 +5535,131 @@ def artifact_payload(path: Path, label: str | None = None) -> dict[str, Any]:
         }
 
 
+def read_jsonl_relaxed(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                row = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    return rows
+
+
+def estimate_recording_seconds_offset(rows: list[dict[str, Any]], *perf_keys: str) -> float | None:
+    deltas: list[float] = []
+    for row in rows:
+        quest_seconds = row.get("quest_recording_timestamp_seconds")
+        if not is_number(quest_seconds):
+            continue
+        for key in perf_keys:
+            perf_seconds = row.get(key)
+            if is_number(perf_seconds):
+                deltas.append(float(quest_seconds) - float(perf_seconds))
+                break
+    if not deltas:
+        return None
+    deltas.sort()
+    return float(deltas[len(deltas) // 2])
+
+
+def robot_replay_row(
+    row: dict[str, Any],
+    robot_dir: Path,
+    origin: list[float],
+    t_world_base: np.ndarray | None,
+    t_ee_end_camera: np.ndarray | None,
+    *,
+    recording_timestamp_seconds: float | None,
+    source_stream: str,
+) -> tuple[dict[str, Any], np.ndarray | None]:
+    ee_matrix = transform_from_json(row.get("T_base_ee"))
+    pose_matrix = robot_row_tool_transform(row)
+    if pose_matrix is None:
+        pose_matrix = ee_matrix
+    if ee_matrix is None:
+        ee_matrix = pose_matrix
+    ee_pose = transform_payload_from_matrix(ee_matrix) if ee_matrix is not None else None
+    pose = transform_payload_from_matrix(pose_matrix) if pose_matrix is not None else None
+    end_camera_pose = row.get("T_base_end_camera") if isinstance(row.get("T_base_end_camera"), dict) else None
+    end_camera_matrix = transform_from_json(end_camera_pose)
+    if end_camera_matrix is not None:
+        end_camera_pose = transform_payload_from_matrix(end_camera_matrix)
+    world_matrix = transform_from_json(row.get("T_world_tool_tcp"))
+    world_pose = transform_payload_from_matrix(world_matrix) if world_matrix is not None else None
+    display_pose = None
+    world_end_camera_matrix = transform_from_json(row.get("T_world_end_camera"))
+    world_end_camera_pose = (
+        transform_payload_from_matrix(world_end_camera_matrix) if world_end_camera_matrix is not None else None
+    )
+    display_end_camera_pose = None
+    display_frame = "unaligned_robot_base"
+    if pose_matrix is not None:
+        if end_camera_matrix is None and t_ee_end_camera is not None:
+            end_camera_matrix = pose_matrix @ t_ee_end_camera
+            end_camera_pose = transform_payload_from_matrix(end_camera_matrix)
+        if t_world_base is not None and world_pose is None:
+            world_matrix = t_world_base @ pose_matrix
+            world_pose = transform_payload_from_matrix(world_matrix)
+        if world_pose is not None:
+            display_pose = translate_transform_payload(world_pose, origin)
+        if t_world_base is not None and end_camera_matrix is not None and world_end_camera_pose is None:
+            world_end_camera_matrix = t_world_base @ end_camera_matrix
+            world_end_camera_pose = transform_payload_from_matrix(world_end_camera_matrix)
+        if world_end_camera_pose is not None:
+            display_end_camera_pose = translate_transform_payload(world_end_camera_pose, origin)
+        if world_pose is not None or world_end_camera_pose is not None:
+            display_frame = "quest_world_axes_translated_to_board_origin"
+    videos = row.get("videos") if isinstance(row.get("videos"), dict) else {}
+    images = row.get("images") if isinstance(row.get("images"), dict) else {}
+    result = {
+        "sampleIndex": row.get("sample_index"),
+        "questSampleIndex": row.get("quest_sample_index"),
+        "recordingTimestampSeconds": recording_timestamp_seconds,
+        "pcPerfCounterSeconds": row.get("pc_perf_counter_seconds"),
+        "pcUnixSeconds": row.get("pc_unix_seconds"),
+        "capturedAt": row.get("captured_at"),
+        "ok": bool(row.get("ok")),
+        "sourceStream": source_stream,
+        "T_base_ee": ee_pose,
+        "T_base_tool_tcp": pose,
+        "T_world_tool_tcp": world_pose,
+        "T_display_tool_tcp": display_pose,
+        "T_world_ee": world_pose,
+        "T_display_ee": display_pose,
+        "T_base_end_camera": end_camera_pose,
+        "T_world_end_camera": world_end_camera_pose,
+        "T_display_end_camera": display_end_camera_pose,
+        "displayFrame": display_frame,
+        "jointpose": row.get("jointpose") or row.get("jointpos"),
+        "jointpos": row.get("jointpos") or row.get("jointpose"),
+        "images": robot_image_artifacts(robot_dir, images),
+        "videos": robot_video_artifacts(robot_dir, videos),
+        "videoFrames": row.get("videoFrames"),
+        "questGaze3DWorld": row.get("quest_gaze3d_pc_world") or pc_world_vec3(row.get("quest_gaze3d_world")),
+        "questGaze3DUnityWorld": row.get("quest_gaze3d_world"),
+        "questGaze3DSource": row.get("quest_gaze3d_source"),
+        "gripper": row.get("gripper"),
+        "poseDiversity": row.get("poseDiversity"),
+        "error": row.get("error"),
+    }
+    return result, pose_matrix
+
+
 def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict[str, Any] | None:
     robot_dir = session_dir / "robot_realsense"
     samples_path = robot_dir / "samples.jsonl"
     if not samples_path.exists():
         return None
     session = read_json_if_exists(robot_dir / "session_summary.json")
+    config = read_json_if_exists(robot_dir / "capture_config.json")
     result = read_json_if_exists(robot_dir / "robot_hand_eye_result.json")
     failure = read_json_if_exists(robot_dir / "robot_hand_eye_failure.json")
     alignment = result.get("questAlignment") if isinstance(result, dict) else None
@@ -3862,80 +5669,77 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
         end_camera_result = result.get("end_camera")
         if isinstance(end_camera_result, dict):
             t_ee_end_camera = transform_from_json(end_camera_result.get("T_ee_realsense"))
+    sample_rows_raw = read_jsonl_relaxed(samples_path)
+    robot_states_path = robot_dir / "robot_states.jsonl"
+    robot_state_rows_raw = read_jsonl_relaxed(robot_states_path)
+    recording_offset = estimate_recording_seconds_offset(
+        sample_rows_raw,
+        "robot_state_pc_perf_counter_seconds",
+        "pc_perf_counter_seconds",
+    )
     rows: list[dict[str, Any]] = []
+    robot_state_rows: list[dict[str, Any]] = []
     ee_poses: list[np.ndarray] = []
-    with samples_path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if not isinstance(row, dict):
-                continue
-            pose = row.get("T_base_tool_tcp") if isinstance(row.get("T_base_tool_tcp"), dict) else row.get("T_base_ee")
-            pose = pose if isinstance(pose, dict) else None
-            pose_matrix = transform_from_json(pose)
-            end_camera_pose = row.get("T_base_end_camera") if isinstance(row.get("T_base_end_camera"), dict) else None
-            end_camera_matrix = transform_from_json(end_camera_pose)
-            world_pose = row.get("T_world_tool_tcp") if isinstance(row.get("T_world_tool_tcp"), dict) else None
-            display_pose = None
-            world_end_camera_pose = row.get("T_world_end_camera") if isinstance(row.get("T_world_end_camera"), dict) else None
-            display_end_camera_pose = None
-            display_frame = "unaligned_robot_base"
-            if pose_matrix is not None:
-                ee_poses.append(pose_matrix)
-                if end_camera_matrix is None and t_ee_end_camera is not None:
-                    end_camera_matrix = pose_matrix @ t_ee_end_camera
-                    end_camera_pose = transform_payload_from_matrix(end_camera_matrix)
-                if t_world_base is not None and world_pose is None:
-                    world_matrix = t_world_base @ pose_matrix
-                    world_pose = transform_payload_from_matrix(world_matrix)
-                if world_pose is not None:
-                    display_pose = translate_transform_payload(world_pose, origin)
-                if t_world_base is not None and end_camera_matrix is not None and world_end_camera_pose is None:
-                    world_end_camera_matrix = t_world_base @ end_camera_matrix
-                    world_end_camera_pose = transform_payload_from_matrix(world_end_camera_matrix)
-                if world_end_camera_pose is not None:
-                    display_end_camera_pose = translate_transform_payload(world_end_camera_pose, origin)
-                if world_pose is not None or world_end_camera_pose is not None:
-                    display_frame = "quest_world_axes_translated_to_board_origin"
-            videos = row.get("videos") if isinstance(row.get("videos"), dict) else {}
-            images = row.get("images") if isinstance(row.get("images"), dict) else {}
-            rows.append(
-                {
-                    "sampleIndex": row.get("sample_index"),
-                    "questSampleIndex": row.get("quest_sample_index"),
-                    "recordingTimestampSeconds": row.get("quest_recording_timestamp_seconds"),
-                    "ok": bool(row.get("ok")),
-                    "T_base_ee": pose,
-                    "T_base_tool_tcp": row.get("T_base_tool_tcp") if isinstance(row.get("T_base_tool_tcp"), dict) else pose,
-                    "T_world_tool_tcp": world_pose,
-                    "T_display_tool_tcp": display_pose,
-                    "T_world_ee": world_pose,
-                    "T_display_ee": display_pose,
-                    "T_base_end_camera": end_camera_pose,
-                    "T_world_end_camera": world_end_camera_pose,
-                    "T_display_end_camera": display_end_camera_pose,
-                    "displayFrame": display_frame,
-                    "jointpose": row.get("jointpose") or row.get("jointpos"),
-                    "jointpos": row.get("jointpos") or row.get("jointpose"),
-                    "images": robot_image_artifacts(robot_dir, images),
-                    "videos": robot_video_artifacts(robot_dir, videos),
-                    "videoFrames": row.get("videoFrames"),
-                    "questGaze3DWorld": row.get("quest_gaze3d_pc_world") or pc_world_vec3(row.get("quest_gaze3d_world")),
-                    "questGaze3DUnityWorld": row.get("quest_gaze3d_world"),
-                    "questGaze3DSource": row.get("quest_gaze3d_source"),
-                    "gripper": row.get("gripper"),
-                    "error": row.get("error"),
-                }
-            )
+    for row in sample_rows_raw:
+        replay_row, pose_matrix = robot_replay_row(
+            row,
+            robot_dir,
+            origin,
+            t_world_base,
+            t_ee_end_camera,
+            recording_timestamp_seconds=float(row["quest_recording_timestamp_seconds"])
+            if is_number(row.get("quest_recording_timestamp_seconds"))
+            else None,
+            source_stream="quest_aligned_samples",
+        )
+        rows.append(replay_row)
+        if pose_matrix is not None:
+            ee_poses.append(pose_matrix)
+    for row in robot_state_rows_raw:
+        derived_recording_seconds = None
+        if is_number(row.get("quest_recording_timestamp_seconds")):
+            derived_recording_seconds = float(row["quest_recording_timestamp_seconds"])
+        elif recording_offset is not None and is_number(row.get("pc_perf_counter_seconds")):
+            derived_recording_seconds = float(row["pc_perf_counter_seconds"]) + recording_offset
+        replay_row, pose_matrix = robot_replay_row(
+            row,
+            robot_dir,
+            origin,
+            t_world_base,
+            t_ee_end_camera,
+            recording_timestamp_seconds=derived_recording_seconds,
+            source_stream="robot_states",
+        )
+        robot_state_rows.append(replay_row)
+        if pose_matrix is not None:
+            ee_poses.append(pose_matrix)
+    if not robot_state_rows:
+        robot_state_rows = list(rows)
+    video_frame_rows = read_jsonl_relaxed(robot_dir / "video_frames.jsonl")
+    depth_frame_count = sum(
+        1
+        for row in video_frame_rows
+        if isinstance(row.get("depth"), dict) and row["depth"].get("path")
+    )
     gripper_rows = read_robot_gripper_rows(robot_dir)
+    performance = robot_realsense_performance_summary(
+        robot_dir,
+        session if isinstance(session, dict) else {},
+        config if isinstance(config, dict) else {},
+    )
     return {
         "directory": str(robot_dir),
         "session": session if isinstance(session, dict) else None,
+        "config": config if isinstance(config, dict) else None,
         "samples": rows,
+        "robotStates": robot_state_rows,
+        "videoFrameCount": len(video_frame_rows),
+        "depthFrameCount": depth_frame_count,
+        "performance": performance,
         "gripper": gripper_rows,
         "displayFrame": "quest_world_axes_translated_to_board_origin" if t_world_base is not None else "unaligned_robot_base",
         "poseDiversity": ee_pose_diversity(ee_poses),
+        "recordingSecondsOffsetFromPerfCounter": recording_offset,
         "result": result if isinstance(result, dict) else None,
         "failure": failure if isinstance(failure, dict) else None,
     }
@@ -4114,6 +5918,28 @@ def stats_summary(values: list[float], scale: float = 1.0) -> dict[str, Any]:
         "min": float(np.min(finite)),
         "max": float(np.max(finite)),
     }
+
+
+def time_series_summary(times: list[float], target_hz: float | None = None) -> dict[str, Any]:
+    finite = np.array([float(value) for value in times if math.isfinite(float(value))], dtype=float)
+    if finite.size == 0:
+        return {"count": 0}
+    duration = float(max(0.0, finite[-1] - finite[0])) if finite.size >= 2 else 0.0
+    hz = float((finite.size - 1) / duration) if duration > 1e-9 and finite.size >= 2 else None
+    payload: dict[str, Any] = {
+        "count": int(finite.size),
+        "durationSeconds": duration,
+        "effectiveHz": hz,
+        "firstPerfCounterSeconds": float(finite[0]),
+        "lastPerfCounterSeconds": float(finite[-1]),
+    }
+    if target_hz is not None and target_hz > 0:
+        payload["targetHz"] = float(target_hz)
+        if hz is not None:
+            payload["targetRatio"] = float(hz / float(target_hz))
+    if finite.size >= 2:
+        payload["gapSeconds"] = stats_summary(list(np.diff(finite)))
+    return payload
 
 
 def causal_median_depth_filter(depths: list[float | None], window: int = 7) -> list[float | None]:
@@ -4767,7 +6593,6 @@ def calibration_result_event(record_id: str, result: dict[str, Any], result_path
     order = result.get("order_summary") if isinstance(result.get("order_summary"), dict) else {}
     stats_obj = result.get("stats") if isinstance(result.get("stats"), dict) else {}
     overall = stats_obj.get("overall") if isinstance(stats_obj.get("overall"), dict) else {}
-    red_anchor_policy = result.get("red_anchor_policy") if isinstance(result.get("red_anchor_policy"), dict) else {}
     unity_quest_world_origin_in_board = None
     if isinstance(calibration, dict):
         unity_quest_world_origin_in_board = (
@@ -4796,11 +6621,9 @@ def calibration_result_event(record_id: str, result: dict[str, Any], result_path
         "keptFrames": order.get("kept_frames"),
         "inputFrames": order.get("input_frames"),
         "appearanceAnchorFrames": order.get("appearance_anchor_frames"),
-        "redAnchorFrames": order.get("red_anchor_frames"),
         "reprojectionOrderFrames": order.get("reprojection_frames"),
         "rot180Frames": order.get("rot180_frames"),
         "appearanceAnchorPolicy": result.get("appearance_anchor_policy") if isinstance(result.get("appearance_anchor_policy"), dict) else {},
-        "redAnchorPolicy": red_anchor_policy,
         "medianReprojectionPx": overall.get("median_px"),
         "p90ReprojectionPx": overall.get("p90_px"),
     }
@@ -4840,10 +6663,9 @@ def recording_calibration_snapshot(output_root: Path | None) -> dict[str, Any] |
         "bestLagSeconds": event.get("bestLagSeconds"),
         "keptFrames": event.get("keptFrames"),
         "inputFrames": event.get("inputFrames"),
-        "redAnchorFrames": event.get("redAnchorFrames"),
+        "appearanceAnchorFrames": event.get("appearanceAnchorFrames"),
         "reprojectionOrderFrames": event.get("reprojectionOrderFrames"),
         "rot180Frames": event.get("rot180Frames"),
-        "redAnchorPolicy": event.get("redAnchorPolicy"),
         "medianReprojectionPx": event.get("medianReprojectionPx"),
         "p90ReprojectionPx": event.get("p90ReprojectionPx"),
     })
@@ -5409,6 +7231,7 @@ def build_preflight_status(
     board_status: dict[str, Any],
     model_status: dict[str, Any],
     udp_status: dict[str, Any] | None = None,
+    capture_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     now = time.time()
     sample_age = None
@@ -5468,6 +7291,12 @@ def build_preflight_status(
     end_stream_ok, end_stream_detail = stream_detail("end", camera_serial)
     third_stream_ok, third_stream_detail = stream_detail("third", third_camera_serial)
     udp_status = udp_status if isinstance(udp_status, dict) else {}
+    capture_state = capture_state if isinstance(capture_state, dict) else {}
+    capture_phase = str(capture_state.get("phase") or "live")
+    capture_busy = capture_phase in ("recording", "saving")
+    capture_detail = str(capture_state.get("detail") or capture_phase)
+    if capture_state.get("recordId"):
+        capture_detail += f" record={capture_state.get('recordId')}"
     last_udp_time = udp_status.get("lastReceiveUnixSeconds")
     last_udp_age = max(0.0, now - float(last_udp_time)) if is_number(last_udp_time) else None
     total_datagrams = int(udp_status.get("totalDatagrams") or 0)
@@ -5485,6 +7314,12 @@ def build_preflight_status(
         )
 
     checks = [
+        {
+            "id": "captureIdle",
+            "label": "PC capture state",
+            "ok": not capture_busy,
+            "detail": capture_detail,
+        },
         {
             "id": "questUdp",
             "label": "Quest UDP receiver",
@@ -5560,6 +7395,7 @@ def build_preflight_status(
         "timestampUnixSeconds": now,
         "sampleAgeSeconds": sample_age,
         "controllerWindow": controller_window,
+        "captureState": capture_state,
         "checks": checks,
         "summary": "ready for Quest recording" if ok else "check required items before Quest recording",
     }
@@ -5632,6 +7468,104 @@ def resolve_robot_mesh_path(path_text: str) -> Path:
     return path
 
 
+def artifact_content_type(suffix: str) -> str:
+    suffix = str(suffix or "").lower()
+    if suffix in (".jpg", ".jpeg"):
+        return "image/jpeg"
+    if suffix == ".png":
+        return "image/png"
+    if suffix == ".mp4":
+        return "video/mp4"
+    if suffix == ".html":
+        return "text/html; charset=utf-8"
+    if suffix in (".json", ".jsonl"):
+        return "application/json; charset=utf-8"
+    if suffix == ".log":
+        return "text/plain; charset=utf-8"
+    return "application/octet-stream"
+
+
+def parse_http_byte_range(header_value: str | None, size: int) -> tuple[int, int] | None:
+    if not header_value:
+        return None
+    text = str(header_value).strip()
+    if not text.startswith("bytes="):
+        raise ValueError("unsupported range unit")
+    spec = text[6:].strip()
+    if "," in spec:
+        raise ValueError("multiple byte ranges are not supported")
+    start_text, sep, end_text = spec.partition("-")
+    if not sep:
+        raise ValueError("invalid byte range")
+    if start_text == "":
+        if end_text == "":
+            raise ValueError("invalid byte range")
+        length = int(end_text)
+        if length <= 0:
+            raise ValueError("invalid byte range")
+        if size <= 0:
+            raise ValueError("invalid byte range")
+        start = max(0, size - length)
+        end = size - 1
+    else:
+        start = int(start_text)
+        end = size - 1 if end_text == "" else int(end_text)
+        if start < 0 or end < start:
+            raise ValueError("invalid byte range")
+    if start >= size:
+        raise ValueError("range start exceeds file size")
+    end = min(end, size - 1)
+    return start, end
+
+
+def send_http_path(handler: BaseHTTPRequestHandler, path: Path, content_type: str) -> None:
+    size = int(path.stat().st_size)
+    range_header = None
+    try:
+        range_header = handler.headers.get("Range")
+    except Exception:
+        range_header = None
+    byte_range = parse_http_byte_range(range_header, size)
+    if byte_range is None and size > MAX_ARTIFACT_BYTES and path.suffix.lower() not in (".mp4", ".bin"):
+        handler.send_error(413, "artifact too large")
+        return
+    start = 0
+    end = max(0, size - 1)
+    status = 200
+    if byte_range is not None:
+        start, end = byte_range
+        status = 206
+    length = 0 if size <= 0 else end - start + 1
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(length))
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Accept-Ranges", "bytes")
+    if status == 206:
+        handler.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+    handler.end_headers()
+    if length <= 0:
+        return
+    with path.open("rb") as handle:
+        handle.seek(start)
+        remaining = length
+        while remaining > 0:
+            chunk = handle.read(min(ARTIFACT_STREAM_CHUNK_BYTES, remaining))
+            if not chunk:
+                break
+            if not write_http_body_safely(handler, chunk):
+                return
+            remaining -= len(chunk)
+
+
+def write_http_body_safely(handler: BaseHTTPRequestHandler, data: bytes) -> bool:
+    try:
+        handler.wfile.write(data)
+        return True
+    except (BrokenPipeError, ConnectionError, ConnectionResetError, ConnectionAbortedError, TimeoutError, OSError):
+        return False
+
+
 def add_board_check_artifact_urls(result: dict[str, Any]) -> None:
     for key in ("imagePath", "overlayPath"):
         path_text = result.get(key)
@@ -5647,6 +7581,26 @@ def quote_path(path_text: str) -> str:
 
 def is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def finite_float(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if math.isfinite(result) else default
+
+
+def finite_int(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        result = int(float(value))
+    except (TypeError, ValueError):
+        return default
+    return result
 
 
 def is_vec3(value: Any) -> bool:
@@ -5757,6 +7711,12 @@ h1 {
   color: #fff1f2;
   box-shadow: 0 0 0 2px rgba(255,79,94,0.22), 0 0 24px rgba(255,79,94,0.24);
 }
+.recording-banner.saving {
+  border-color: #f2c94c;
+  background: #3b3214;
+  color: #fff7d6;
+  box-shadow: 0 0 0 2px rgba(242,201,76,0.20), 0 0 22px rgba(242,201,76,0.20);
+}
 .recording-dot {
   width: 12px;
   height: 12px;
@@ -5766,6 +7726,10 @@ h1 {
 .recording-banner.recording .recording-dot {
   background: #ff4f5e;
   box-shadow: 0 0 14px rgba(255,79,94,0.95);
+}
+.recording-banner.saving .recording-dot {
+  background: #f2c94c;
+  box-shadow: 0 0 14px rgba(242,201,76,0.9);
 }
 .recording-label {
   font-size: 18px;
@@ -6151,9 +8115,14 @@ label {
         <input id="robotNetworkInterfaces" spellcheck="false" placeholder="optional, e.g. 192.168.2.108">
       </label>
       <div class="robot-grid">
-        <label>Capture interval
+        <label>Robot state Hz
+          <input id="robotStateHz" type="number" min="1" step="1">
+        </label>
+        <label>Calib interval s
           <input id="robotInterval" type="number" min="0.05" step="0.05">
         </label>
+      </div>
+      <div class="robot-grid">
         <label>Hand-eye
           <select id="robotHandEye">
             <option value="true">auto</option>
@@ -6175,24 +8144,35 @@ label {
       <label>Gain
         <input id="robotGain" type="number" min="0" max="128" step="1">
       </label>
-      <label>Board warmup
-        <input id="robotBoardWarmup" type="number" min="1" max="120" step="1">
-      </label>
+      <div class="robot-grid">
+        <label>Board warmup
+          <input id="robotBoardWarmup" type="number" min="1" max="120" step="1">
+        </label>
+        <label>Depth record
+          <select id="robotRecordDepth">
+            <option value="true">on</option>
+            <option value="false">off</option>
+          </select>
+        </label>
+        <label>Depth align
+          <select id="robotRecordDepthAlign">
+            <option value="false">raw</option>
+            <option value="true">color</option>
+          </select>
+        </label>
+        <label>Depth every
+          <input id="robotRecordDepthEveryNFrames" type="number" min="1" step="1">
+        </label>
+      </div>
       <div class="robot-grid">
         <label>Motion scale
           <input id="robotMotionScale" type="number" min="0" step="0.1">
         </label>
-        <label>Max offset m
-          <input id="robotMaxOffset" type="number" min="0" step="0.01">
+        <label>Max step m
+          <input id="robotMaxStep" type="number" min="0" step="0.005">
         </label>
       </div>
-      <label>Max step m
-        <input id="robotMaxStep" type="number" min="0" step="0.005">
-      </label>
       <div class="robot-grid">
-        <label>Max rot deg
-          <input id="robotMaxRotation" type="number" min="0" step="1">
-        </label>
         <label>Rot step deg
           <input id="robotMaxRotationStep" type="number" min="0" step="0.5">
         </label>
@@ -6307,16 +8287,18 @@ const robotThirdCamera = document.getElementById('robotThirdCamera');
 const robotSn = document.getElementById('robotSn');
 const robotPoseField = document.getElementById('robotPoseField');
 const robotNetworkInterfaces = document.getElementById('robotNetworkInterfaces');
+const robotStateHz = document.getElementById('robotStateHz');
 const robotInterval = document.getElementById('robotInterval');
 const robotHandEye = document.getElementById('robotHandEye');
 const robotExposureMode = document.getElementById('robotExposureMode');
 const robotExposure = document.getElementById('robotExposure');
 const robotGain = document.getElementById('robotGain');
 const robotBoardWarmup = document.getElementById('robotBoardWarmup');
+const robotRecordDepth = document.getElementById('robotRecordDepth');
+const robotRecordDepthAlign = document.getElementById('robotRecordDepthAlign');
+const robotRecordDepthEveryNFrames = document.getElementById('robotRecordDepthEveryNFrames');
 const robotMotionScale = document.getElementById('robotMotionScale');
-const robotMaxOffset = document.getElementById('robotMaxOffset');
 const robotMaxStep = document.getElementById('robotMaxStep');
-const robotMaxRotation = document.getElementById('robotMaxRotation');
 const robotMaxRotationStep = document.getElementById('robotMaxRotationStep');
 const robotJointLimitBuffer = document.getElementById('robotJointLimitBuffer');
 const robotJointLimitGuard = document.getElementById('robotJointLimitGuard');
@@ -6381,6 +8363,7 @@ const state = {
   clearCalibrationConfirmUntilMs: 0,
   questAdb: null,
   preflight: null,
+  captureState: {phase: 'live', detail: 'not recording'},
   lastPreflightRefreshMs: 0
 };
 
@@ -6396,7 +8379,7 @@ function resetView() {
   state.yaw = -0.72;
   state.pitch = -0.62;
   const bounds = computeBounds();
-  state.target = bounds.center;
+  state.target = [0, 0, 0];
   state.distance = Math.max(0.45, bounds.radius * 3.2);
 }
 
@@ -6445,7 +8428,7 @@ function computeBounds() {
   }
   const center = min.map((value, i) => (value + max[i]) * 0.5);
   let radius = 0.1;
-  for (const p of pts) radius = Math.max(radius, length(sub(p, center)));
+  for (const p of pts) radius = Math.max(radius, length(p));
   return {center, radius};
 }
 
@@ -6480,6 +8463,10 @@ function connect() {
       ingest(sample);
     } else if (sample.type === 'status') {
       updateRecordingStatus(sample);
+    } else if (sample.type === 'capture_state') {
+      updateCaptureState(sample);
+    } else if (sample.type === 'capture_rejected') {
+      state.captureRejected = sample;
     } else if (sample.type === 'calibration_status') {
       updateCalibrationStatus(sample);
     } else if (sample.type === 'calibration_result') {
@@ -6661,6 +8648,7 @@ async function loadPreflightStatus() {
 
 function renderPreflight(payload) {
   state.preflight = payload || {};
+  if (payload?.captureState) updateCaptureState(payload.captureState);
   const ready = Boolean(payload?.ready);
   preflightStatus.classList.toggle('ready', ready);
   preflightStatus.textContent = ready ? 'READY' : (payload?.summary || 'check required');
@@ -6692,6 +8680,11 @@ async function loadQuestAdbStatus() {
 
 async function sendQuestCalibrationCommand(command) {
   const button = command === 'calib_start' ? questCalibStart : questCalibStop;
+  if (command === 'calib_start' && captureBusy()) {
+    renderQuestAdb({...(state.questAdb || {}), ok: false, ready: Boolean(state.questAdb?.ready), error: 'PC is recording or saving'});
+    syncQuestCommandButtons();
+    return;
+  }
   button.disabled = true;
   questAdbStatus.textContent = `sending ${command}...`;
   try {
@@ -6704,7 +8697,7 @@ async function sendQuestCalibrationCommand(command) {
   } catch (error) {
     renderQuestAdb({ok: false, ready: false, error: String(error)});
   } finally {
-    button.disabled = !state.questAdb?.ready;
+    syncQuestCommandButtons();
   }
 }
 
@@ -6722,9 +8715,7 @@ function renderQuestAdb(payload) {
   if (payload?.error) lines.push(`error: ${payload.error}`);
   if (payload?.stderr) lines.push(`stderr: ${payload.stderr}`);
   questAdbStatus.textContent = lines.join('\n');
-  const ready = Boolean(payload?.ready);
-  questCalibStart.disabled = !ready;
-  questCalibStop.disabled = !ready;
+  syncQuestCommandButtons();
   const manual = payload?.manualPowerShell || {};
   const manualText = [
     'Manual PowerShell when the Quest is connected to this Windows PC:',
@@ -6798,18 +8789,20 @@ function robotPayloadFromControls() {
     networkInterfaces: robotNetworkInterfaces.value.split(/[,\s;]+/).map(v => v.trim()).filter(Boolean),
     cameraSerial: endSerial,
     thirdCameraSerial: thirdSerial,
+    robotStateHz: Number(robotStateHz.value || 90),
     captureIntervalSeconds: Number(robotInterval.value || 0.35),
+    recordDepth: robotRecordDepth.value !== 'false',
+    recordDepthAlignToColor: robotRecordDepthAlign.value === 'true',
+    recordDepthEveryNFrames: Math.max(1, Math.floor(Number(robotRecordDepthEveryNFrames.value || 3))),
     realsenseAutoExposure: robotExposureMode.value !== 'manual',
     realsenseExposure: robotExposure.value ? Number(robotExposure.value) : null,
     realsenseGain: robotGain.value ? Number(robotGain.value) : null,
     boardCheckWarmupFrames: Number(robotBoardWarmup.value || 60),
     runHandEye: robotHandEye.value === 'true',
     controllerTranslationScale: Number(robotMotionScale.value || 1.0),
-    controllerMaxOffsetM: Number(robotMaxOffset.value || 0.18),
-    controllerMaxStepM: Number(robotMaxStep.value || 0.025),
-    controllerMaxRotationDeg: Number(robotMaxRotation.value || 30.0),
-    controllerMaxRotationStepDeg: Number(robotMaxRotationStep.value || 2.0),
-    controllerJointLimitBufferRad: Number(robotJointLimitBuffer.value || 0.08),
+    controllerMaxStepM: Number(robotMaxStep.value || 0.04),
+    controllerMaxRotationStepDeg: Number(robotMaxRotationStep.value || 4.0),
+    controllerJointLimitBufferRad: Number(robotJointLimitBuffer.value || 0.04),
     controllerJointLimitGuardEnabled: robotJointLimitGuard.value !== 'false',
     gripperEnabled: robotGripperEnabled.value === 'true',
     gripperDevice: robotGripperDevice.value.trim(),
@@ -6902,13 +8895,6 @@ function renderRobotBoardCheck(payload) {
   ];
   if (Number.isFinite(payload?.bestReprojectionRmsePx)) {
     lines.push(`reproj: ${payload.bestReprojectionRmsePx.toFixed(2)} px`);
-  }
-  const anchor = payload?.redAnchor;
-  if (anchor) {
-    const anchorText = anchor.ok
-      ? `red anchor: corner ${anchor.observedIndex} -> target ${anchor.targetIndex}, ${anchor.order}, score ${Number(anchor.bestScore || 0).toFixed(3)}`
-      : `red anchor: ${anchor.reason || 'not found'}`;
-    lines.push(anchorText);
   }
   if (Number.isFinite(payload?.brightness?.mean) && Number.isFinite(payload?.brightness?.p95)) {
     lines.push(`brightness: mean ${payload.brightness.mean.toFixed(1)}, p95 ${payload.brightness.p95.toFixed(1)}`);
@@ -7003,21 +8989,25 @@ function applyRobotStatus(payload) {
   }
   setCameraSelectValue(robotCamera, config.cameraSerial);
   setCameraSelectValue(robotThirdCamera, config.thirdCameraSerial);
+  if (Number.isFinite(config.robotStateHz)) robotStateHz.value = config.robotStateHz;
   if (Number.isFinite(config.captureIntervalSeconds)) robotInterval.value = config.captureIntervalSeconds;
   if (typeof config.realsenseAutoExposure === 'boolean') robotExposureMode.value = config.realsenseAutoExposure ? 'auto' : 'manual';
   if (Number.isFinite(config.realsenseExposure)) robotExposure.value = config.realsenseExposure;
   if (Number.isFinite(config.realsenseGain)) robotGain.value = config.realsenseGain;
   if (Number.isFinite(config.boardCheckWarmupFrames)) robotBoardWarmup.value = config.boardCheckWarmupFrames;
+  if (typeof config.recordDepth === 'boolean') robotRecordDepth.value = config.recordDepth ? 'true' : 'false';
+  if (typeof config.recordDepthAlignToColor === 'boolean') robotRecordDepthAlign.value = config.recordDepthAlignToColor ? 'true' : 'false';
+  if (Number.isFinite(config.recordDepthEveryNFrames)) robotRecordDepthEveryNFrames.value = config.recordDepthEveryNFrames;
   if (typeof config.runHandEye === 'boolean') robotHandEye.value = config.runHandEye ? 'true' : 'false';
   if (Number.isFinite(config.controllerTranslationScale)) robotMotionScale.value = config.controllerTranslationScale;
-  if (Number.isFinite(config.controllerMaxOffsetM)) robotMaxOffset.value = config.controllerMaxOffsetM;
   if (Number.isFinite(config.controllerMaxStepM)) robotMaxStep.value = config.controllerMaxStepM;
-  if (Number.isFinite(config.controllerMaxRotationDeg)) robotMaxRotation.value = config.controllerMaxRotationDeg;
   if (Number.isFinite(config.controllerMaxRotationStepDeg)) robotMaxRotationStep.value = config.controllerMaxRotationStepDeg;
   if (Number.isFinite(config.controllerJointLimitBufferRad)) robotJointLimitBuffer.value = config.controllerJointLimitBufferRad;
   if (typeof config.controllerJointLimitGuardEnabled === 'boolean') robotJointLimitGuard.value = config.controllerJointLimitGuardEnabled ? 'true' : 'false';
   if (typeof config.gripperEnabled === 'boolean') robotGripperEnabled.value = config.gripperEnabled ? 'true' : 'false';
-  if (config.gripperDevice && !robotGripperDevice.value) robotGripperDevice.value = config.gripperDevice;
+  if (config.gripperDevice && document.activeElement !== robotGripperDevice) {
+    robotGripperDevice.value = config.gripperDevice;
+  }
   if (Number.isFinite(config.gripperOpenWidthM)) robotGripperOpen.value = config.gripperOpenWidthM;
   if (Number.isFinite(config.gripperCloseWidthM)) robotGripperClose.value = config.gripperCloseWidthM;
   if (Number.isFinite(config.gripperSpeedMps)) robotGripperSpeed.value = config.gripperSpeedMps;
@@ -7080,6 +9070,11 @@ function renderRobotStatus(payload) {
   const cartesianLoopAlive = Boolean(robot.cartesianControlLoopAlive || robot.freeDragLoopAlive || robot.freedriveLoopAlive);
   const freeDragLastError = robot.freeDragLastError || robot.freedriveLastError || '';
   const cartesianSendSignature = robot.cartesianSendSignature || '';
+  const gripper = robot.gripper || {};
+  const depthRecordingEnabled = payload.config?.recordDepth !== false;
+  const sessionText = payload.activeSession
+    ? `${active.samples || 0} samples, ${active.images || 0} images${depthRecordingEnabled ? `, ${active.depthFrames ?? 0} depth` : ', depth off'}`
+    : 'idle';
   const teleopText = controlMode === 'controller_teleop'
     ? `hold right middle-finger trigger${robot.motionArmed ? ' (motion mode active)' : ' (motion not armed)'}`
     : 'off';
@@ -7091,14 +9086,17 @@ function renderRobotStatus(payload) {
     `cartesian loop: ${cartesianLoopAlive ? 'running' : 'off'}${cartesianSendSignature ? ` (${cartesianSendSignature})` : ''}`,
     `controller motion: ${payload.config?.controllerMotionEnabled ? 'enabled' : 'disabled'}`,
     `joint guard: ${robotJointGuardText(robot.state?.jointLimitGuard, payload.config)}`,
+    `gripper: ${robotGripperStatusText(gripper, payload.config)}`,
+    `devices: ${robotDevicesText(robot.devices)}`,
     `pose: ${robot.poseField || 'n/a'}`,
     `rdk iface: ${(payload.config?.networkInterfaces || []).join(', ') || 'default'}`,
     `camera: ${payload.config?.cameraSerial || 'n/a'}`,
     `third camera: ${payload.config?.thirdCameraSerial || 'off'}`,
+    `depth record: ${depthRecordingEnabled ? `${payload.config?.recordDepthAlignToColor ? 'aligned' : 'raw'} every ${payload.config?.recordDepthEveryNFrames || 1} frame(s)` : 'off'}`,
     `stream: ${realsenseStreamText(payload.realsenseStream)}`,
     `exposure: ${payload.config?.realsenseAutoExposure === false ? 'manual' : 'auto'}${Number.isFinite(payload.config?.realsenseExposure) ? ` ${payload.config.realsenseExposure}` : ''}${Number.isFinite(payload.config?.realsenseGain) ? ` gain ${payload.config.realsenseGain}` : ''}`,
     `robot frame: ${state.robotWorldBase ? 'aligned to Quest/world' : 'unaligned at viewer origin, Z up'}`,
-    `session: ${payload.activeSession ? `${active.samples || 0} samples, ${active.images || 0} images` : 'idle'}`
+    `session: ${sessionText}`
   ];
   lines.push(`model: ${robotModelStatusText()}`);
   if (state.robotSample) {
@@ -7170,8 +9168,12 @@ function robotSampleLabel(sample) {
 function realsenseStreamText(stream) {
   if (!stream) return 'n/a';
   if (!stream.running) return stream.lastError ? `stopped (${stream.lastError})` : 'stopped';
-  const roles = Array.isArray(stream.roles) ? stream.roles.join(',') : 'n/a';
-  return `running ${roles} frames=${stream.frameCount ?? 0}`;
+  const roleList = Array.isArray(stream.roles) ? stream.roles : [];
+  const roles = roleList.length ? roleList.join(',') : 'n/a';
+  const metadata = stream.metadata || {};
+  const depthRoles = roleList.filter(role => metadata?.[role]?.depthEnabled);
+  const depthText = depthRoles.length ? ` depth=${depthRoles.join(',')}` : ' depth=off';
+  return `running ${roles} frames=${stream.frameCount ?? 0}${depthText}`;
 }
 
 function robotMotionSummaryText(event) {
@@ -7240,10 +9242,37 @@ function robotControllerInputText(controller) {
 
 function robotGripperSummaryText(event) {
   if (!event) return 'n/a';
+  const device = event.device ? ` ${event.device}` : '';
   const trigger = Number.isFinite(event.trigger) ? ` trig ${Number(event.trigger).toFixed(2)}` : '';
   const width = Number.isFinite(event.targetWidthM) ? ` width ${(Number(event.targetWidthM) * 1000).toFixed(1)}mm` : '';
-  if (event.ok && event.commandSent) return `${event.action || 'move'}${trigger}${width}`;
-  return `${event.reason || event.error || event.action || 'skip'}${trigger}`;
+  const attempts = Array.isArray(event.status?.enableAttempts) ? ` attempts ${event.status.enableAttempts.length}` : '';
+  if (event.ok && event.commandSent) return `${event.action || 'move'}${device}${trigger}${width}`;
+  return `${event.reason || event.error || event.action || 'skip'}${device}${trigger}${attempts}`;
+}
+
+function robotGripperStatusText(gripper, config) {
+  if (config?.gripperEnabled !== true) return 'off';
+  if (!gripper) return 'enabled, status missing';
+  const parts = [gripper.enabled ? 'ready' : 'not ready'];
+  if (gripper.device) parts.push(`device=${gripper.device}`);
+  else if (config?.gripperDevice) parts.push(`target=${config.gripperDevice}`);
+  const paramsName = gripper.params?.name;
+  if (paramsName && paramsName !== gripper.device) parts.push(`params=${paramsName}`);
+  if (Number.isFinite(gripper.states?.width)) parts.push(`width=${(Number(gripper.states.width) * 1000).toFixed(1)}mm`);
+  if (gripper.lastError) parts.push(`error=${gripper.lastError}`);
+  if (Array.isArray(gripper.enableAttempts) && gripper.enableAttempts.length) {
+    const last = gripper.enableAttempts[gripper.enableAttempts.length - 1];
+    parts.push(`lastAttempt=${last.device || 'n/a'}:${last.ok ? 'ok' : 'fail'}`);
+  }
+  return parts.join(', ');
+}
+
+function robotDevicesText(devices) {
+  const list = devices?.list;
+  if (!list || typeof list !== 'object') return devices?.lastError ? `unavailable (${devices.lastError})` : 'n/a';
+  const names = Object.keys(list);
+  if (!names.length) return 'none';
+  return names.map(name => `${name}${list[name] ? '*' : ''}`).join(', ');
 }
 
 function robotModelStatusText() {
@@ -7326,14 +9355,55 @@ function maybeRefreshPreflight() {
 }
 
 function updateRecordingStatus(frame) {
+  const currentPhase = state.captureState?.phase || 'live';
+  if (currentPhase === 'saving') {
+    renderCaptureBanner();
+    return;
+  }
   const isRecording = !!frame.isRecording;
-  recordingBanner.classList.toggle('recording', isRecording);
-  recordingLabel.textContent = isRecording ? 'REC' : 'LIVE';
-  recordingDetail.textContent = isRecording ? 'recording' : 'not recording';
+  if (frame.type === 'status') {
+    state.captureState = {
+      phase: isRecording ? 'recording' : 'live',
+      recordId: frame.recordId,
+      detail: isRecording ? 'PC formal recording' : 'not recording'
+    };
+  }
+  renderCaptureBanner();
   statusEl.textContent =
     `mode: ${frame.telemetryMode ?? (isRecording ? 'recording' : 'live_preview')}\n` +
     `record: ${frame.recordId ?? 'n/a'}\n` +
     `waiting for ${isRecording ? 'recording' : 'live'} samples...`;
+}
+
+function updateCaptureState(event) {
+  state.captureState = {
+    ...(state.captureState || {}),
+    ...(event || {})
+  };
+  renderCaptureBanner();
+  syncQuestCommandButtons();
+}
+
+function renderCaptureBanner() {
+  const phase = state.captureState?.phase || 'live';
+  const isRecording = phase === 'recording';
+  const isSaving = phase === 'saving';
+  recordingBanner.classList.toggle('recording', isRecording);
+  recordingBanner.classList.toggle('saving', isSaving);
+  recordingLabel.textContent = isSaving ? 'SAVING' : (isRecording ? 'REC' : 'LIVE');
+  recordingDetail.textContent = state.captureState?.detail || (isSaving ? 'saving recording' : (isRecording ? 'recording' : 'not recording'));
+}
+
+function captureBusy() {
+  const phase = state.captureState?.phase || 'live';
+  return phase === 'recording' || phase === 'saving';
+}
+
+function syncQuestCommandButtons() {
+  const ready = Boolean(state.questAdb?.ready);
+  const busy = captureBusy();
+  questCalibStart.disabled = !ready || busy;
+  questCalibStop.disabled = !ready;
 }
 
 function updateCalibrationStatus(event) {
@@ -7498,9 +9568,6 @@ function renderCalibrationResult(event) {
   const normalAngle = Number.isFinite(event.boardNormalAbsAngleToWorldZDeg)
     ? `${event.boardNormalAbsAngleToWorldZDeg.toFixed(1)} deg`
     : 'n/a';
-  const redAnchorFrames = Number.isFinite(event.redAnchorFrames)
-    ? `${event.redAnchorFrames} / ${event.keptFrames ?? 'n/a'}`
-    : 'n/a';
   calibrationDetails.innerHTML = `
     <div class="calibration-ok">Calibration succeeded</div>
     <div class="calibration-kv">
@@ -7508,7 +9575,7 @@ function renderCalibrationResult(event) {
       <span>image y</span><span>${escapeHtml(event.imageYAxis || 'n/a')}</span>
       <span>lag</span><span>${lag}</span>
       <span>kept frames</span><span>${event.keptFrames ?? 'n/a'} / ${event.inputFrames ?? 'n/a'}</span>
-      <span>red anchor</span><span>${redAnchorFrames}</span>
+      <span>appearance anchor</span><span>${event.appearanceAnchorFrames ?? 'n/a'} / ${event.keptFrames ?? 'n/a'}</span>
       <span>rot180</span><span>${event.rot180Frames ?? 'n/a'}</span>
       <span>median / p90</span><span>${median} / ${p90}</span>
       <span>board Z vs world Z</span><span>${normalAngle}</span>
@@ -7544,7 +9611,6 @@ function renderCalibrationDiagnostics(event) {
       <span>gate</span><span>${threshold}</span>
       <span>kept frames</span><span>${summary.kept_frames ?? 'n/a'} / ${summary.input_frames ?? 'n/a'}</span>
       <span>appearance anchor</span><span>${summary.appearance_anchor_frames ?? 'n/a'} / ${summary.kept_frames ?? 'n/a'}</span>
-      <span>red anchor</span><span>${summary.red_anchor_frames ?? 'n/a'} / ${summary.kept_frames ?? 'n/a'}</span>
       <span>best error</span><span>${bestStats}</span>
     </div>
     ${detectionsHtml}
@@ -7578,9 +9644,6 @@ function renderFramePreview(rows) {
     `${row.side} f${row.frame_index}: ${fmtPx(row.best_median_px)} ${row.best_order} ${row.order_source || ''}` +
     (Number.isFinite(row.appearance_anchor_observed_index) && row.appearance_anchor_observed_index >= 0
       ? ` app ${row.appearance_anchor_observed_index}->${row.appearance_anchor_target_index}`
-      : '') +
-    (Number.isFinite(row.red_anchor_observed_index) && row.red_anchor_observed_index >= 0
-      ? ` red ${row.red_anchor_observed_index}->${row.red_anchor_target_index}`
       : '')
   ).join('<br>');
   return `<div><strong>Best frames</strong><br>${text}</div>`;
@@ -7819,7 +9882,8 @@ function renderMeshPolygons(polygons) {
 
 function updateStatus(frame) {
   updateRecordingStatus(frame);
-  const isRecording = !!frame.isRecording;
+  const phase = state.captureState?.phase || 'live';
+  const isRecording = phase === 'recording' || !!frame.isRecording;
   const t = Number.isFinite(frame.recordingTimestampSeconds)
     ? frame.recordingTimestampSeconds.toFixed(3) + 's'
     : 'n/a';
@@ -7837,26 +9901,30 @@ function updateStatus(frame) {
 }
 
 function drawRecordingOverlay(frame) {
-  const isRecording = !!frame.isRecording;
-  const label = isRecording ? 'REC' : 'LIVE';
-  const detail = isRecording ? (frame.recordId ?? 'recording') : 'not recording';
+  const phase = state.captureState?.phase || (!!frame.isRecording ? 'recording' : 'live');
+  const isRecording = phase === 'recording';
+  const isSaving = phase === 'saving';
+  const label = isSaving ? 'SAVING' : (isRecording ? 'REC' : 'LIVE');
+  const detail = isSaving
+    ? (state.captureState?.detail || 'saving recording')
+    : (isRecording ? (frame.recordId ?? state.captureState?.recordId ?? 'recording') : 'not recording');
   ctx.save();
   ctx.font = '700 18px system-ui, sans-serif';
   const labelWidth = ctx.measureText(label).width;
   ctx.font = '12px system-ui, sans-serif';
   const detailWidth = ctx.measureText(detail).width;
   const width = Math.max(104, labelWidth + detailWidth + 54);
-  ctx.fillStyle = isRecording ? 'rgba(88,20,28,0.92)' : 'rgba(28,35,41,0.88)';
-  ctx.strokeStyle = isRecording ? 'rgba(255,79,94,0.95)' : 'rgba(80,96,108,0.85)';
+  ctx.fillStyle = isSaving ? 'rgba(59,50,20,0.94)' : (isRecording ? 'rgba(88,20,28,0.92)' : 'rgba(28,35,41,0.88)');
+  ctx.strokeStyle = isSaving ? 'rgba(242,201,76,0.95)' : (isRecording ? 'rgba(255,79,94,0.95)' : 'rgba(80,96,108,0.85)');
   roundRect(16, 16, width, 42, 8);
   ctx.fill();
   ctx.stroke();
   ctx.beginPath();
   ctx.arc(37, 37, 6, 0, Math.PI * 2);
-  ctx.fillStyle = isRecording ? '#ff4f5e' : '#7b8994';
+  ctx.fillStyle = isSaving ? '#f2c94c' : (isRecording ? '#ff4f5e' : '#7b8994');
   ctx.fill();
-  if (isRecording) {
-    ctx.shadowColor = 'rgba(255,79,94,0.95)';
+  if (isRecording || isSaving) {
+    ctx.shadowColor = isSaving ? 'rgba(242,201,76,0.9)' : 'rgba(255,79,94,0.95)';
     ctx.shadowBlur = 12;
     ctx.fill();
     ctx.shadowBlur = 0;
@@ -7864,7 +9932,7 @@ function drawRecordingOverlay(frame) {
   ctx.fillStyle = '#fff';
   ctx.font = '700 18px system-ui, sans-serif';
   ctx.fillText(label, 51, 42);
-  ctx.fillStyle = isRecording ? '#ffd9dd' : '#b8c4ce';
+  ctx.fillStyle = isSaving ? '#fff2bd' : (isRecording ? '#ffd9dd' : '#b8c4ce');
   ctx.font = '12px system-ui, sans-serif';
   ctx.fillText(detail, 51 + labelWidth + 12, 41);
   ctx.restore();
@@ -8204,7 +10272,7 @@ clearCalibration.addEventListener('click', clearCalibrationClick);
 questAdbRefresh.addEventListener('click', loadQuestAdbStatus);
 questCalibStart.addEventListener('click', () => sendQuestCalibrationCommand('calib_start'));
 questCalibStop.addEventListener('click', () => sendQuestCalibrationCommand('calib_stop'));
-for (const input of [robotCamera, robotThirdCamera, robotSn, robotPoseField, robotNetworkInterfaces, robotInterval, robotHandEye, robotExposureMode, robotExposure, robotGain, robotBoardWarmup, robotMotionScale, robotMaxOffset, robotMaxStep, robotMaxRotation, robotMaxRotationStep, robotJointLimitBuffer, robotJointLimitGuard]) {
+for (const input of [robotCamera, robotThirdCamera, robotSn, robotPoseField, robotNetworkInterfaces, robotStateHz, robotInterval, robotHandEye, robotExposureMode, robotExposure, robotGain, robotBoardWarmup, robotRecordDepth, robotRecordDepthAlign, robotRecordDepthEveryNFrames, robotMotionScale, robotMaxStep, robotMaxRotationStep, robotJointLimitBuffer, robotJointLimitGuard, robotGripperEnabled, robotGripperDevice, robotGripperOpen, robotGripperClose, robotGripperSpeed, robotGripperForce]) {
   input.addEventListener('change', configureRobot);
 }
 document.getElementById('records').addEventListener('click', () => {
@@ -8442,7 +10510,7 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
     <div class="topbar">
       <button id="playBtn">Play</button>
       <button id="resetBtn">Reset</button>
-      <label class="pill"><input id="centerBoard" type="checkbox" checked> center board</label>
+      <span class="pill">pivot origin</span>
     </div>
     <div class="topbar">
       <label class="pill">Gaze
@@ -8501,7 +10569,6 @@ const liveBtn = document.getElementById('liveBtn');
 const refreshBtn = document.getElementById('refreshBtn');
 const playBtn = document.getElementById('playBtn');
 const resetBtn = document.getElementById('resetBtn');
-const centerBoard = document.getElementById('centerBoard');
 const gazeMode = document.getElementById('gazeMode');
 const scrub = document.getElementById('scrub');
 const recordTitle = document.getElementById('recordTitle');
@@ -8533,6 +10600,7 @@ const state = {
   robotModel: null,
   robotMeshes: {},
   robotMeshPending: {},
+  cameraStripKey: '',
   trails: {head: [], left: [], right: [], gaze: [], gazeFiltered: [], gazeBoardPlane: [], hit: [], robot: []}
 };
 
@@ -8606,6 +10674,11 @@ function robotRecordSummaryText(summary) {
     parts.push(`motion ${summary.motionCommands}/${skips}/${errors}`);
     if (summary.lastMotionReason) parts.push(String(summary.lastMotionReason).slice(0, 48));
   }
+  const perf = effectiveRobotPerformance(summary.performance);
+  const robotHz = perf?.robotState?.effectiveHz;
+  if (Number.isFinite(Number(robotHz))) parts.push(`state ${Number(robotHz).toFixed(1)}Hz`);
+  const cameraText = robotPerformanceCameraBrief(perf);
+  if (cameraText) parts.push(cameraText);
   if (summary.residualMedianMm !== null && summary.residualMedianMm !== undefined && Number.isFinite(Number(summary.residualMedianMm))) {
     parts.push(`res ${Number(summary.residualMedianMm).toFixed(1)}mm`);
   }
@@ -8613,6 +10686,33 @@ function robotRecordSummaryText(summary) {
     parts.push(String(summary.failureReason).slice(0, 80));
   }
   return parts.join(' | ');
+}
+
+function effectiveRobotPerformance(performancePayload) {
+  const payload = performancePayload || {};
+  const robot = payload.robotState || {};
+  const cameras = payload.cameras || {};
+  const hasRobot = Number.isFinite(Number(robot.effectiveHz)) || Number(robot.count || 0) > 0;
+  const hasCamera = Object.values(cameras).some(role => {
+    const video = role?.video || {};
+    return Number.isFinite(Number(video.effectiveHz)) || Number(video.count || 0) > 0;
+  });
+  if (hasRobot || hasCamera) return payload;
+  return payload.computedFromJsonl || payload;
+}
+
+function robotPerformanceCameraBrief(performancePayload) {
+  const perf = effectiveRobotPerformance(performancePayload);
+  const cameras = perf?.cameras || {};
+  const parts = [];
+  for (const [role, row] of Object.entries(cameras)) {
+    const hz = Number(row?.video?.effectiveHz);
+    const drop = Number(row?.queueDropRatio);
+    if (Number.isFinite(hz)) {
+      parts.push(`${role} ${hz.toFixed(1)}Hz${Number.isFinite(drop) && drop > 0 ? ` drop ${(drop * 100).toFixed(1)}%` : ''}`);
+    }
+  }
+  return parts.join(', ');
 }
 
 function calibrationRecordSummaryText(record) {
@@ -8641,6 +10741,7 @@ async function loadRecord(recordId, source = null) {
   state.data = await response.json();
   state.idx = 0;
   state.t = state.data.samples?.[0]?.recordingTimestampSeconds || 0;
+  state.cameraStripKey = '';
   buildTrails();
   updateScrub();
   updateSnapshotInfo();
@@ -8660,7 +10761,7 @@ function buildTrails() {
     if (s.gazeBoardPlane?.p) state.trails.gazeBoardPlane.push(s.gazeBoardPlane.p);
     if (s.gazeHit?.p) state.trails.hit.push(s.gazeHit.p);
   }
-  for (const row of state.data?.robotRealSense?.samples || []) {
+  for (const row of robotPoseRows()) {
     const p = matrixTranslation(row.T_display_ee?.matrix_4x4);
     if (p) state.trails.robot.push(p);
   }
@@ -8799,25 +10900,35 @@ function updateRobotInfo() {
   const result = rr.result || {};
   const failure = rr.failure || {};
   const session = rr.session || {};
+  const config = rr.config || {};
   const counts = result.counts || failure.counts || {};
   const residual = result.end_camera?.residuals?.translation_mm || {};
   const align = result.questAlignment || {};
   const diversity = result.diversity || failure.diversity || rr.poseDiversity;
+  const robotStates = Array.isArray(rr.robotStates) ? rr.robotStates.length : 0;
   const sample = state.data?.samples?.[state.idx] || {};
   const robot = nearestRobotSample(sample.recordingTimestampSeconds);
   const fkError = replayRobotFkErrorMm(robot);
   const cameraRoles = Array.isArray(session.cameraRoles) ? session.cameraRoles.join(', ') : 'n/a';
   const gripperEvents = Array.isArray(rr.gripper) ? rr.gripper.filter(row => row.commandSent).length : 0;
+  const perf = effectiveRobotPerformance(rr.performance || {});
+  const robotHz = Number(perf?.robotState?.effectiveHz);
+  const robotGap = Number(perf?.robotState?.gapSeconds?.p95);
+  const cameraPerfText = robotPerformanceCameraBrief(perf) || 'n/a';
+  const depthEnabled = config.recordDepth !== false;
+  const depthFrames = session.depthFrames ?? rr.depthFrameCount ?? 0;
   const detections = counts.requiredDetections !== undefined
     ? `${counts.detections ?? 'n/a'} / ${counts.requiredDetections}`
     : (counts.detections ?? 'n/a');
   const kv = [
-    ['samples', String(rr.samples?.length || 0)],
+    ['samples', `${rr.samples?.length || 0} aligned / ${robotStates} states`],
     ['detections', detections],
     ['model', replayRobotModelStatusText()],
     ['URDF FK', Number.isFinite(fkError) ? `${fkError.toFixed(1)}mm vs flange` : 'n/a'],
     ['ee motion', replayPoseDiversityText(diversity)],
     ['cameras', cameraRoles],
+    ['perf', `${Number.isFinite(robotHz) ? `state ${robotHz.toFixed(1)}Hz` : 'state n/a'}${Number.isFinite(robotGap) ? ` gap95 ${(robotGap * 1000).toFixed(1)}ms` : ''}; ${cameraPerfText}`],
+    ['depth', depthEnabled ? `${depthFrames} depth frames / ${rr.videoFrameCount ?? 'n/a'} video rows` : 'disabled'],
     ['motion', replayMotionSummaryText(session)],
     ['gripper', `cmd ${session.gripperCommands ?? gripperEvents}, err ${session.gripperErrors ?? 0}`],
     ['hand-eye', result.ok ? 'ok' : (rr.failure ? 'failed' : 'pending')],
@@ -8914,8 +11025,9 @@ function updateLabels() {
   recordingLabel.textContent = s.isRecording ? 'REC' : 'LIVE';
   recordingLabel.className = s.isRecording ? 'rec' : 'ok';
   const robot = nearestRobotSample(s.recordingTimestampSeconds);
-  const imageRoles = robot?.images ? Object.keys(robot.images).filter(role => robot.images[role]?.url) : [];
-  const videoRoles = robot?.videos ? Object.keys(robot.videos).filter(role => robot.videos[role]?.url) : [];
+  const robotMedia = nearestRobotMediaSample(s.recordingTimestampSeconds);
+  const imageRoles = robotMedia?.images ? Object.keys(robotMedia.images).filter(role => robotMedia.images[role]?.url) : [];
+  const videoRoles = robotMedia?.videos ? Object.keys(robotMedia.videos).filter(role => robotMedia.videos[role]?.url) : [];
   const gripper = nearestGripperEvent(s.recordingTimestampSeconds);
   const kv = [
     ['gaze3D', s.gaze?.ok ? (s.gaze.source || 'ok') : 'missing'],
@@ -8928,12 +11040,12 @@ function updateLabels() {
     ['left input', robotControllerInputText(s.left) || 'n/a'],
     ['right input', robotControllerInputText(s.right) || 'n/a'],
     ['head', s.head?.ok ? (s.head.source || 'ok') : 'missing'],
-    ['robot sample', robot ? `${robot.sampleIndex ?? 'n/a'} / q${robot.questSampleIndex ?? 'n/a'}` : 'n/a'],
+    ['robot sample', robot ? `${robot.sampleIndex ?? 'n/a'} / ${robot.sourceStream || 'robot'}` : 'n/a'],
     ['media', [...new Set([...imageRoles, ...videoRoles])].join(', ') || 'n/a'],
     ['gripper', gripper ? replayGripperText(gripper) : 'n/a']
   ];
   sampleKv.innerHTML = kv.map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
-  renderCameraStrip(robot);
+  renderCameraStrip(robotMedia);
 }
 
 function renderCameraStrip(robot) {
@@ -8943,9 +11055,19 @@ function renderCameraStrip(robot) {
   const imageEntries = Object.entries(images).filter(([role, item]) => item?.url && !videos[role]?.url);
   const entries = [...videoEntries, ...imageEntries];
   if (!entries.length) {
-    cameraStrip.innerHTML = '';
+    if (state.cameraStripKey !== '') {
+      cameraStrip.innerHTML = '';
+      state.cameraStripKey = '';
+    }
     return;
   }
+  const stripKey = entries.map(([role, item]) => {
+    const url = String(item.url || '');
+    const frame = Number.isFinite(item.frameIndex) ? String(item.frameIndex) : '';
+    return `${role}:${url}:${frame}`;
+  }).join('|');
+  if (stripKey === state.cameraStripKey) return;
+  state.cameraStripKey = stripKey;
   cameraStrip.innerHTML = entries.map(([role, item]) => {
     const label = `${role}${Number.isFinite(item.frameIndex) ? ` #${item.frameIndex}` : ''}`;
     if (String(item.url || '').toLowerCase().includes('.mp4')) {
@@ -9029,7 +11151,7 @@ function resetView() {
       if (s[key]?.p) pts.push(s[key].p);
     }
   }
-  for (const row of state.data?.robotRealSense?.samples || []) {
+  for (const row of robotPoseRows()) {
     for (const key of ['T_display_tool_tcp', 'T_display_ee', 'T_display_end_camera']) {
       const p = matrixTranslation(row[key]?.matrix_4x4);
       if (p) pts.push(p);
@@ -9047,8 +11169,7 @@ function resetView() {
       max[i] = Math.max(max[i], p[i]);
     }
   }
-  const center = [(min[0]+max[0])*0.5, (min[1]+max[1])*0.5, (min[2]+max[2])*0.5];
-  if (!centerBoard.checked) state.target = center;
+  state.target = [0,0,0];
   let radius = 0.12;
   for (const p of pts) radius = Math.max(radius, length(sub(p, state.target)));
   state.distance = Math.max(0.35, radius * 3.1);
@@ -9056,7 +11177,6 @@ function resetView() {
 
 function render() {
   const rect = canvas.getBoundingClientRect();
-  if (centerBoard.checked) state.target = [0,0,0];
   ctx.clearRect(0, 0, rect.width, rect.height);
   ctx.fillStyle = '#080a0c';
   ctx.fillRect(0, 0, rect.width, rect.height);
@@ -9347,7 +11467,24 @@ function renderMeshPolygons(polygons) {
 }
 
 function nearestRobotSample(t) {
-  const rows = state.data?.robotRealSense?.samples || [];
+  const rows = robotPoseRows();
+  if (!rows.length) return null;
+  if (!Number.isFinite(t)) return rows[0];
+  let best = rows[0], bestDt = Infinity;
+  for (const row of rows) {
+    const rt = Number(row.recordingTimestampSeconds);
+    if (!Number.isFinite(rt)) continue;
+    const dt = Math.abs(rt - t);
+    if (dt < bestDt) {
+      best = row;
+      bestDt = dt;
+    }
+  }
+  return best;
+}
+
+function nearestRobotMediaSample(t) {
+  const rows = robotMediaRows();
   if (!rows.length) return null;
   if (!Number.isFinite(t)) return rows[0];
   let best = rows[0], bestDt = Infinity;
@@ -9457,6 +11594,17 @@ function replayBoardMatrix() {
   return state.data?.boardMatrix || identityMatrix4();
 }
 
+function robotPoseRows() {
+  const rr = state.data?.robotRealSense;
+  if (Array.isArray(rr?.robotStates) && rr.robotStates.length) return rr.robotStates;
+  return Array.isArray(rr?.samples) ? rr.samples : [];
+}
+
+function robotMediaRows() {
+  const rows = state.data?.robotRealSense?.samples;
+  return Array.isArray(rows) ? rows : [];
+}
+
 function robotFrames(model, jointpose, baseMatrix) {
   const frames = [baseMatrix];
   let current = baseMatrix;
@@ -9554,7 +11702,6 @@ playBtn.onclick = () => {
   playBtn.textContent = state.playing ? 'Pause' : 'Play';
 };
 resetBtn.onclick = resetView;
-centerBoard.onchange = resetView;
 gazeMode.onchange = () => { updateLabels(); render(); };
 refreshBtn.onclick = loadRecords;
 liveBtn.onclick = () => { window.location.href = '/'; };
@@ -9566,7 +11713,7 @@ scrub.oninput = () => {
   updateLabels();
   render();
 };
-window.addEventListener('resize', () => { resize(); resetView(); render(); });
+window.addEventListener('resize', () => { resize(); render(); });
 
 function initDetailResize(storageKey, minWidth, maxWidth, defaultWidth) {
   const saved = Number(localStorage.getItem(storageKey));
@@ -9617,8 +11764,10 @@ function tick(now) {
     state.t += dt;
     const end = samples[samples.length - 1].recordingTimestampSeconds || 0;
     if (state.t > end) {
-      state.t = samples[0].recordingTimestampSeconds || 0;
-      state.idx = 0;
+      state.t = end;
+      state.idx = samples.length - 1;
+      state.playing = false;
+      playBtn.textContent = 'Play';
     }
     while (state.idx < samples.length - 1 && samples[state.idx + 1].recordingTimestampSeconds <= state.t) state.idx++;
     while (state.idx > 0 && samples[state.idx].recordingTimestampSeconds > state.t) state.idx--;
