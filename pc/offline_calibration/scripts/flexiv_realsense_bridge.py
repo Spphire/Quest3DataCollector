@@ -907,12 +907,24 @@ class FlexivRobotClient:
         device_list = device_status.get("list") if isinstance(device_status, dict) else None
         if isinstance(device_list, dict):
             names = [str(name) for name in device_list.keys()]
-            gripperish = [
-                name
-                for name in names
-                if any(token in name.lower() for token in ("robotiq", "gripper", "2f", "hand-e", "hande"))
+            online_names = [name for name in names if bool(device_list.get(name))]
+            offline_names = [name for name in names if not bool(device_list.get(name))]
+
+            def is_robotiq(name: str) -> bool:
+                lower = name.lower()
+                return any(token in lower for token in ("robotiq", "2f", "hand-e", "hande"))
+
+            def is_gripperish(name: str) -> bool:
+                lower = name.lower()
+                return is_robotiq(name) or "gripper" in lower
+
+            prioritized = [
+                *[name for name in online_names if is_robotiq(name)],
+                *[name for name in online_names if is_gripperish(name) and not is_robotiq(name)],
+                *[name for name in offline_names if is_robotiq(name)],
+                *[name for name in offline_names if is_gripperish(name) and not is_robotiq(name)],
             ]
-            for name in gripperish:
+            for name in prioritized:
                 if name not in candidates:
                     candidates.append(name)
         for name in DEFAULT_GRIPPER_DEVICE_CANDIDATES:

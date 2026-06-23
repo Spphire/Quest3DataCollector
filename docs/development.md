@@ -177,7 +177,7 @@ Useful options:
 - `--flexiv-network-interface 192.168.2.108` limits Flexiv RDK discovery to the PC interface connected to the robot network. This can also be entered in the web UI as `RDK local IP`.
 - `--robot-state-hz 60` controls Flexiv robot state polling for A-button formal recordings. The lab default is 60 Hz; set `QUEST3_ROBOT_STATE_HZ=90` only for targeted high-rate experiments and audit the resulting record.
 - `--robot-capture-interval 0.35` controls how often robot/RealSense samples are taken during B-button calibration.
-- `--enable-gripper` enables right index-trigger gripper open/close commands during robot sessions. The default gripper device is `auto`: the receiver lists Flexiv Elements devices on the active robot connection, then tries Robotiq/gripper-looking device names before common Robotiq fallbacks. Use `--gripper-device <Elements device name>` to force one.
+- `--enable-gripper` enables right index-trigger gripper open/close commands during robot sessions. The default gripper device is `auto`: the receiver lists Flexiv Elements devices on the active robot connection, prefers online Robotiq devices, then tries other gripper-looking names before common Robotiq fallbacks. Use `--gripper-device <Elements device name>` to force one.
 - `--no-flexiv-realsense` hides/disables the robot bridge.
 - `--no-robot-hand-eye` records robot/RealSense data but skips the automatic hand-eye solve.
 - `--controller-motion-scale 1.0` scales right-controller displacement into TCP displacement.

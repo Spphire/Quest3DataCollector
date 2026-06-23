@@ -43,9 +43,10 @@ end RealSense `244222073667`, third RealSense `750612070265`, robot state
 `60 Hz`, and depth every `3` RGB frames.
 
 With `--enable-gripper`, the default gripper device is `auto`: the receiver
-asks the connected Flexiv robot for the Elements device list and tries names
-that look like Robotiq/gripper devices before falling back to common Robotiq
-names. If needed, pass `--gripper-device <exact Elements device name>`.
+asks the connected Flexiv robot for the Elements device list, prefers online
+Robotiq devices, then tries other gripper-looking names before falling back to
+common Robotiq names. If needed, pass
+`--gripper-device <exact Elements device name>`.
 
 Check the remote process:
 
