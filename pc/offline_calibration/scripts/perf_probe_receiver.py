@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
@@ -50,11 +52,13 @@ def main() -> int:
     summary = wait_for_summary(args.output_root, record_id, args.host, args.view_port, args.wait_seconds)
     record_dir = resolve_record_directory(args.output_root, record_id, summary)
     audit = run_audit(args.python, record_dir)
-    replay = replay_health(args.host, args.view_port, record_id)
+    replay_id = replay_record_id(record_dir, summary, record_id)
+    replay = replay_health(args.host, args.view_port, replay_id)
 
     payload = {
-        "ok": audit.get("ok") is True,
+        "ok": audit.get("ok") is True and replay.get("ok") is True,
         "recordId": record_id,
+        "replayRecordId": replay_id,
         "recordDirectory": str(record_dir.resolve()),
         "receiver": {
             "host": args.host,
@@ -212,14 +216,16 @@ def resolve_record_directory(output_root: Path, record_id: str, summary: dict[st
 
 def candidate_summary_paths(output_root: Path, record_id: str) -> list[Path]:
     names = []
-    for value in (record_id, sanitize_name(record_id)):
+    safe = sanitize_name(record_id)
+    for value in (record_id if record_id == safe else "", safe):
         if value and value not in names:
             names.append(value)
     if output_root.exists():
-        safe = sanitize_name(record_id)
-        for item in sorted(output_root.glob(f"{safe}*"), key=lambda p: p.stat().st_mtime, reverse=True):
+        suffix_pattern = re.compile(rf"^{re.escape(safe)}_\d{{3}}$")
+        for item in sorted(output_root.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
             if item.is_dir() and item.name not in names:
-                names.append(item.name)
+                if item.name == safe or suffix_pattern.match(item.name):
+                    names.append(item.name)
     return [output_root / name / "pc_session_summary.json" for name in names]
 
 
@@ -260,8 +266,15 @@ def run_audit(python: str, record_dir: Path) -> dict[str, object]:
     return audit
 
 
+def replay_record_id(record_dir: Path, summary: dict[str, object], requested_id: str) -> str:
+    for value in (summary.get("recordId"), record_dir.name, requested_id):
+        if isinstance(value, str) and value:
+            return value
+    return record_dir.name
+
+
 def replay_health(host: str, view_port: int, record_id: str) -> dict[str, object]:
-    payload = get_json(host, view_port, f"/recordings/replay?recordId={record_id}&compact=1", timeout=30)
+    payload = get_json(host, view_port, f"/recordings/replay?recordId={quote(record_id, safe='')}&compact=1", timeout=30)
     robot = payload.get("robotRealSense") if isinstance(payload.get("robotRealSense"), dict) else {}
     return {
         "ok": payload.get("ok"),

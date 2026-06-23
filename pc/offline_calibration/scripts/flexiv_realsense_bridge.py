@@ -6,6 +6,7 @@ import math
 import os
 import queue
 import sys
+import tempfile
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -53,6 +54,8 @@ ASYNC_QUEST_ALIGNED_SAMPLE_HZ = 10.0
 ASYNC_CAMERA_QUEUE_SECONDS = 0.25
 ASYNC_CAMERA_QUEUE_MIN_FRAMES = 4
 ASYNC_CAMERA_QUEUE_MAX_FRAMES = 8
+REALSENSE_CONNECT_WARMUP_SECONDS = 3.0
+REALSENSE_RECORD_START_WAIT_SECONDS = 2.0
 ROBOT_SESSION_THREAD_JOIN_SECONDS = 5.0
 ROBOT_SESSION_CAMERA_WRITER_FINAL_JOIN_SECONDS = 1.0
 ROBOT_SESSION_VIDEO_RELEASE_LOCK_SECONDS = 1.0
@@ -1269,6 +1272,10 @@ class RealSenseStreamHub:
                 thread.join(timeout=2.0)
         with self.lock:
             cameras = self.cameras
+            subscribers = {
+                role: list(queues)
+                for role, queues in self.subscribers.items()
+            }
             self.cameras = {}
             self.metadata = {}
             self.latest = {}
@@ -1279,6 +1286,19 @@ class RealSenseStreamHub:
             self.threads = {}
             self.role_frame_counts = {}
             self.role_errors = {}
+        for queues in subscribers.values():
+            for frame_queue in queues:
+                try:
+                    frame_queue.put_nowait(None)
+                except queue.Full:
+                    try:
+                        frame_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        frame_queue.put_nowait(None)
+                    except queue.Full:
+                        pass
         for camera in cameras.values():
             camera.stop()
 
@@ -1347,6 +1367,40 @@ class RealSenseStreamHub:
 
     def snapshot_roles(self, roles: list[str], wait_timeout: float = 2.0) -> dict[str, dict[str, Any]]:
         return {role: self.get_latest(role, wait_timeout=wait_timeout) for role in roles}
+
+    def wait_for_roles(self, roles: list[str], timeout_seconds: float) -> dict[str, Any]:
+        role_names = [str(role or "").strip().lower() for role in roles if str(role or "").strip()]
+        deadline = time.perf_counter() + max(0.0, float(timeout_seconds))
+        while True:
+            with self.lock:
+                latest = {
+                    role: self.latest.get(role)
+                    for role in role_names
+                }
+                missing = [role for role, frame in latest.items() if not isinstance(frame, dict)]
+                role_threads = {
+                    role: bool(self.threads.get(role) and self.threads[role].is_alive())
+                    for role in role_names
+                }
+                errors = {
+                    role: self.role_errors.get(role)
+                    for role in role_names
+                    if self.role_errors.get(role)
+                }
+                status = self.status_locked()
+            if not missing:
+                return {"ok": True, "roles": role_names, "missingRoles": [], "stream": status}
+            if time.perf_counter() >= deadline or any(not role_threads.get(role) for role in missing):
+                return {
+                    "ok": False,
+                    "roles": role_names,
+                    "missingRoles": missing,
+                    "roleThreads": role_threads,
+                    "roleErrors": errors,
+                    "lastError": self.last_error,
+                    "stream": status,
+                }
+            time.sleep(0.02)
 
     def subscribe(self, role: str, *, max_queue_size: int = 128) -> queue.Queue[Any]:
         role_name = str(role or "").strip().lower()
@@ -1582,9 +1636,6 @@ class RobotRealsenseSession:
         self.motion_handle = self.motion_path.open("a", encoding="utf-8", newline="\n")
         self.gripper_handle = self.gripper_path.open("a", encoding="utf-8", newline="\n")
         self.video_frames_handle = self.video_frames_path.open("a", encoding="utf-8", newline="\n")
-        with self.lock:
-            self.recording_start_perf_counter = time.perf_counter()
-            self.recording_start_unix_seconds = time.time()
         config_payload = config_to_json(self.config)
         config_payload["recordId"] = self.record_id
         config_payload["controlMode"] = self.control_mode
@@ -1594,9 +1645,22 @@ class RobotRealsenseSession:
         stream_status = self.stream_hub.start(self.config)
         metadata = stream_status.get("metadata") if isinstance(stream_status, dict) else None
         self.camera_metadata = metadata if isinstance(metadata, dict) else {}
+        warmup_status = self.stream_hub.wait_for_roles(
+            sorted(self.camera_metadata.keys()),
+            REALSENSE_RECORD_START_WAIT_SECONDS,
+        )
+        config_payload["realsenseWarmup"] = {
+            "ok": warmup_status.get("ok"),
+            "missingRoles": warmup_status.get("missingRoles"),
+            "timeoutSeconds": REALSENSE_RECORD_START_WAIT_SECONDS,
+        }
+        write_json(config_payload, self.directory / "capture_config.json")
         self.camera_subscriber_drop_start_counts = dict(
-            stream_status.get("subscriberDropCounts")
-            if isinstance(stream_status.get("subscriberDropCounts"), dict)
+            warmup_status.get("stream", {}).get("subscriberDropCounts")
+            if isinstance(warmup_status.get("stream"), dict)
+            and isinstance(warmup_status.get("stream", {}).get("subscriberDropCounts"), dict)
+            else stream_status.get("subscriberDropCounts")
+            if isinstance(stream_status, dict) and isinstance(stream_status.get("subscriberDropCounts"), dict)
             else {}
         )
         write_json(self.camera_metadata, self.directory / "cameras.json")
@@ -1605,6 +1669,9 @@ class RobotRealsenseSession:
         if self.config.gripper_enabled:
             self._try_initialize_gripper()
         self.stop_event = threading.Event()
+        with self.lock:
+            self.recording_start_perf_counter = time.perf_counter()
+            self.recording_start_unix_seconds = time.time()
         if self.record_mode == ROBOT_SESSION_RECORD_ASYNC:
             self.robot_state_thread = threading.Thread(
                 target=self._robot_state_loop,
@@ -2960,6 +3027,28 @@ class FlexivRealSenseManager:
         self.stream_hub.start(config)
         return config
 
+    def warm_realsense_stream(self, timeout_seconds: float = REALSENSE_CONNECT_WARMUP_SECONDS) -> dict[str, Any]:
+        try:
+            config = self._ensure_stream_for_current_config()
+            status = self.stream_hub.status()
+            roles = sorted(status.get("roles") or [])
+            warmup = self.stream_hub.wait_for_roles(roles, timeout_seconds)
+            return {
+                "ok": bool(warmup.get("ok")),
+                "timeoutSeconds": float(timeout_seconds),
+                "roles": roles,
+                "missingRoles": warmup.get("missingRoles") or [],
+                "stream": warmup.get("stream") or status,
+                "config": config_to_json(config),
+            }
+        except Exception as exc:  # pragma: no cover - hardware path
+            return {
+                "ok": False,
+                "timeoutSeconds": float(timeout_seconds),
+                "error": str(exc),
+                "stream": self.stream_hub.status(),
+            }
+
     def configure(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
             if "robotSn" in payload:
@@ -3059,8 +3148,9 @@ class FlexivRealSenseManager:
                 self.config.flexiv_network_interfaces,
                 wait_seconds=float(payload.get("waitSeconds") or 0.2),
             )
+            warmup = self.warm_realsense_stream(REALSENSE_CONNECT_WARMUP_SECONDS)
             self.last_error = None
-            return {"ok": True, "state": state, "status": self.status()}
+            return {"ok": True, "state": state, "realsenseWarmup": warmup, "status": self.status()}
         except Exception as exc:  # pragma: no cover - hardware path
             self.last_error = str(exc)
             return {"ok": False, "error": self.last_error, "status": self.status()}
@@ -3291,6 +3381,36 @@ class FlexivRealSenseManager:
                 return None
             session_config = copy.deepcopy(self.config)
             session_config.controller_motion_enabled = control_mode == ROBOT_SESSION_CONTROL_TELEOP
+            try:
+                if control_mode == ROBOT_SESSION_CONTROL_FREEDRIVE:
+                    self.robot.enable_freedrive()
+                    self.config.controller_motion_enabled = False
+                    stage = "freedrive_enabled"
+                elif control_mode == ROBOT_SESSION_CONTROL_TELEOP:
+                    self.robot.disable_freedrive()
+                    self.config.controller_motion_enabled = True
+                    stage = "teleop_ready"
+                else:
+                    self.robot.disarm_motion()
+                    self.robot.disable_freedrive()
+                    self.config.controller_motion_enabled = False
+                    stage = "record_only"
+                self.last_error = None
+            except Exception as exc:  # pragma: no cover - hardware path
+                self.config.controller_motion_enabled = False
+                self.last_error = str(exc)
+                if publish_event is not None:
+                    publish_event(
+                        {
+                            "type": "robot_status",
+                            "ok": False,
+                            "stage": f"{control_mode}_start_failed",
+                            "controlMode": control_mode,
+                            "error": self.last_error,
+                            "status": self.status(),
+                        }
+                    )
+                return None
             session = RobotRealsenseSession(
                 parent_directory,
                 record_id,
@@ -3311,38 +3431,18 @@ class FlexivRealSenseManager:
                 if publish_event is not None:
                     publish_event({"type": "robot_status", "ok": False, "stage": "start_failed", "error": self.last_error})
                 return None
-            try:
-                if control_mode == ROBOT_SESSION_CONTROL_FREEDRIVE:
-                    self.robot.enable_freedrive()
-                    self.config.controller_motion_enabled = False
-                    stage = "freedrive_enabled"
-                elif control_mode == ROBOT_SESSION_CONTROL_TELEOP:
-                    self.robot.disable_freedrive()
-                    self.config.controller_motion_enabled = True
-                    stage = "teleop_ready"
-                else:
-                    self.robot.disarm_motion()
-                    self.robot.disable_freedrive()
-                    self.config.controller_motion_enabled = False
-                    stage = "record_only"
-                self.last_error = None
-                if publish_event is not None:
-                    publish_event({"type": "robot_status", "stage": stage, "controlMode": control_mode, **self.status()})
-            except Exception as exc:  # pragma: no cover - hardware path
-                self.config.controller_motion_enabled = False
-                self.last_error = str(exc)
-                if publish_event is not None:
-                    publish_event(
-                        {
-                            "type": "robot_status",
-                            "ok": False,
-                            "stage": f"{control_mode}_start_failed",
-                            "controlMode": control_mode,
-                            "error": self.last_error,
-                            "status": self.status(),
-                        }
-                    )
             self.active_session = session
+            if publish_event is not None:
+                publish_event(
+                    {
+                        "type": "robot_status",
+                        "ok": True,
+                        "stage": stage,
+                        "controlMode": control_mode,
+                        "activeSession": session.summary("recording"),
+                        "realsenseStream": self.stream_hub.status(),
+                    }
+                )
             return session
 
     def stop_session(self, session: RobotRealsenseSession | None) -> dict[str, Any] | None:
@@ -4999,7 +5099,21 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def write_json(payload: Any, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 def read_json_if_exists(path: Path) -> Any:

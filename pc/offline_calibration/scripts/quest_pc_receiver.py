@@ -12,6 +12,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -1161,6 +1162,11 @@ class SessionWriter:
         try:
             self._enqueue_writer_sentinel()
             self.writer_thread.join(timeout=SESSION_WRITER_THREAD_JOIN_SECONDS)
+            if self.writer_thread.is_alive():
+                self._note_close_error(
+                    "writer_thread_alive",
+                    RuntimeError("PC session writer thread did not stop before files were closed"),
+                )
         except Exception as exc:  # pragma: no cover - defensive close path
             self._note_close_error("writer_thread_join", exc)
         writer_joined_perf = time.perf_counter()
@@ -1254,7 +1260,7 @@ class SessionWriter:
         if self.close_errors:
             summary["closeErrors"] = list(self.close_errors)
         try:
-            self.summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+            atomic_write_json(self.summary_path, summary)
         except Exception as exc:  # pragma: no cover - defensive close path
             self._note_close_error(stage, exc)
 
@@ -2041,13 +2047,7 @@ class LiveTelemetryVisualizer:
                 if size > MAX_ARTIFACT_BYTES:
                     self.send_error(413, "robot mesh too large")
                     return
-                data = path.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(data)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self._write_response_body(data)
+                send_http_path(self, path, "text/plain; charset=utf-8")
 
             def _send_events(self) -> None:
                 self.send_response(200)
@@ -4894,7 +4894,7 @@ def build_and_write_replay_visualization_cache(
     payload["sourceMtime"] = float(source_mtime if source_mtime is not None else time.time())
     payload["cachePath"] = str(replay_visualization_path(session_dir))
     cache_path = replay_visualization_path(session_dir)
-    cache_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    atomic_write_json(cache_path, payload, compact=True)
     return payload
 
 
@@ -5224,8 +5224,8 @@ def replay_raw_artifacts(
             for role, rel_path in depth_streams.items():
                 if not isinstance(rel_path, str) or not rel_path:
                     continue
-                path = (robot_dir / rel_path).resolve()
-                if path.exists():
+                path = resolve_child_path(robot_dir, rel_path)
+                if path is not None and path.exists():
                     artifacts[f"robotDepth_{role}"] = artifact_payload(path, f"Robot depth stream {role}")
         depth_dir = robot_dir / "depth"
         if depth_dir.exists():
@@ -5750,7 +5750,10 @@ def robot_image_artifacts(robot_dir: Path, images: dict[str, Any]) -> dict[str, 
     for role, rel_path in images.items():
         if not isinstance(rel_path, str) or not rel_path:
             continue
-        path = (robot_dir / rel_path).resolve()
+        path = resolve_child_path(robot_dir, rel_path)
+        if path is None:
+            payload[role] = {"label": f"{role} camera", "path": rel_path, "url": None, "error": "path outside robot directory"}
+            continue
         if path.exists():
             payload[role] = artifact_payload(path, f"{role} camera")
         else:
@@ -5771,7 +5774,17 @@ def robot_video_artifacts(robot_dir: Path, videos: dict[str, Any]) -> dict[str, 
             serial = None
         if not isinstance(rel_path, str) or not rel_path:
             continue
-        path = (robot_dir / rel_path).resolve()
+        path = resolve_child_path(robot_dir, rel_path)
+        if path is None:
+            payload[role] = {
+                "label": f"{role} camera video",
+                "path": rel_path,
+                "url": None,
+                "frameIndex": frame_index,
+                "serial": serial,
+                "error": "path outside robot directory",
+            }
+            continue
         if path.exists():
             artifact = artifact_payload(path, f"{role} camera video")
             artifact["frameIndex"] = frame_index
@@ -6937,6 +6950,30 @@ def read_json_if_exists(path: Path) -> Any:
         return None
 
 
+def atomic_write_json(path: Path, payload: Any, *, compact: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":") if compact else None,
+        indent=None if compact else 2,
+    )
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
 def rizon4_model_payload() -> dict[str, Any]:
     if not DEFAULT_RIZON_URDF.exists():
         return {"ok": False, "reason": "missing_urdf", "path": str(DEFAULT_RIZON_URDF)}
@@ -7443,6 +7480,17 @@ def resolve_artifact_path(path_text: str, must_exist: bool = True) -> Path:
     if must_exist and not path.exists():
         raise ValueError("artifact path does not exist")
     return path
+
+
+def resolve_child_path(root: Path, path_text: str) -> Path | None:
+    if not path_text:
+        return None
+    candidate = (root / path_text).resolve()
+    try:
+        candidate.relative_to(root.resolve())
+    except ValueError:
+        return None
+    return candidate
 
 
 def package_mesh_asset_path(filename: str) -> str | None:
@@ -8834,6 +8882,10 @@ async function connectRobot() {
     const payload = await response.json();
     applyRobotStatus(payload.status || payload);
     if (!payload.ok) robotStatus.textContent += `\nerror: ${payload.error || 'connect failed'}`;
+    else if (payload.realsenseWarmup?.ok || payload.status?.realsenseStream?.running) {
+      refreshRobotLiveFrame();
+      syncRobotLiveLoop();
+    }
     loadPreflightStatus();
   } catch (error) {
     robotStatus.textContent = String(error);
