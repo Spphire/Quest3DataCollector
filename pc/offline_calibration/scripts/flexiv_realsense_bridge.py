@@ -2320,7 +2320,7 @@ class RobotRealsenseSession:
         while not stop_event.is_set():
             started = time.perf_counter()
             try:
-                row = self._build_robot_state_row(lightweight=True, derived_transforms=False)
+                row = self._build_robot_state_row(lightweight=True, derived_transforms=True)
                 with self.lock:
                     if self.closed or self.robot_states_handle is None:
                         return
@@ -4710,11 +4710,8 @@ def robot_state_pose_transform(state: dict[str, Any], key: str = "rawEndEffector
     return flexiv_pose_payload_to_transform(state.get(key))
 
 
-def robot_row_tool_transform(row: dict[str, Any]) -> np.ndarray | None:
+def robot_row_tool_transform(row: dict[str, Any], pose_to_tool_tcp: np.ndarray | None = None) -> np.ndarray | None:
     transform = transform_from_json(row.get("T_base_tool_tcp"))
-    if transform is not None:
-        return transform
-    transform = transform_from_json(row.get("T_base_ee"))
     if transform is not None:
         return transform
     state = row.get("robot_state") if isinstance(row.get("robot_state"), dict) else {}
@@ -4726,8 +4723,14 @@ def robot_row_tool_transform(row: dict[str, Any]) -> np.ndarray | None:
         transform = flexiv_pose_payload_to_transform(tcp.get("pose"))
         if transform is not None:
             return transform
+    transform = transform_from_json(row.get("T_base_ee"))
+    if transform is not None:
+        return transform @ pose_to_tool_tcp if pose_to_tool_tcp is not None else transform
     if isinstance(state, dict):
-        return robot_state_pose_transform(state)
+        transform = robot_state_pose_transform(state)
+        if transform is not None and pose_to_tool_tcp is not None:
+            return transform @ pose_to_tool_tcp
+        return transform
     return None
 
 
@@ -5062,7 +5065,7 @@ def compact_joint_limit_guard_for_record(guard: Any) -> dict[str, Any] | None:
 
 
 def compact_robot_state_for_record(state: dict[str, Any]) -> dict[str, Any]:
-    return {
+    result = {
         "ok": state.get("ok"),
         "robotSn": state.get("robotSn"),
         "poseField": state.get("poseField"),
@@ -5072,6 +5075,27 @@ def compact_robot_state_for_record(state: dict[str, Any]) -> dict[str, Any]:
         "jointLimitGuard": compact_joint_limit_guard_for_record(state.get("jointLimitGuard")),
         "gripper": state.get("gripper"),
     }
+    for key in ("flange_pose", "tcp_pose"):
+        pose = compact_robot_pose_for_record(state.get(key))
+        if pose is not None:
+            result[key] = pose
+    return result
+
+
+def compact_robot_pose_for_record(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, Any] = {}
+    pose = value.get("pose")
+    if isinstance(pose, list) and len(pose) >= 7:
+        try:
+            result["pose"] = [float(pose[index]) for index in range(7)]
+        except (TypeError, ValueError):
+            pass
+    matrix = transform_from_json(value.get("T_base_pose"))
+    if matrix is not None:
+        result["T_base_pose"] = transform_to_compact_json(matrix)
+    return result or None
 
 
 def save_bgr_jpeg(bgr: np.ndarray, path: Path) -> None:

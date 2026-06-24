@@ -61,9 +61,13 @@ from flexiv_realsense_bridge import (
     FlexivRealSenseConfig,
     FlexivRealSenseManager,
     RobotRealsenseSession,
+    average_transforms,
     compact_robot_result,
     ee_pose_diversity,
+    flexiv_pose_payload_to_transform,
+    invert_transform,
     robot_row_tool_transform,
+    robot_state_pose_transform,
     transform_from_json,
 )
 from flexiv_realsense_diagnostics import DEFAULT_PORTS as DEFAULT_ROBOT_DIAGNOSTIC_PORTS
@@ -120,7 +124,7 @@ SESSION_CONTROL_THREAD_JOIN_SECONDS = 1.0
 SESSION_WRITER_THREAD_JOIN_SECONDS = 10.0
 SESSION_CLOSE_THREAD_JOIN_SECONDS = 0.05
 REPLAY_VISUALIZATION_CACHE = "replay_visualization.json"
-REPLAY_VISUALIZATION_CACHE_VERSION = 3
+REPLAY_VISUALIZATION_CACHE_VERSION = 4
 
 
 def main() -> int:
@@ -5570,18 +5574,82 @@ def estimate_recording_seconds_offset(rows: list[dict[str, Any]], *perf_keys: st
     return float(deltas[len(deltas) // 2])
 
 
+def row_base_ee_transform(row: dict[str, Any]) -> np.ndarray | None:
+    transform = transform_from_json(row.get("T_base_ee"))
+    if transform is not None:
+        return transform
+    state = row.get("robot_state") if isinstance(row.get("robot_state"), dict) else {}
+    return robot_state_pose_transform(state) if isinstance(state, dict) else None
+
+
+def row_explicit_tool_tcp_transform(row: dict[str, Any]) -> np.ndarray | None:
+    transform = transform_from_json(row.get("T_base_tool_tcp"))
+    if transform is not None:
+        return transform
+    state = row.get("robot_state") if isinstance(row.get("robot_state"), dict) else {}
+    tcp = state.get("tcp_pose") if isinstance(state, dict) and isinstance(state.get("tcp_pose"), dict) else None
+    if not isinstance(tcp, dict):
+        return None
+    transform = transform_from_json(tcp.get("T_base_pose"))
+    if transform is not None:
+        return transform
+    return flexiv_pose_payload_to_transform(tcp.get("pose"))
+
+
+def estimate_pose_to_tool_tcp_transform(rows: list[dict[str, Any]]) -> np.ndarray | None:
+    transforms: list[np.ndarray] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        base_ee = row_base_ee_transform(row)
+        base_tool = row_explicit_tool_tcp_transform(row)
+        if base_ee is None or base_tool is None:
+            continue
+        delta = invert_transform(base_ee) @ base_tool
+        if np.all(np.isfinite(delta)) and np.linalg.norm(delta[:3, 3]) < 1.0:
+            transforms.append(delta)
+    if not transforms:
+        return None
+    return average_transforms(transforms)
+
+
+def calibration_tool_tcp_rows(result: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(result, dict):
+        return []
+    candidates: list[Path] = []
+    run_dir = result.get("run_dir")
+    if isinstance(run_dir, str) and run_dir:
+        candidates.append(Path(run_dir) / "samples.jsonl")
+    source_path = result.get("sourcePath")
+    if isinstance(source_path, str) and source_path:
+        source = Path(source_path)
+        candidates.append(source.parent / "samples.jsonl")
+    for path in candidates:
+        try:
+            rows = read_jsonl_relaxed(path)
+        except Exception:
+            rows = []
+        if rows:
+            return rows
+    return []
+
+
 def robot_replay_row(
     row: dict[str, Any],
     robot_dir: Path,
     origin: list[float],
     t_world_base: np.ndarray | None,
     t_ee_end_camera: np.ndarray | None,
+    t_pose_tool_tcp: np.ndarray | None = None,
     *,
     recording_timestamp_seconds: float | None,
     source_stream: str,
 ) -> tuple[dict[str, Any], np.ndarray | None]:
     ee_matrix = transform_from_json(row.get("T_base_ee"))
-    pose_matrix = robot_row_tool_transform(row)
+    state = row.get("robot_state") if isinstance(row.get("robot_state"), dict) else {}
+    if ee_matrix is None and isinstance(state, dict):
+        ee_matrix = robot_state_pose_transform(state)
+    pose_matrix = robot_row_tool_transform(row, t_pose_tool_tcp)
     if pose_matrix is None:
         pose_matrix = ee_matrix
     if ee_matrix is None:
@@ -5672,6 +5740,12 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
     sample_rows_raw = read_jsonl_relaxed(samples_path)
     robot_states_path = robot_dir / "robot_states.jsonl"
     robot_state_rows_raw = read_jsonl_relaxed(robot_states_path)
+    t_pose_tool_tcp = estimate_pose_to_tool_tcp_transform(sample_rows_raw + robot_state_rows_raw)
+    tool_tcp_source = "record"
+    if t_pose_tool_tcp is None:
+        calibration_rows = calibration_tool_tcp_rows(result if isinstance(result, dict) else None)
+        t_pose_tool_tcp = estimate_pose_to_tool_tcp_transform(calibration_rows)
+        tool_tcp_source = "calibration_run" if t_pose_tool_tcp is not None else None
     recording_offset = estimate_recording_seconds_offset(
         sample_rows_raw,
         "robot_state_pc_perf_counter_seconds",
@@ -5687,6 +5761,7 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
             origin,
             t_world_base,
             t_ee_end_camera,
+            t_pose_tool_tcp,
             recording_timestamp_seconds=float(row["quest_recording_timestamp_seconds"])
             if is_number(row.get("quest_recording_timestamp_seconds"))
             else None,
@@ -5707,6 +5782,7 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
             origin,
             t_world_base,
             t_ee_end_camera,
+            t_pose_tool_tcp,
             recording_timestamp_seconds=derived_recording_seconds,
             source_stream="robot_states",
         )
@@ -5740,6 +5816,10 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
         "displayFrame": "quest_world_axes_translated_to_board_origin" if t_world_base is not None else "unaligned_robot_base",
         "poseDiversity": ee_pose_diversity(ee_poses),
         "recordingSecondsOffsetFromPerfCounter": recording_offset,
+        "toolTcpFallback": {
+            "source": tool_tcp_source,
+            "T_pose_tool_tcp": transform_payload_from_matrix(t_pose_tool_tcp) if t_pose_tool_tcp is not None else None,
+        },
         "result": result if isinstance(result, dict) else None,
         "failure": failure if isinstance(failure, dict) else None,
     }
