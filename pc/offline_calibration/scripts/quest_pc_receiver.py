@@ -50,14 +50,17 @@ from flexiv_realsense_bridge import (
     DEFAULT_HAND_EYE_MAX_DIVERSE_SAMPLES,
     DEFAULT_HAND_EYE_MIN_DIVERSE_SAMPLES,
     DEFAULT_RECORD_DEPTH_EVERY_N_FRAMES,
+    DEFAULT_RECORD_DEPTH_FORMAT,
     DEFAULT_ROBOT_STATE_HZ,
     DEFAULT_CONTROLLER_JOINT_LIMIT_BUFFER_RAD,
     DEFAULT_CONTROLLER_MAX_STEP_M,
     DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG,
+    DEFAULT_CONTROLLER_TARGET_UPDATE_HZ,
     DEFAULT_CONTROLLER_TRANSLATION_SCALE,
     ROBOT_SESSION_RECORD_ASYNC,
     ROBOT_SESSION_CONTROL_FREEDRIVE,
     ROBOT_SESSION_CONTROL_TELEOP,
+    ColorStreamWriter,
     FlexivRealSenseConfig,
     FlexivRealSenseManager,
     RobotRealsenseSession,
@@ -104,7 +107,18 @@ RECENTLY_CLOSED_RECORD_REOPEN_GUARD_SECONDS = 30.0
 MAX_CALIBRATION_HTTP_BODY_BYTES = 8 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 ARTIFACT_STREAM_CHUNK_BYTES = 1024 * 1024
-ALLOWED_ARTIFACT_SUFFIXES = {".html", ".json", ".jsonl", ".log", ".jpg", ".jpeg", ".png", ".mp4", ".bin"}
+ALLOWED_ARTIFACT_SUFFIXES = {
+    ".html",
+    ".json",
+    ".jsonl",
+    ".log",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".mp4",
+    ".mkv",
+    ".bin",
+}
 QUEST_RECORD_COMMAND_PATH = "/sdcard/Android/data/com.Apricity.EyeTrackingTest/files/record_command.txt"
 DEFAULT_ADB = Path(
     r"C:\Program Files\Unity\Hub\Editor\6000.0.60f1\Editor\Data\PlaybackEngines\AndroidPlayer\SDK\platform-tools\adb.exe"
@@ -404,8 +418,18 @@ def main() -> int:
         type=int,
         default=DEFAULT_RECORD_DEPTH_EVERY_N_FRAMES,
         help=(
-            "Append aligned RealSense depth to the indexed raw stream every N RGB frames during formal recordings. "
+            "Append RealSense uint16 depth to the indexed depth stream every N RGB frames during formal recordings. "
             f"Default: {DEFAULT_RECORD_DEPTH_EVERY_N_FRAMES}"
+        ),
+    )
+    receive_parser.add_argument(
+        "--record-realsense-depth-format",
+        choices=("ffv1", "raw"),
+        default=DEFAULT_RECORD_DEPTH_FORMAT,
+        help=(
+            "Depth storage format for formal recordings: ffv1 writes lossless 16-bit MKV, "
+            "raw writes the legacy .u16le.bin stream. "
+            f"Default: {DEFAULT_RECORD_DEPTH_FORMAT}"
         ),
     )
     receive_parser.add_argument("--realsense-manual-exposure", action="store_true", help="Disable RealSense RGB auto exposure.")
@@ -503,6 +527,15 @@ def main() -> int:
         ),
     )
     receive_parser.add_argument(
+        "--controller-target-update-hz",
+        type=float,
+        default=DEFAULT_CONTROLLER_TARGET_UPDATE_HZ,
+        help=(
+            "Maximum rate for updating the robot TCP target from the right controller. "
+            f"Default: {DEFAULT_CONTROLLER_TARGET_UPDATE_HZ:g}"
+        ),
+    )
+    receive_parser.add_argument(
         "--controller-joint-limit-buffer",
         type=float,
         default=DEFAULT_CONTROLLER_JOINT_LIMIT_BUFFER_RAD,
@@ -535,8 +568,8 @@ def main() -> int:
         action="store_true",
         default=DEFAULT_GRIPPER_INIT_ON_ENABLE,
         help=(
-            "Call Gripper.Init() after Gripper.Enable(). Leave off for Robotiq devices that initialize "
-            "automatically on power-up."
+            "Call Gripper.Init() after Gripper.Enable(). Use this when the gripper reports states but "
+            "does not respond to Move() until initialized."
         ),
     )
     receive_parser.add_argument(
@@ -1559,11 +1592,11 @@ class LiveTelemetryVisualizer:
             except queue.Full:
                 pass
 
-    def robot_status_payload(self) -> dict[str, Any]:
+    def robot_status_payload(self, *, lightweight: bool = False) -> dict[str, Any]:
         if self.robot_manager is None:
             return {"ok": False, "enabled": False, "reason": "disabled"}
-        payload = self.robot_manager.status()
-        if not self.calibration_state_cleared and not isinstance(payload.get("lastCalibration"), dict):
+        payload = self.robot_manager.status(lightweight=lightweight)
+        if not lightweight and not self.calibration_state_cleared and not isinstance(payload.get("lastCalibration"), dict):
             latest = latest_robot_calibration_event(self.calibration_raw_root, self.calibration_output_root, self.recording_root)
             if latest is not None:
                 payload["lastCalibration"] = latest
@@ -1580,9 +1613,31 @@ class LiveTelemetryVisualizer:
         self.publish_event({"type": "robot_calibration_cleared", **result})
         return result
 
-    def camera_list_payload(self) -> dict[str, Any]:
+    def camera_list_payload(
+        self,
+        *,
+        lightweight: bool = False,
+        robot_status: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if self.robot_manager is None:
             return {"ok": False, "enabled": False, "reason": "disabled", "cameras": []}
+        if lightweight:
+            status = robot_status if isinstance(robot_status, dict) else self.robot_manager.status(lightweight=True)
+            stream = status.get("realsenseStream") if isinstance(status, dict) else {}
+            metadata = stream.get("metadata") if isinstance(stream, dict) and isinstance(stream.get("metadata"), dict) else {}
+            cameras = []
+            for role, row in metadata.items():
+                if not isinstance(row, dict):
+                    continue
+                cameras.append(
+                    {
+                        "serial": row.get("serial"),
+                        "name": row.get("name") or row.get("productLine") or role,
+                        "role": role,
+                        "cached": True,
+                    }
+                )
+            return {"ok": True, "enabled": True, "cameras": cameras, "cached": True}
         return self.robot_manager.list_cameras()
 
     def start_realsense_stream_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1618,8 +1673,10 @@ class LiveTelemetryVisualizer:
             controller_window = recent_controller_status(recent_samples)
             udp_status = dict(self.udp_status)
             capture_state = dict(self.capture_state)
-        robot_status = self.robot_status_payload()
-        camera_status = self.camera_list_payload()
+        capture_phase = str(capture_state.get("phase") or "live") if isinstance(capture_state, dict) else "live"
+        lightweight = capture_phase in ("recording", "saving")
+        robot_status = self.robot_status_payload(lightweight=lightweight)
+        camera_status = self.camera_list_payload(lightweight=lightweight, robot_status=robot_status)
         board_status = self.latest_robot_board_check_payload()
         model_status = rizon4_model_payload()
         return build_preflight_status(
@@ -1689,6 +1746,29 @@ class LiveTelemetryVisualizer:
         }
         result["interpretation"] = interpret_result(result)
         self.publish_event({"type": "robot_status", "stage": "diagnostics", "diagnostics": result})
+        return result
+
+    def robot_gripper_status_payload(self) -> dict[str, Any]:
+        if self.robot_manager is None:
+            return {"ok": False, "enabled": False, "reason": "disabled"}
+        return self.robot_manager.gripper_status()
+
+    def robot_gripper_move_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.robot_manager is None:
+            return {"ok": False, "enabled": False, "reason": "disabled"}
+        self.robot_manager.configure(payload)
+        try:
+            result = self.robot_manager.move_gripper(payload)
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "enabled": True,
+                "commandSent": False,
+                "action": str(payload.get("action") or "move"),
+                "targetWidthM": payload.get("widthM"),
+                "error": str(exc),
+            }
+        self.publish_event({"type": "robot_gripper", **result})
         return result
 
     def configure_robot_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1809,6 +1889,9 @@ class LiveTelemetryVisualizer:
                 if parsed.path == "/robot/status":
                     self._send_json(visualizer.robot_status_payload())
                     return
+                if parsed.path == "/robot/gripper/status":
+                    self._send_json(visualizer.robot_gripper_status_payload())
+                    return
                 if parsed.path == "/robot/diagnostics":
                     self._send_json(visualizer.robot_diagnostics_payload({}))
                     return
@@ -1861,6 +1944,9 @@ class LiveTelemetryVisualizer:
                         return
                     if parsed.path == "/robot/diagnostics":
                         self._send_json(visualizer.robot_diagnostics_payload(payload))
+                        return
+                    if parsed.path == "/robot/gripper/move":
+                        self._send_json(visualizer.robot_gripper_move_payload(payload))
                         return
                     if parsed.path == "/robot/board-check":
                         self._send_json(visualizer.robot_board_check_payload(payload))
@@ -2139,7 +2225,7 @@ class PcCalibrationSession:
         self.left_frames_file = self.left_frames_path.open("w", encoding="utf-8", newline="\n")
         self.right_frames_file = self.right_frames_path.open("w", encoding="utf-8", newline="\n")
         self.trajectory_file = self.trajectory_path.open("w", encoding="utf-8", newline="\n")
-        self.video_writers: dict[str, cv2.VideoWriter] = {}
+        self.video_writers: dict[str, ColorStreamWriter] = {}
         self.frame_counts = {"left": 0, "right": 0}
         self.legacy_flip_vertical_params: set[bool] = set()
         self.applied_vertical_flips: set[bool] = set()
@@ -2242,7 +2328,10 @@ class PcCalibrationSession:
                 return self.summary("already_closed")
             self.closed = True
             for writer in self.video_writers.values():
-                writer.release()
+                try:
+                    writer.close()
+                except Exception as exc:
+                    print(f"[calibration] video writer close failed: {exc}", file=sys.stderr)
             self.video_writers.clear()
             self.left_frames_file.close()
             self.right_frames_file.close()
@@ -2401,16 +2490,15 @@ class PcCalibrationSession:
             "activeSession": active,
         }
 
-    def _video_writer(self, side: str, width: int, height: int) -> cv2.VideoWriter:
+    def _video_writer(self, side: str, width: int, height: int) -> ColorStreamWriter:
         existing = self.video_writers.get(side)
         if existing is not None:
             return existing
         filename = str(self.metadata["leftVideoFileName"] if side == "left" else self.metadata["rightVideoFileName"])
         path = self.directory / filename
-        fps = int(self.metadata.get("fps") or 15)
-        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), max(1, fps), (width, height))
-        if not writer.isOpened():
-            raise RuntimeError(f"could not open video writer: {path}")
+        fps = max(1, int(self.metadata.get("fps") or 15))
+        # H.264 via system ffmpeg (libx264) for ~2-4x smaller files than mp4v.
+        writer = ColorStreamWriter(path, width=int(width), height=int(height), fps=fps)
         self.video_writers[side] = writer
         return writer
 
@@ -2806,6 +2894,7 @@ def receive(args: argparse.Namespace) -> int:
                 robot_state_hz=args.robot_state_hz,
                 record_depth=not args.no_record_realsense_depth,
                 record_depth_every_n_frames=max(1, int(args.record_realsense_depth_every_n_frames)),
+                record_depth_format=args.record_realsense_depth_format,
                 realsense_auto_exposure=not args.realsense_manual_exposure,
                 realsense_exposure=args.realsense_exposure,
                 realsense_gain=args.realsense_gain,
@@ -2820,6 +2909,7 @@ def receive(args: argparse.Namespace) -> int:
                 controller_translation_scale=args.controller_motion_scale,
                 controller_max_step_m=args.controller_motion_max_step,
                 controller_max_rotation_step_deg=args.controller_motion_max_rotation_step,
+                controller_target_update_hz=max(1.0, float(args.controller_target_update_hz)),
                 controller_joint_limit_buffer_rad=args.controller_joint_limit_buffer,
                 controller_joint_limit_guard_enabled=not args.disable_controller_joint_limit_guard,
                 gripper_enabled=args.enable_gripper,
@@ -3031,14 +3121,13 @@ def receive(args: argparse.Namespace) -> int:
             pc_receive_perf_counter_seconds = time.perf_counter()
             last_datagram_perf = pc_receive_perf_counter_seconds
 
-            text = data.decode("utf-8", errors="replace").strip()
-            if not text:
+            if not data or data.isspace():
                 continue
 
             try:
-                message = json.loads(text)
+                message = json.loads(data)
             except json.JSONDecodeError as exc:
-                print(f"[bad-json] {remote[0]}:{remote[1]} {exc}: {text[:200]}", file=sys.stderr)
+                print(f"[bad-json] {remote[0]}:{remote[1]} {exc}: {data[:200]!r}", file=sys.stderr)
                 continue
 
             if not isinstance(message, dict):
@@ -4429,6 +4518,8 @@ def robot_realsense_record_summary(session_dir: Path) -> dict[str, Any] | None:
             if isinstance(result.get("end_camera"), dict)
             else None
         )
+    performance_payload = session.get("performance") if isinstance(session.get("performance"), dict) else {}
+    record_depth_format = config.get("recordDepthFormat") or performance_payload.get("recordDepthFormat")
     return {
         "status": status,
         "samples": session.get("samples"),
@@ -4439,6 +4530,16 @@ def robot_realsense_record_summary(session_dir: Path) -> dict[str, Any] | None:
         "depthFrames": session.get("depthFrames"),
         "recordDepth": config.get("recordDepth"),
         "recordDepthEveryNFrames": config.get("recordDepthEveryNFrames"),
+        "recordDepthFormat": record_depth_format,
+        "depthStreamEncodings": session.get("depthStreamEncodings")
+        if isinstance(session.get("depthStreamEncodings"), dict)
+        else {},
+        "depthStreamWarnings": session.get("depthStreamWarnings")
+        if isinstance(session.get("depthStreamWarnings"), list)
+        else [],
+        "depthStreamDisabledRoles": session.get("depthStreamDisabledRoles")
+        if isinstance(session.get("depthStreamDisabledRoles"), dict)
+        else {},
         "performance": performance,
         "motionCommands": session.get("motionCommands"),
         "motionSkips": session.get("motionSkips"),
@@ -5233,10 +5334,15 @@ def replay_raw_artifacts(
                     artifacts[f"robotDepth_{role}"] = artifact_payload(path, f"Robot depth stream {role}")
         depth_dir = robot_dir / "depth"
         if depth_dir.exists():
-            for path in sorted(depth_dir.glob("*.bin")):
-                key = f"robotDepth_{path.stem}"
+            for pattern in ("*.mkv", "*.bin"):
+                for path in sorted(depth_dir.glob(pattern)):
+                    key = f"robotDepth_{path.stem}"
+                    if key not in artifacts:
+                        artifacts[key] = artifact_payload(path, f"Robot depth stream {path.name}")
+            for path in sorted(depth_dir.glob("*.ffmpeg.log")):
+                key = f"robotDepthLog_{path.stem}"
                 if key not in artifacts:
-                    artifacts[key] = artifact_payload(path, f"Robot depth stream {path.name}")
+                    artifacts[key] = artifact_payload(path, f"Robot depth encoder log {path.name}")
         video_dir = robot_dir / "videos"
         if video_dir.exists():
             for path in sorted(video_dir.glob("*.mp4")):
@@ -5311,18 +5417,44 @@ def build_recording_audit(
     )
     depth_rows = read_jsonl_relaxed(robot_dir / "video_frames.jsonl")
     expected_depth = not (isinstance(session_config, dict) and session_config.get("recordDepth") is False)
-    depth_count = sum(1 for row in depth_rows if isinstance(row.get("depth"), dict) and row["depth"].get("path"))
+    depth_payloads = [
+        row["depth"]
+        for row in depth_rows
+        if isinstance(row.get("depth"), dict) and row["depth"].get("path")
+    ]
+    depth_count = len(depth_payloads)
+    depth_paths = {
+        str(payload.get("path"))
+        for payload in depth_payloads
+        if isinstance(payload.get("path"), str) and payload.get("path")
+    }
+    missing_depth_paths = [
+        rel_path
+        for rel_path in sorted(depth_paths)
+        for resolved in [resolve_child_path(robot_dir, rel_path)]
+        if resolved is None or not resolved.exists()
+    ]
+    depth_encodings = sorted(
+        {
+            str(payload.get("encoding") or payload.get("codec") or "unknown")
+            for payload in depth_payloads
+        }
+    )
     checks.append(
         audit_item(
             "robot_realsense_depth",
-            "RealSense aligned depth",
-            (not expected_depth) or depth_count > 0,
+            "RealSense depth stream",
+            (not expected_depth) or (depth_count > 0 and not missing_depth_paths),
             (
-                f"{depth_count}/{len(depth_rows)} video frame rows with indexed depth payload"
+                f"{depth_count}/{len(depth_rows)} video frame rows with indexed depth payload; "
+                f"files {len(depth_paths) - len(missing_depth_paths)}/{len(depth_paths)}; "
+                f"encodings {', '.join(depth_encodings) or 'none'}"
                 if expected_depth
                 else "depth recording disabled in capture_config"
             ),
             required=expected_depth,
+            missingPaths=missing_depth_paths[:8],
+            encodings=depth_encodings,
         )
     )
     if robot_realsense is None:
@@ -7604,6 +7736,8 @@ def artifact_content_type(suffix: str) -> str:
         return "image/png"
     if suffix == ".mp4":
         return "video/mp4"
+    if suffix == ".mkv":
+        return "video/x-matroska"
     if suffix == ".html":
         return "text/html; charset=utf-8"
     if suffix in (".json", ".jsonl"):
@@ -7654,7 +7788,7 @@ def send_http_path(handler: BaseHTTPRequestHandler, path: Path, content_type: st
     except Exception:
         range_header = None
     byte_range = parse_http_byte_range(range_header, size)
-    if byte_range is None and size > MAX_ARTIFACT_BYTES and path.suffix.lower() not in (".mp4", ".bin"):
+    if byte_range is None and size > MAX_ARTIFACT_BYTES and path.suffix.lower() not in (".mp4", ".mkv", ".bin"):
         handler.send_error(413, "artifact too large")
         return
     start = 0
@@ -8349,6 +8483,8 @@ label {
         <button id="robotStreamStop">Stop Stream</button>
         <button id="robotBoardCheck">Check Board</button>
         <button id="robotDiagnostics">Diagnostics</button>
+        <button id="robotGripOpen">Grip Open</button>
+        <button id="robotGripClose">Grip Close</button>
         <button id="robotConnect">Connect Robot</button>
         <button id="robotDisconnect">Disconnect</button>
       </div>
@@ -8441,6 +8577,8 @@ const robotStreamStart = document.getElementById('robotStreamStart');
 const robotStreamStop = document.getElementById('robotStreamStop');
 const robotBoardCheck = document.getElementById('robotBoardCheck');
 const robotDiagnostics = document.getElementById('robotDiagnostics');
+const robotGripOpen = document.getElementById('robotGripOpen');
+const robotGripClose = document.getElementById('robotGripClose');
 const robotConnect = document.getElementById('robotConnect');
 const robotDisconnect = document.getElementById('robotDisconnect');
 const robotStatus = document.getElementById('robotStatus');
@@ -8991,6 +9129,39 @@ async function runRobotDiagnostics() {
     robotStatus.textContent = String(error);
   } finally {
     robotDiagnostics.disabled = false;
+  }
+}
+
+async function moveRobotGripper(action) {
+  const button = action === 'open' ? robotGripOpen : robotGripClose;
+  const payload = robotPayloadFromControls();
+  payload.action = action;
+  payload.widthM = action === 'open'
+    ? Number(robotGripperOpen.value || 0.08)
+    : Number(robotGripperClose.value || 0.0);
+  payload.speedMps = Number(robotGripperSpeed.value || 0.04);
+  payload.forceN = Number(robotGripperForce.value || 20.0);
+  robotGripOpen.disabled = true;
+  robotGripClose.disabled = true;
+  button.textContent = action === 'open' ? 'Opening...' : 'Closing...';
+  robotStatus.textContent = `moving gripper ${action}...`;
+  try {
+    const response = await fetch('/robot/gripper/move', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const result = await response.json();
+    updateRobotGripper(result);
+    await loadRobotStatus();
+    if (!result.ok) robotStatus.textContent += `\ngripper error: ${result.error || 'move failed'}`;
+  } catch (error) {
+    robotStatus.textContent = String(error);
+  } finally {
+    robotGripOpen.disabled = false;
+    robotGripClose.disabled = false;
+    robotGripOpen.textContent = 'Grip Open';
+    robotGripClose.textContent = 'Grip Close';
   }
 }
 
@@ -10397,6 +10568,8 @@ robotStreamStart.addEventListener('click', startRobotStream);
 robotStreamStop.addEventListener('click', stopRobotStream);
 robotBoardCheck.addEventListener('click', checkRobotBoard);
 robotDiagnostics.addEventListener('click', runRobotDiagnostics);
+robotGripOpen.addEventListener('click', () => moveRobotGripper('open'));
+robotGripClose.addEventListener('click', () => moveRobotGripper('close'));
 robotConnect.addEventListener('click', connectRobot);
 robotDisconnect.addEventListener('click', disconnectRobot);
 preflightRefresh.addEventListener('click', loadPreflightStatus);

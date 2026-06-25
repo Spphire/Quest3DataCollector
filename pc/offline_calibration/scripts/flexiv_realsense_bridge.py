@@ -5,6 +5,8 @@ import json
 import math
 import os
 import queue
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -46,8 +48,10 @@ DEFAULT_SQUARE_SIZE_M = 0.025
 DEFAULT_REALSENSE_WIDTH = 1280
 DEFAULT_REALSENSE_HEIGHT = 720
 DEFAULT_REALSENSE_FPS = 30
-DEFAULT_ROBOT_STATE_HZ = 60.0
+DEFAULT_ROBOT_STATE_HZ = 90.0
 DEFAULT_RECORD_DEPTH_EVERY_N_FRAMES = 3
+DEFAULT_RECORD_DEPTH_FORMAT = "ffv1"
+RECORD_DEPTH_FORMATS = {"ffv1", "raw"}
 ASYNC_JSONL_FLUSH_ROWS = 16
 ASYNC_JSONL_FLUSH_INTERVAL_SECONDS = 0.25
 ASYNC_QUEST_ALIGNED_SAMPLE_HZ = 10.0
@@ -66,8 +70,11 @@ DEFAULT_END_CAMERA_SERIAL = "750612070265"
 MIN_HAND_EYE_EE_TRANSLATION_SPAN_M = 0.02
 MIN_HAND_EYE_EE_ROTATION_SPAN_DEG = 2.0
 DEFAULT_CONTROLLER_TRANSLATION_SCALE = 1.0
+CONTROLLER_TRANSLATION_SCALE_MIN = 0.1
+CONTROLLER_TRANSLATION_SCALE_MAX = 3.0
 DEFAULT_CONTROLLER_MAX_STEP_M = 0.04
 DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG = 4.0
+DEFAULT_CONTROLLER_TARGET_UPDATE_HZ = 30.0
 DEFAULT_CONTROLLER_JOINT_LIMIT_BUFFER_RAD = 0.04
 DEFAULT_HAND_EYE_MAX_DIVERSE_SAMPLES = 120
 DEFAULT_HAND_EYE_MIN_DIVERSE_SAMPLES = 20
@@ -120,11 +127,20 @@ ROBOT_SESSION_RECORD_MODES = {
 DEFAULT_FREEDRIVE_HOLD_STIFFNESS = [10000.0, 10000.0, 10000.0, 1500.0, 1500.0, 1500.0]
 DEFAULT_FREEDRIVE_COMPLIANT_STIFFNESS = [1000.0, 1000.0, 1000.0, 8.0, 8.0, 8.0]
 DEFAULT_FREEDRIVE_DAMPING = [0.6, 0.6, 0.6, 0.6, 0.6, 0.6]
-DEFAULT_FREEDRIVE_CONTROL_HZ = 100.0
+DEFAULT_FREEDRIVE_CONTROL_HZ = 60.0
 DEFAULT_FREEDRIVE_MAX_LINEAR_VEL = 0.2
 DEFAULT_FREEDRIVE_MAX_ANGULAR_VEL = 0.6
 DEFAULT_FREEDRIVE_MAX_LINEAR_ACC = 0.8
 DEFAULT_FREEDRIVE_MAX_ANGULAR_ACC = 2.0
+ROBOT_CARTESIAN_SEND_SLOW_SECONDS = 0.05
+ROBOT_CARTESIAN_SEND_FATAL_MARKERS = (
+    "not in an applicable control mode",
+    "safety error",
+    "cat2",
+    "fault",
+)
+ROBOT_CARTESIAN_TARGET_POSITION_EPS_M = 0.001
+ROBOT_CARTESIAN_TARGET_ROTATION_EPS_DEG = 0.25
 FREEDRIVE_FLOATING_CARTESIAN_PRIMITIVE = "FloatingCartesian()"
 
 
@@ -244,6 +260,7 @@ class FlexivRealSenseConfig:
     record_depth: bool = True
     record_depth_align_to_color: bool = False
     record_depth_every_n_frames: int = DEFAULT_RECORD_DEPTH_EVERY_N_FRAMES
+    record_depth_format: str = DEFAULT_RECORD_DEPTH_FORMAT
     warmup_frames: int = 2
     realsense_auto_exposure: bool = True
     realsense_exposure: float | None = None
@@ -265,6 +282,7 @@ class FlexivRealSenseConfig:
     controller_translation_scale: float = DEFAULT_CONTROLLER_TRANSLATION_SCALE
     controller_max_step_m: float = DEFAULT_CONTROLLER_MAX_STEP_M
     controller_max_rotation_step_deg: float = DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG
+    controller_target_update_hz: float = DEFAULT_CONTROLLER_TARGET_UPDATE_HZ
     controller_joint_limit_buffer_rad: float = DEFAULT_CONTROLLER_JOINT_LIMIT_BUFFER_RAD
     controller_joint_limit_guard_enabled: bool = True
     gripper_enabled: bool = False
@@ -296,6 +314,10 @@ class FlexivRobotClient:
         self.freedrive_last_tick_unix: float | None = None
         self.freedrive_last_error: str | None = None
         self.freedrive_send_signature: str | None = None
+        self.cartesian_send_count = 0
+        self.cartesian_send_error_count = 0
+        self.cartesian_send_slow_count = 0
+        self.cartesian_last_send: dict[str, Any] | None = None
         self.gripper: Any | None = None
         self.gripper_enabled = False
         self.gripper_device: str | None = None
@@ -343,6 +365,10 @@ class FlexivRobotClient:
             self.freedrive_last_tick_unix = None
             self.freedrive_last_error = None
             self.freedrive_send_signature = None
+            self.cartesian_send_count = 0
+            self.cartesian_send_error_count = 0
+            self.cartesian_send_slow_count = 0
+            self.cartesian_last_send = None
             self.device_list_cache = None
             self.device_list_last_error = None
             return self.read_state_locked()
@@ -361,7 +387,7 @@ class FlexivRobotClient:
         self.robot_sn = None
         self.device_list_cache = None
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, include_state: bool = True, include_devices: bool = True) -> dict[str, Any]:
         with self.lock:
             connected = self.robot is not None
             payload = {
@@ -386,10 +412,21 @@ class FlexivRobotClient:
                 "freedriveControlHz": DEFAULT_FREEDRIVE_CONTROL_HZ,
                 "freeDragControlHz": DEFAULT_FREEDRIVE_CONTROL_HZ,
                 "cartesianSendSignature": self.freedrive_send_signature,
-                "gripper": self.gripper_status_locked(),
-                "devices": self.device_status_locked(),
+                "cartesianSend": self.cartesian_send_status_locked(),
+                "gripper": self.gripper_status_locked(
+                    include_params=include_state,
+                    include_states=include_state,
+                ),
+                "devices": self.device_status_locked()
+                if include_devices
+                else {
+                    "ok": self.device_list_cache is not None,
+                    "list": self.device_list_cache,
+                    "lastError": self.device_list_last_error,
+                    "skipped": True,
+                },
             }
-            if connected:
+            if connected and include_state:
                 try:
                     payload["state"] = self.read_state_locked()
                 except Exception as exc:  # pragma: no cover - hardware path
@@ -528,15 +565,25 @@ class FlexivRobotClient:
         with self.lock:
             if self.robot is None:
                 raise RuntimeError("Flexiv robot is not connected")
+            if (
+                self.motion_armed
+                and not self.freedrive_enabled
+                and self.mode_name_locked() == "NRT_CARTESIAN_MOTION_FORCE"
+            ):
+                return self.read_state_locked()
             self.disable_freedrive_locked()
+            self.stop_cartesian_control_loop_locked()
             robot = self.robot
             self.ensure_operational_locked("arming controller motion")
             self.switch_mode_locked("NRT_CARTESIAN_MOTION_FORCE")
             robot.SetForceControlAxis([False, False, False, False, False, False])
+            self.set_cartesian_impedance_locked(
+                DEFAULT_FREEDRIVE_HOLD_STIFFNESS,
+                DEFAULT_FREEDRIVE_DAMPING,
+            )
             self.motion_armed = True
             self.motion_last_target_pose = [float(v) for v in robot.states().tcp_pose]
             self.freedrive_hold_pose = list(self.motion_last_target_pose)
-            self.start_cartesian_control_loop_locked()
             return self.read_state_locked()
 
     def enable_freedrive(self) -> dict[str, Any]:
@@ -665,6 +712,7 @@ class FlexivRobotClient:
             "freedriveControlHz": DEFAULT_FREEDRIVE_CONTROL_HZ,
             "freeDragControlHz": DEFAULT_FREEDRIVE_CONTROL_HZ,
             "cartesianSendSignature": self.freedrive_send_signature,
+            "cartesianSend": self.cartesian_send_status_locked(),
             "gripper": self.gripper_status_locked(),
             "devices": self.device_status_locked(),
         }
@@ -682,6 +730,7 @@ class FlexivRobotClient:
         joint_limit_buffer_rad: float,
         joint_limit_guard_enabled: bool,
     ) -> dict[str, Any]:
+        started = time.perf_counter()
         with self.lock:
             if self.robot is None:
                 raise RuntimeError("Flexiv robot is not connected")
@@ -690,6 +739,27 @@ class FlexivRobotClient:
             if len(target_pose_wxyz) < 7:
                 raise ValueError("target pose must be [x,y,z,qw,qx,qy,qz]")
             target = [float(v) for v in target_pose_wxyz[:7]]
+            if not all(math.isfinite(v) for v in target):
+                self.motion_armed = False
+                self.motion_last_target_pose = None
+                return {
+                    "enabled": bool(joint_limit_guard_enabled),
+                    "ok": False,
+                    "reason": "target_not_finite",
+                    "target": target,
+                    "commandSent": False,
+                }
+            mode_name = self.mode_name_locked()
+            if mode_name != "NRT_CARTESIAN_MOTION_FORCE":
+                self.motion_armed = False
+                self.motion_last_target_pose = None
+                return {
+                    "enabled": bool(joint_limit_guard_enabled),
+                    "ok": False,
+                    "reason": "cartesian_motion_mode_not_active",
+                    "modeName": mode_name,
+                    "commandSent": False,
+                }
             joint_pose = self.read_joint_pose_locked()
             guard = joint_limit_guard_state(
                 joint_pose,
@@ -699,9 +769,32 @@ class FlexivRobotClient:
             )
             if not bool(guard.get("ok")):
                 return guard
+            last_target = self.motion_last_target_pose
+            if last_target is not None and cartesian_target_near(
+                target,
+                last_target,
+                ROBOT_CARTESIAN_TARGET_POSITION_EPS_M,
+                ROBOT_CARTESIAN_TARGET_ROTATION_EPS_DEG,
+            ):
+                self.motion_last_target_pose = target
+                self.freedrive_hold_pose = target
+                guard["targetQueued"] = False
+                guard["commandSent"] = False
+                guard["reason"] = "target_unchanged"
+                guard["positionEpsilonM"] = ROBOT_CARTESIAN_TARGET_POSITION_EPS_M
+                guard["rotationEpsilonDeg"] = ROBOT_CARTESIAN_TARGET_ROTATION_EPS_DEG
+                guard["targetUpdateDurationSeconds"] = time.perf_counter() - started
+                return guard
             self.send_cartesian_motion_force_compat(self.robot, target)
             self.motion_last_target_pose = target
             self.freedrive_hold_pose = target
+            last_send = self.cartesian_last_send if isinstance(self.cartesian_last_send, dict) else {}
+            guard["targetQueued"] = False
+            guard["commandSent"] = True
+            guard["sendDurationSeconds"] = last_send.get("durationSeconds")
+            guard["sendSlow"] = last_send.get("slow")
+            guard["sendSignature"] = last_send.get("signature")
+            guard["targetUpdateDurationSeconds"] = time.perf_counter() - started
             return guard
 
     def start_cartesian_control_loop_locked(self) -> None:
@@ -735,22 +828,33 @@ class FlexivRobotClient:
         while not stop_event.is_set():
             start = time.perf_counter()
             try:
-                current_tcp = [float(v) for v in robot.states().tcp_pose]
-                if self.motion_armed:
-                    target = self.motion_last_target_pose or current_tcp
-                elif self.freedrive_enabled:
-                    target = current_tcp
-                    self.freedrive_hold_pose = current_tcp
-                else:
-                    if self.freedrive_hold_pose is None:
+                with self.lock:
+                    if self.motion_armed:
+                        target = self.motion_last_target_pose or self.freedrive_hold_pose
+                        if target is None:
+                            target = [float(v) for v in robot.states().tcp_pose]
+                            self.freedrive_hold_pose = target
+                    elif self.freedrive_enabled:
+                        current_tcp = [float(v) for v in robot.states().tcp_pose]
+                        target = current_tcp
                         self.freedrive_hold_pose = current_tcp
-                    target = self.freedrive_hold_pose
-                self.send_cartesian_motion_force_compat(robot, target)
-                self.freedrive_last_tick_unix = time.time()
-                self.freedrive_last_error = None
+                    else:
+                        if self.freedrive_hold_pose is None:
+                            current_tcp = [float(v) for v in robot.states().tcp_pose]
+                            self.freedrive_hold_pose = current_tcp
+                        target = self.freedrive_hold_pose
+                    self.send_cartesian_motion_force_compat(robot, target)
+                    self.freedrive_last_tick_unix = time.time()
+                    self.freedrive_last_error = None
             except Exception as exc:  # pragma: no cover - hardware path
-                self.freedrive_last_error = str(exc)
-                self.last_error = str(exc)
+                with self.lock:
+                    self.freedrive_last_error = str(exc)
+                    self.last_error = str(exc)
+                    if self.cartesian_error_is_fatal(exc):
+                        self.motion_armed = False
+                        self.motion_last_target_pose = None
+                        self.freedrive_hold_pose = None
+                        stop_event.set()
             elapsed = time.perf_counter() - start
             stop_event.wait(max(0.0, period - elapsed))
 
@@ -819,31 +923,78 @@ class FlexivRobotClient:
         except TypeError:
             self.robot.SetCartesianImpedance(list(stiffness))
 
+    def cartesian_send_status_locked(self) -> dict[str, Any]:
+        return {
+            "count": self.cartesian_send_count,
+            "errors": self.cartesian_send_error_count,
+            "slowCalls": self.cartesian_send_slow_count,
+            "last": self.cartesian_last_send,
+            "slowThresholdSeconds": ROBOT_CARTESIAN_SEND_SLOW_SECONDS,
+        }
+
+    def cartesian_send_status(self) -> dict[str, Any]:
+        with self.lock:
+            return copy.deepcopy(self.cartesian_send_status_locked())
+
+    @staticmethod
+    def cartesian_error_is_fatal(error: Exception | str) -> bool:
+        message = str(error).lower()
+        return any(marker in message for marker in ROBOT_CARTESIAN_SEND_FATAL_MARKERS)
+
     def send_cartesian_motion_force_compat(self, robot: Any, pose: list[float]) -> None:
         target = [float(v) for v in pose[:7]]
         zero6 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        started = time.perf_counter()
+        signature: str | None = None
+        error: Exception | None = None
+        fallback_errors: list[str] = []
         try:
             robot.SendCartesianMotionForce(
                 target,
                 zero6,
-                zero6,
-                max_linear_vel=DEFAULT_FREEDRIVE_MAX_LINEAR_VEL,
-                max_angular_vel=DEFAULT_FREEDRIVE_MAX_ANGULAR_VEL,
-                max_linear_acc=DEFAULT_FREEDRIVE_MAX_LINEAR_ACC,
-                max_angular_acc=DEFAULT_FREEDRIVE_MAX_ANGULAR_ACC,
+                DEFAULT_FREEDRIVE_MAX_LINEAR_VEL,
+                DEFAULT_FREEDRIVE_MAX_ANGULAR_VEL,
+                DEFAULT_FREEDRIVE_MAX_LINEAR_ACC,
+                DEFAULT_FREEDRIVE_MAX_ANGULAR_ACC,
             )
-            self.freedrive_send_signature = "pose+wrench+velocity+limits"
-            return
-        except TypeError:
-            pass
-        try:
-            robot.SendCartesianMotionForce(target, zero6, zero6)
-            self.freedrive_send_signature = "pose+wrench+velocity"
-            return
-        except TypeError:
-            pass
-        robot.SendCartesianMotionForce(target)
-        self.freedrive_send_signature = "pose"
+            signature = "pose+wrench+limits"
+        except TypeError as exc:
+            fallback_errors.append(f"limits: {exc}")
+            try:
+                robot.SendCartesianMotionForce(target, zero6)
+                signature = "pose+wrench"
+            except TypeError as exc:
+                fallback_errors.append(f"wrench: {exc}")
+                try:
+                    robot.SendCartesianMotionForce(target)
+                    signature = "pose"
+                except Exception as exc:
+                    error = exc
+            except Exception as exc:
+                error = exc
+        except Exception as exc:
+            error = exc
+        duration = time.perf_counter() - started
+        with self.lock:
+            self.cartesian_send_count += 1
+            if duration >= ROBOT_CARTESIAN_SEND_SLOW_SECONDS:
+                self.cartesian_send_slow_count += 1
+            if error is not None:
+                self.cartesian_send_error_count += 1
+            if signature is not None:
+                self.freedrive_send_signature = signature
+            self.cartesian_last_send = {
+                "ok": error is None,
+                "durationSeconds": duration,
+                "slow": duration >= ROBOT_CARTESIAN_SEND_SLOW_SECONDS,
+                "signature": signature or self.freedrive_send_signature,
+                "error": str(error) if error is not None else None,
+                "fallbackErrors": fallback_errors[-3:],
+                "targetPoseWxyz": target,
+                "unixSeconds": time.time(),
+            }
+        if error is not None:
+            raise error
 
     def joint_limit_guard(self, buffer_rad: float, enabled: bool) -> dict[str, Any]:
         with self.lock:
@@ -920,8 +1071,8 @@ class FlexivRobotClient:
 
             prioritized = [
                 *[name for name in online_names if is_robotiq(name)],
-                *[name for name in online_names if is_gripperish(name) and not is_robotiq(name)],
                 *[name for name in offline_names if is_robotiq(name)],
+                *[name for name in online_names if is_gripperish(name) and not is_robotiq(name)],
                 *[name for name in offline_names if is_gripperish(name) and not is_robotiq(name)],
             ]
             for name in prioritized:
@@ -942,6 +1093,12 @@ class FlexivRobotClient:
             raise RuntimeError("Flexiv robot is not connected")
         flexivrdk = sys.modules.get("flexivrdk") or import_flexivrdk(None)
         requested = str(device_name or DEFAULT_GRIPPER_DEVICE).strip() or DEFAULT_GRIPPER_DEVICE
+        if self.gripper is not None and self.gripper_enabled:
+            current = str(self.gripper_device or "").strip()
+            if requested.lower() in ("auto", "default") or not current or current == requested:
+                status = self.gripper_status_locked()
+                status["reusedExisting"] = True
+                return status
         attempts: list[dict[str, Any]] = []
         last_error: str | None = None
         for device in self.gripper_device_candidates_locked(requested):
@@ -961,7 +1118,7 @@ class FlexivRobotClient:
                 self.gripper_last_error = None
                 attempts.append({"device": device, "ok": True, "initError": init_error})
                 self.gripper_enable_attempts = attempts
-                return self.gripper_status_locked()
+                return self.gripper_status_locked(include_params=True, include_states=True)
             except Exception as exc:
                 last_error = str(exc)
                 attempts.append({"device": device, "ok": False, "error": last_error})
@@ -973,7 +1130,7 @@ class FlexivRobotClient:
                     attempts[-1]["ok"] = True
                     attempts[-1]["reusedAlreadyEnabled"] = True
                     self.gripper_enable_attempts = attempts
-                    return self.gripper_status_locked()
+                    return self.gripper_status_locked(include_params=True, include_states=True)
         self.gripper = None
         self.gripper_enabled = False
         self.gripper_device = None
@@ -996,14 +1153,19 @@ class FlexivRobotClient:
         self.gripper_enabled = False
         self.gripper_device = None
 
-    def gripper_status_locked(self, *, include_params: bool = True) -> dict[str, Any]:
+    def gripper_status_locked(
+        self,
+        *,
+        include_params: bool = False,
+        include_states: bool = False,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "enabled": self.gripper_enabled,
             "device": self.gripper_device,
             "lastError": self.gripper_last_error,
             "enableAttempts": self.gripper_enable_attempts[-12:],
         }
-        if self.gripper is not None:
+        if self.gripper is not None and include_states:
             try:
                 states = self.gripper.states()
                 payload["states"] = {
@@ -1030,9 +1192,14 @@ class FlexivRobotClient:
                     pass
         return payload
 
-    def gripper_status(self) -> dict[str, Any]:
+    def gripper_status(
+        self,
+        *,
+        include_params: bool = False,
+        include_states: bool = False,
+    ) -> dict[str, Any]:
         with self.lock:
-            return self.gripper_status_locked()
+            return self.gripper_status_locked(include_params=include_params, include_states=include_states)
 
     def move_gripper(self, width_m: float, speed_mps: float, force_n: float) -> dict[str, Any]:
         with self.lock:
@@ -1067,7 +1234,7 @@ class FlexivRobotClient:
             force = clamp_optional_range(requested["force"], params_payload.get("minForce"), params_payload.get("maxForce"))
             self.gripper.Move(width, speed, force)
             self.gripper_last_error = None
-            status = self.gripper_status_locked()
+            status = self.gripper_status_locked(include_states=True)
             status["command"] = {
                 "requestedWidth": requested["width"],
                 "requestedSpeed": requested["speed"],
@@ -1525,6 +1692,311 @@ class RealSenseStreamHub:
         return serials
 
 
+DEFAULT_COLOR_VIDEO_CRF = 23
+DEFAULT_COLOR_VIDEO_PRESET = "veryfast"
+
+
+class ColorStreamWriter:
+    """Encode BGR frames to H.264 via a system ffmpeg pipe (libx264).
+
+    OpenCV's bundled FFmpeg on the lab machine only exposes the v4l2m2m H.264
+    backend (no valid device), so writing H.264 through cv2.VideoWriter silently
+    fails. The system ffmpeg has libx264, and the depth stream already uses this
+    same pipe pattern, so color reuses it to get ~2-4x smaller files than mp4v.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        width: int,
+        height: int,
+        fps: float,
+        crf: int = DEFAULT_COLOR_VIDEO_CRF,
+        preset: str = DEFAULT_COLOR_VIDEO_PRESET,
+    ) -> None:
+        self.path = path
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = max(1.0, float(fps))
+        self.crf = int(crf)
+        self.preset = str(preset)
+        self.codec = "libx264"
+        self.frame_count = 0
+        self.process: subprocess.Popen[bytes] | None = None
+        self.stderr_handle: Any | None = None
+        self.stderr_path: Path | None = None
+        self.error: str | None = None
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._open()
+
+    def _open(self) -> None:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg executable not found")
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s:v",
+            f"{self.width}x{self.height}",
+            "-r",
+            f"{self.fps:.6f}",
+            "-i",
+            "pipe:0",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            self.preset,
+            "-crf",
+            str(self.crf),
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(self.path),
+        ]
+        self.stderr_path = self.path.with_name(self.path.name + ".ffmpeg.log")
+        self.stderr_handle = self.stderr_path.open("ab")
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=self.stderr_handle,
+            )
+        except Exception:
+            if self.stderr_handle is not None:
+                self.stderr_handle.close()
+                self.stderr_handle = None
+            raise
+        if self.process.stdin is None:
+            try:
+                self.process.kill()
+            except Exception:
+                pass
+            if self.stderr_handle is not None:
+                self.stderr_handle.close()
+                self.stderr_handle = None
+            raise RuntimeError("ffmpeg stdin pipe is unavailable")
+
+    def write(self, bgr: np.ndarray) -> None:
+        if bgr.shape[0] != self.height or bgr.shape[1] != self.width:
+            raise ValueError(
+                f"color frame shape changed from {self.width}x{self.height} "
+                f"to {int(bgr.shape[1])}x{int(bgr.shape[0])}"
+            )
+        if self.process is None or self.process.stdin is None:
+            raise RuntimeError("ffmpeg color writer is not open")
+        if not bgr.flags["C_CONTIGUOUS"] or bgr.dtype != np.uint8:
+            bgr = np.ascontiguousarray(bgr, dtype=np.uint8)
+        self.process.stdin.write(bgr.tobytes(order="C"))
+        self.frame_count += 1
+
+    def close(self) -> None:
+        if self.process is None:
+            return
+        process = self.process
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+            return_code = process.wait(timeout=15.0)
+        except Exception as exc:
+            self.error = str(exc)
+            try:
+                process.kill()
+            except Exception:
+                pass
+            try:
+                process.wait(timeout=2.0)
+            except Exception:
+                pass
+            raise
+        finally:
+            self.process = None
+            if self.stderr_handle is not None:
+                self.stderr_handle.close()
+                self.stderr_handle = None
+        if return_code != 0:
+            message = ""
+            if self.stderr_path is not None and self.stderr_path.exists():
+                try:
+                    message = self.stderr_path.read_text(encoding="utf-8", errors="replace").strip()
+                except Exception:
+                    message = ""
+            self.error = message or f"ffmpeg exited with code {return_code}"
+            raise RuntimeError(self.error)
+        if self.stderr_path is not None and self.stderr_path.exists():
+            try:
+                if self.stderr_path.stat().st_size == 0:
+                    self.stderr_path.unlink()
+            except Exception:
+                pass
+
+
+class DepthStreamWriter:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        width: int,
+        height: int,
+        fps: float,
+        encoding: str,
+    ) -> None:
+        self.path = path
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = max(1.0, float(fps))
+        self.encoding = str(encoding or "raw")
+        self.frame_count = 0
+        self.byte_count = 0
+        self.process: subprocess.Popen[bytes] | None = None
+        self.handle: Any | None = None
+        self.stderr_handle: Any | None = None
+        self.stderr_path: Path | None = None
+        self.error: str | None = None
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.encoding == "ffv1":
+            self._open_ffv1()
+        else:
+            self.encoding = "raw"
+            self.handle = self.path.open("ab")
+
+    def _open_ffv1(self) -> None:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg executable not found")
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray16le",
+            "-s:v",
+            f"{self.width}x{self.height}",
+            "-r",
+            f"{self.fps:.6f}",
+            "-i",
+            "pipe:0",
+            "-an",
+            "-c:v",
+            "ffv1",
+            "-level",
+            "3",
+            "-g",
+            "1",
+            "-slices",
+            "24",
+            "-slicecrc",
+            "1",
+            str(self.path),
+        ]
+        self.stderr_path = self.path.with_name(self.path.name + ".ffmpeg.log")
+        self.stderr_handle = self.stderr_path.open("ab")
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=self.stderr_handle,
+            )
+        except Exception:
+            if self.stderr_handle is not None:
+                self.stderr_handle.close()
+                self.stderr_handle = None
+            raise
+        if self.process.stdin is None:
+            try:
+                self.process.kill()
+            except Exception:
+                pass
+            if self.stderr_handle is not None:
+                self.stderr_handle.close()
+                self.stderr_handle = None
+            raise RuntimeError("ffmpeg stdin pipe is unavailable")
+
+    def write(self, depth: np.ndarray) -> dict[str, Any]:
+        if depth.shape[0] != self.height or depth.shape[1] != self.width:
+            raise ValueError(
+                f"depth frame shape changed from {self.width}x{self.height} "
+                f"to {int(depth.shape[1])}x{int(depth.shape[0])}"
+            )
+        data = depth.tobytes(order="C")
+        frame_index = self.frame_count
+        byte_offset = self.byte_count
+        if self.encoding == "ffv1":
+            if self.process is None or self.process.stdin is None:
+                raise RuntimeError("ffmpeg depth writer is not open")
+            self.process.stdin.write(data)
+        else:
+            if self.handle is None:
+                raise RuntimeError("raw depth writer is not open")
+            self.handle.write(data)
+        self.frame_count += 1
+        self.byte_count += len(data)
+        return {
+            "streamFrameIndex": frame_index,
+            "byteOffset": byte_offset if self.encoding == "raw" else None,
+            "byteLength": len(data) if self.encoding == "raw" else None,
+            "sourceByteOffset": byte_offset,
+            "sourceByteLength": len(data),
+        }
+
+    def close(self) -> None:
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+        if self.process is not None:
+            process = self.process
+            try:
+                if process.stdin is not None:
+                    process.stdin.close()
+                return_code = process.wait(timeout=10.0)
+            except Exception as exc:
+                self.error = str(exc)
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                try:
+                    process.wait(timeout=2.0)
+                except Exception:
+                    pass
+                raise
+            finally:
+                self.process = None
+                if self.stderr_handle is not None:
+                    self.stderr_handle.close()
+                    self.stderr_handle = None
+            if return_code != 0:
+                message = ""
+                if self.stderr_path is not None and self.stderr_path.exists():
+                    try:
+                        message = self.stderr_path.read_text(encoding="utf-8", errors="replace").strip()
+                    except Exception:
+                        message = ""
+                self.error = message or f"ffmpeg exited with code {return_code}"
+                raise RuntimeError(self.error)
+            if self.stderr_path is not None and self.stderr_path.exists():
+                try:
+                    if self.stderr_path.stat().st_size == 0:
+                        self.stderr_path.unlink()
+                except Exception:
+                    pass
+
+
 class RobotRealsenseSession:
     def __init__(
         self,
@@ -1564,11 +2036,16 @@ class RobotRealsenseSession:
         self.motion_handle: Any | None = None
         self.gripper_handle: Any | None = None
         self.video_frames_handle: Any | None = None
-        self.video_writers: dict[str, cv2.VideoWriter] = {}
+        self.video_writers: dict[str, ColorStreamWriter] = {}
+        self.video_codecs: dict[str, str] = {}
         self.video_paths: dict[str, str] = {}
         self.video_frame_counts: dict[str, int] = {}
-        self.depth_stream_handles: dict[str, Any] = {}
+        self.depth_stream_handles: dict[str, DepthStreamWriter] = {}
         self.depth_stream_paths: dict[str, str] = {}
+        self.depth_stream_encodings: dict[str, str] = {}
+        self.depth_stream_frame_counts: dict[str, int] = {}
+        self.depth_stream_warnings: list[dict[str, Any]] = []
+        self.depth_stream_disabled_roles: dict[str, str] = {}
         self.camera_frame_queues: dict[str, queue.Queue[Any]] = {}
         self.camera_writer_threads: dict[str, threading.Thread] = {}
         self.video_role_locks: dict[str, threading.RLock] = {}
@@ -1612,6 +2089,7 @@ class RobotRealsenseSession:
         self.robot_anchor_tcp_pose: list[float] | None = None
         self.motion_command_count = 0
         self.motion_skip_count = 0
+        self.motion_rate_limit_count = 0
         self.motion_error_count = 0
         self.last_motion_event: dict[str, Any] | None = None
         self.gripper_command_count = 0
@@ -1621,6 +2099,7 @@ class RobotRealsenseSession:
         self.last_gripper_event: dict[str, Any] | None = None
         self.last_gripper_closed: bool | None = None
         self.last_gripper_unavailable_closed: bool | None = None
+        self.next_controller_motion_target_perf = 0.0
         self.ee_pose_history: list[np.ndarray] = []
         self.text_pending_rows = {
             "samples": 0,
@@ -1637,6 +2116,7 @@ class RobotRealsenseSession:
         self.require_controller_alignment = require_controller_alignment
         self.t_ee_end_camera = self._alignment_transform("end_camera", "T_ee_realsense")
         self.t_base_world = self._alignment_transform("questAlignment", "T_base_world")
+        self.cartesian_send_baseline = self.robot.cartesian_send_status()
 
     def start(self) -> dict[str, Any]:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -1717,6 +2197,7 @@ class RobotRealsenseSession:
         with self.lock:
             if self.closed:
                 return None
+        update_started_perf = time.perf_counter()
         try:
             event = self._update_controller_motion_unlocked(quest_sample)
         except Exception as exc:  # pragma: no cover - hardware path
@@ -1728,13 +2209,20 @@ class RobotRealsenseSession:
                 "quest_sample_index": quest_sample.get("sampleIndex"),
                 "error": str(exc),
             }
+        update_finished_perf = time.perf_counter()
+        event.setdefault("pc_perf_counter_seconds", update_finished_perf)
+        event.setdefault("pc_unix_seconds", time.time())
+        event["update_duration_seconds"] = update_finished_perf - update_started_perf
         should_record_event = self._should_record_motion_event(event)
         with self.lock:
-            self.last_motion_event = event
+            if event.get("reason") != "rate_limited":
+                self.last_motion_event = event
             if should_record_event and self.motion_handle is not None:
                 self.motion_handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
                 self._note_text_write_locked("motion")
-        if event.get("ok"):
+        if event.get("reason") == "rate_limited":
+            self.motion_rate_limit_count += 1
+        elif event.get("ok") and event.get("commandSent") is not False:
             self.motion_command_count += 1
         else:
             self.motion_skip_count += 1
@@ -1748,6 +2236,7 @@ class RobotRealsenseSession:
         with self.lock:
             if self.closed:
                 return None
+        update_started_perf = time.perf_counter()
         try:
             if not self.gripper_available:
                 event = self._gripper_unavailable_event(quest_sample)
@@ -1765,6 +2254,10 @@ class RobotRealsenseSession:
                 "error": str(exc),
                 "disabledAfterError": True,
             }
+        update_finished_perf = time.perf_counter()
+        event.setdefault("pc_perf_counter_seconds", update_finished_perf)
+        event.setdefault("pc_unix_seconds", time.time())
+        event["update_duration_seconds"] = update_finished_perf - update_started_perf
         should_record_event = self._should_record_gripper_event(event)
         with self.lock:
             self.last_gripper_event = event
@@ -1781,6 +2274,8 @@ class RobotRealsenseSession:
 
     @staticmethod
     def _should_record_motion_event(event: dict[str, Any]) -> bool:
+        if event.get("reason") == "rate_limited":
+            return False
         if event.get("ok") or event.get("error"):
             return True
         return event.get("teleopHeld") is True
@@ -1985,23 +2480,22 @@ class RobotRealsenseSession:
             try:
                 writer = self.video_writers.pop(role, None)
                 if writer is not None:
-                    writer.release()
-                handle = self.depth_stream_handles.pop(role, None)
-                if handle is not None:
-                    handle.close()
+                    writer.close()
+                self.video_codecs.pop(role, None)
+                self._close_depth_stream(role)
             finally:
                 role_lock.release()
         with self.video_io_lock:
-            for role, handle in list(self.depth_stream_handles.items()):
+            for role in list(self.depth_stream_handles.keys()):
                 if role in alive_camera_roles:
                     continue
-                handle.close()
-                self.depth_stream_handles.pop(role, None)
+                self._close_depth_stream(role)
             for role, writer in list(self.video_writers.items()):
                 if role in alive_camera_roles:
                     continue
-                writer.release()
+                writer.close()
                 self.video_writers.pop(role, None)
+                self.video_codecs.pop(role, None)
             for role in list(self.video_role_locks.keys()):
                 if role not in alive_camera_roles:
                     self.video_role_locks.pop(role, None)
@@ -2044,6 +2538,10 @@ class RobotRealsenseSession:
             "images": self.image_count,
             "videos": self.video_paths,
             "depthStreams": self.depth_stream_paths,
+            "depthStreamEncodings": dict(self.depth_stream_encodings),
+            "depthStreamFrameCounts": dict(self.depth_stream_frame_counts),
+            "depthStreamWarnings": list(self.depth_stream_warnings),
+            "depthStreamDisabledRoles": dict(self.depth_stream_disabled_roles),
             "videoFrames": self.video_frame_count,
             "depthFrames": self.depth_count,
             "cameraQueueDrops": dict(self.camera_queue_drop_counts),
@@ -2055,6 +2553,7 @@ class RobotRealsenseSession:
             "cameraRecordErrors": self.camera_record_error_count,
             "motionCommands": self.motion_command_count,
             "motionSkips": self.motion_skip_count,
+            "motionRateLimited": self.motion_rate_limit_count,
             "motionErrors": self.motion_error_count,
             "lastMotion": self.last_motion_event,
             "controlMode": self.control_mode,
@@ -2066,12 +2565,30 @@ class RobotRealsenseSession:
             "gripperSkips": self.gripper_skip_count,
             "gripperErrors": self.gripper_error_count,
             "lastGripper": self.last_gripper_event,
+            "cartesianControl": self._cartesian_control_summary(),
             "poseDiversity": ee_pose_diversity(self.ee_pose_history),
             "performance": self._performance_summary(),
             "closeErrors": list(self.close_errors),
             "lastError": self.last_error,
             "lastRobotStateError": self.last_robot_state_error,
             "lastCameraRecordError": self.last_camera_record_error,
+        }
+
+    def _cartesian_control_summary(self) -> dict[str, Any]:
+        current = self.robot.cartesian_send_status()
+        baseline = self.cartesian_send_baseline if isinstance(self.cartesian_send_baseline, dict) else {}
+        count = max(0, int(current.get("count") or 0) - int(baseline.get("count") or 0))
+        errors = max(0, int(current.get("errors") or 0) - int(baseline.get("errors") or 0))
+        slow = max(0, int(current.get("slowCalls") or 0) - int(baseline.get("slowCalls") or 0))
+        return {
+            "count": count,
+            "errors": errors,
+            "slowCalls": slow,
+            "last": current.get("last"),
+            "slowThresholdSeconds": current.get("slowThresholdSeconds"),
+            "globalCount": current.get("count"),
+            "globalErrors": current.get("errors"),
+            "globalSlowCalls": current.get("slowCalls"),
         }
 
     def _performance_summary(self) -> dict[str, Any]:
@@ -2116,6 +2633,8 @@ class RobotRealsenseSession:
             "cameras": cameras,
             "targetCameraHz": target_camera_hz,
             "recordDepth": bool(self.config.record_depth),
+            "recordDepthFormat": normalize_depth_format(self.config.record_depth_format),
+            "depthStreamEncodings": dict(self.depth_stream_encodings),
             "recordDepthEveryNFrames": depth_every,
             "targetDepthHz": target_depth_hz,
         }
@@ -2496,10 +3015,9 @@ class RobotRealsenseSession:
                     fps = max(1.0, float(self.config.fps))
                 else:
                     fps = max(1.0, 1.0 / max(1e-6, float(self.config.capture_interval_seconds)))
-                writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-                if not writer.isOpened():
-                    raise RuntimeError(f"could not open robot camera video writer: {path}")
+                writer = ColorStreamWriter(path, width=width, height=height, fps=fps)
                 self.video_writers[role] = writer
+                self.video_codecs[role] = writer.codec
                 self.video_paths[role] = str(rel_path).replace("\\", "/")
                 self.video_frame_counts[role] = 0
             frame_index = int(self.video_frame_counts.get(role, 0))
@@ -2514,6 +3032,7 @@ class RobotRealsenseSession:
                 "serial": serial,
                 "frame_index": frame_index,
                 "video": self.video_paths.get(role),
+                "video_codec": self.video_codecs.get(role),
                 "captured_at": datetime.now(timezone.utc).isoformat(),
                 "pc_perf_counter_seconds": write_finished_perf,
                 "write_duration_seconds": float(write_finished_perf - write_started_perf),
@@ -2549,18 +3068,64 @@ class RobotRealsenseSession:
                 self.video_role_locks[role_name] = lock
             return lock
 
-    def _depth_stream_handle(self, role: str, serial: str) -> tuple[Any, str]:
+    def _close_depth_stream(self, role: str) -> None:
+        writer = self.depth_stream_handles.pop(role, None)
+        if writer is None:
+            return
+        try:
+            writer.close()
+        except Exception as exc:
+            self._note_close_error("depth_stream_close", f"{role}: {exc}")
+        self.depth_stream_frame_counts[role] = int(writer.frame_count)
+
+    def _depth_stream_handle(
+        self,
+        role: str,
+        serial: str,
+        depth: np.ndarray,
+        *,
+        force_raw: bool = False,
+    ) -> tuple[DepthStreamWriter, str]:
         handle = self.depth_stream_handles.get(role)
         rel_path = self.depth_stream_paths.get(role)
         if handle is not None and isinstance(rel_path, str) and rel_path:
+            if handle.width != int(depth.shape[1]) or handle.height != int(depth.shape[0]):
+                raise ValueError(
+                    f"{role} depth dimensions changed from {handle.width}x{handle.height} "
+                    f"to {int(depth.shape[1])}x{int(depth.shape[0])}"
+                )
             return handle, rel_path
-        rel = Path("depth") / f"{role}_{safe_filename(serial)}.u16le.bin"
-        path = self.directory / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handle = path.open("ab")
+        requested = "raw" if force_raw else normalize_depth_format(self.config.record_depth_format)
+        depth_every = max(1, int(self.config.record_depth_every_n_frames))
+        depth_fps = float(self.config.fps) / float(depth_every)
+        if requested == "ffv1":
+            rel = Path("depth") / f"{role}_{safe_filename(serial)}.ffv1.mkv"
+            path = self.directory / rel
+            try:
+                handle = DepthStreamWriter(
+                    path,
+                    width=int(depth.shape[1]),
+                    height=int(depth.shape[0]),
+                    fps=depth_fps,
+                    encoding="ffv1",
+                )
+            except Exception as exc:
+                self._note_depth_warning("depth_ffv1_open_fallback", role, exc)
+                requested = "raw"
+        if requested != "ffv1":
+            rel = Path("depth") / f"{role}_{safe_filename(serial)}.u16le.bin"
+            path = self.directory / rel
+            handle = DepthStreamWriter(
+                path,
+                width=int(depth.shape[1]),
+                height=int(depth.shape[0]),
+                fps=depth_fps,
+                encoding="raw",
+            )
         rel_path = str(rel).replace("\\", "/")
         self.depth_stream_handles[role] = handle
         self.depth_stream_paths[role] = rel_path
+        self.depth_stream_encodings[role] = handle.encoding
         return handle, rel_path
 
     def _write_depth_frame(
@@ -2573,6 +3138,8 @@ class RobotRealsenseSession:
         depth = frame.get("depth")
         if not isinstance(depth, np.ndarray):
             return None
+        if role in self.depth_stream_disabled_roles:
+            return None
         every_n = max(1, int(self.config.record_depth_every_n_frames))
         if frame.get("depthCaptureIndex") is None and every_n > 1 and int(frame_index) % every_n != 0:
             return None
@@ -2581,21 +3148,59 @@ class RobotRealsenseSession:
         if not depth.flags.c_contiguous:
             depth = np.ascontiguousarray(depth)
         metadata = frame.get("metadata") if isinstance(frame.get("metadata"), dict) else {}
-        handle, rel_path = self._depth_stream_handle(role, serial)
-        byte_offset = int(handle.tell())
-        byte_length = int(depth.nbytes)
-        depth.tofile(handle)
+        handle, rel_path = self._depth_stream_handle(role, serial, depth)
+        try:
+            stream_info = handle.write(depth)
+        except Exception as exc:
+            if handle.encoding == "ffv1" and handle.frame_count == 0:
+                self._note_depth_warning("depth_ffv1_first_write_fallback", role, exc)
+                self.depth_stream_handles.pop(role, None)
+                self.depth_stream_paths.pop(role, None)
+                self.depth_stream_encodings.pop(role, None)
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+                for candidate in (handle.path, handle.stderr_path):
+                    if candidate is not None:
+                        try:
+                            if candidate.exists():
+                                candidate.unlink()
+                        except Exception:
+                            pass
+                handle, rel_path = self._depth_stream_handle(role, serial, depth, force_raw=True)
+                stream_info = handle.write(depth)
+            else:
+                self.depth_stream_disabled_roles[role] = str(exc)
+                self._note_close_error("depth_stream_write_failed", f"{role}: {exc}")
+                self._close_depth_stream(role)
+                return None
+        self.depth_stream_frame_counts[role] = int(handle.frame_count)
         self.depth_count += 1
         depth_aligned = bool(metadata.get("depthAlignedToColor"))
+        encoding = (
+            "uint16_ffv1_mkv_aligned_to_color"
+            if handle.encoding == "ffv1" and depth_aligned
+            else "uint16_ffv1_mkv_camera_native"
+            if handle.encoding == "ffv1"
+            else "uint16_raw_aligned_to_color"
+            if depth_aligned
+            else "uint16_raw_camera_native"
+        )
         return {
             "path": rel_path,
-            "encoding": "uint16_raw_aligned_to_color" if depth_aligned else "uint16_raw_camera_native",
+            "encoding": encoding,
+            "container": "matroska" if handle.encoding == "ffv1" else "raw",
+            "codec": "ffv1" if handle.encoding == "ffv1" else None,
             "dtype": "uint16",
             "endianness": "little",
             "layout": "row_major",
             "alignedToColor": depth_aligned,
-            "byteOffset": byte_offset,
-            "byteLength": byte_length,
+            "streamFrameIndex": stream_info.get("streamFrameIndex"),
+            "byteOffset": stream_info.get("byteOffset"),
+            "byteLength": stream_info.get("byteLength"),
+            "sourceByteOffset": stream_info.get("sourceByteOffset"),
+            "sourceByteLength": stream_info.get("sourceByteLength"),
             "captureIndex": frame.get("depthCaptureIndex"),
             "depthScaleM": metadata.get("depthScaleM"),
             "width": int(depth.shape[1]),
@@ -2627,6 +3232,16 @@ class RobotRealsenseSession:
         }
         self.close_errors.append(payload)
         self.last_error = payload["error"]
+
+    def _note_depth_warning(self, stage: str, role: str, message: Any) -> None:
+        self.depth_stream_warnings.append(
+            {
+                "stage": stage,
+                "role": str(role),
+                "message": str(message),
+                "capturedAt": datetime.now(timezone.utc).isoformat(),
+            }
+        )
 
     def _flush_text_handles_locked(self) -> None:
         for handle in (self.samples_handle, self.robot_states_handle, self.motion_handle, self.gripper_handle):
@@ -2668,13 +3283,31 @@ class RobotRealsenseSession:
 
     def _try_initialize_gripper(self) -> None:
         try:
+            if self.record_mode == ROBOT_SESSION_RECORD_ASYNC and not self.robot.gripper_enabled:
+                status = self.robot.gripper_status()
+                self.gripper_available = False
+                event = {
+                    "ok": False,
+                    "commandSent": False,
+                    "record_id": self.record_id,
+                    "captured_at": datetime.now(timezone.utc).isoformat(),
+                    "action": "initialize",
+                    "reason": "gripper_not_preinitialized",
+                    "status": status,
+                }
+                self.last_gripper_event = event
+                if self.gripper_handle is not None:
+                    self.gripper_handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+                    self.gripper_handle.flush()
+                self._publish(robot_gripper_event(event))
+                return
             status = self.robot.enable_gripper(
                 self.config.gripper_device,
                 init_on_enable=self.config.gripper_init_on_enable,
             )
-            self.gripper_available = True
+            self.gripper_available = bool(status.get("enabled", True)) if isinstance(status, dict) else True
             event = {
-                "ok": True,
+                "ok": self.gripper_available,
                 "commandSent": False,
                 "record_id": self.record_id,
                 "captured_at": datetime.now(timezone.utc).isoformat(),
@@ -2735,9 +3368,37 @@ class RobotRealsenseSession:
                 "teleopHoldValue": side_value,
                 "right_controller_input": input_summary,
             }
+        now_perf = time.perf_counter()
+        min_period = 1.0 / max(1.0, float(self.config.controller_target_update_hz))
+        if now_perf < self.next_controller_motion_target_perf:
+            return {
+                "ok": False,
+                "reason": "rate_limited",
+                "record_id": self.record_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "quest_sample_index": quest_sample.get("sampleIndex"),
+                "quest_recording_timestamp_seconds": quest_sample.get("recordingTimestampSeconds"),
+                "anchored": self.controller_motion_anchor_ready(),
+                "right_controller_input": input_summary,
+                "teleopHeld": True,
+                "teleopHoldValue": side_value,
+                "targetUpdateHz": float(self.config.controller_target_update_hz),
+            }
+        self.next_controller_motion_target_perf = now_perf + min_period
         if not self.robot.motion_armed:
-            self.robot.arm_motion()
             self.reset_controller_motion_anchor()
+            return {
+                "ok": False,
+                "reason": "motion_not_armed",
+                "record_id": self.record_id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "quest_sample_index": quest_sample.get("sampleIndex"),
+                "quest_recording_timestamp_seconds": quest_sample.get("recordingTimestampSeconds"),
+                "anchored": self.controller_motion_anchor_ready(),
+                "right_controller_input": input_summary,
+                "teleopHeld": True,
+                "teleopHoldValue": side_value,
+            }
         position = vec3_array(controller.get("position") if isinstance(controller, dict) else None)
         if position is None:
             self.reset_controller_motion_anchor()
@@ -2849,6 +3510,7 @@ class RobotRealsenseSession:
                 "step_rotation_deg": rotation_angle_deg(step_rotation),
                 "target_tcp_pose_wxyz": target,
                 "joint_limit_guard": joint_guard,
+                "commandSent": bool(joint_guard.get("commandSent")),
                 "limits": {
                     "scale": self.config.controller_translation_scale,
                     "workspaceLimitEnabled": False,
@@ -2856,6 +3518,7 @@ class RobotRealsenseSession:
                     "maxStepM": self.config.controller_max_step_m,
                     "maxRotationDeg": None,
                     "maxRotationStepDeg": self.config.controller_max_rotation_step_deg,
+                    "targetUpdateHz": self.config.controller_target_update_hz,
                     "jointLimitBufferRad": self.config.controller_joint_limit_buffer_rad,
                     "jointLimitGuardEnabled": self.config.controller_joint_limit_guard_enabled,
                 },
@@ -2894,6 +3557,8 @@ class RobotRealsenseSession:
             "step_rotation_deg": rotation_angle_deg(step_rotation),
             "target_tcp_pose_wxyz": target,
             "joint_limit_guard": joint_guard,
+            "commandSent": bool(joint_guard.get("commandSent")),
+            "reason": joint_guard.get("reason"),
             "limits": {
                 "scale": self.config.controller_translation_scale,
                 "workspaceLimitEnabled": False,
@@ -2901,6 +3566,7 @@ class RobotRealsenseSession:
                 "maxStepM": self.config.controller_max_step_m,
                 "maxRotationDeg": None,
                 "maxRotationStepDeg": self.config.controller_max_rotation_step_deg,
+                "targetUpdateHz": self.config.controller_target_update_hz,
                 "jointLimitBufferRad": self.config.controller_joint_limit_buffer_rad,
                 "jointLimitGuardEnabled": self.config.controller_joint_limit_guard_enabled,
             },
@@ -2917,6 +3583,7 @@ class RobotRealsenseSession:
         self.controller_anchor_world = None
         self.controller_anchor_rotation_world = None
         self.robot_anchor_tcp_pose = None
+        self.next_controller_motion_target_perf = 0.0
 
     def _update_gripper_unlocked(self, quest_sample: dict[str, Any]) -> dict[str, Any]:
         controller = quest_sample.get("rightController")
@@ -3008,12 +3675,12 @@ class FlexivRealSenseManager:
         self.last_calibration: dict[str, Any] | None = None
         self.last_error: str | None = None
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, lightweight: bool = False) -> dict[str, Any]:
         with self.lock:
             active = self.active_session.summary("recording") if self.active_session is not None else None
-            robot_status = self.robot.status()
+            robot_status = self.robot.status(include_state=not lightweight, include_devices=not lightweight)
             state = robot_status.get("state") if isinstance(robot_status, dict) else None
-            if isinstance(state, dict) and robot_status.get("connected"):
+            if not lightweight and isinstance(state, dict) and robot_status.get("connected"):
                 state["jointLimitGuard"] = self.robot.joint_limit_guard(
                     self.config.controller_joint_limit_buffer_rad,
                     self.config.controller_joint_limit_guard_enabled,
@@ -3027,6 +3694,51 @@ class FlexivRealSenseManager:
                 "realsenseStream": self.stream_hub.status(),
                 "lastCalibration": self.last_calibration,
                 "lastError": self.last_error,
+            }
+
+    def gripper_status(self) -> dict[str, Any]:
+        with self.lock:
+            robot_status = self.robot.status(include_state=False, include_devices=True)
+            gripper = self.robot.gripper_status(include_params=True, include_states=True)
+            if isinstance(robot_status, dict):
+                robot_status["gripper"] = gripper
+            return {
+                "ok": True,
+                "enabled": True,
+                "config": config_to_json(self.config),
+                "robotConnected": bool(isinstance(robot_status, dict) and robot_status.get("connected")),
+                "robot": robot_status,
+                "gripper": gripper,
+                "devices": robot_status.get("devices") if isinstance(robot_status, dict) else None,
+            }
+
+    def move_gripper(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.lock:
+            action = str(payload.get("action") or "").strip().lower()
+            if action == "open":
+                width_m = float(payload.get("widthM", self.config.gripper_open_width_m))
+            elif action == "close":
+                width_m = float(payload.get("widthM", self.config.gripper_close_width_m))
+            elif is_number(payload.get("widthM")):
+                width_m = float(payload["widthM"])
+                action = "move"
+            else:
+                raise ValueError("gripper move requires action=open|close or numeric widthM")
+            speed_mps = float(payload.get("speedMps", self.config.gripper_speed_mps))
+            force_n = float(payload.get("forceN", self.config.gripper_force_n))
+            status = self.robot.move_gripper(width_m, speed_mps, force_n)
+            return {
+                "ok": True,
+                "enabled": True,
+                "commandSent": True,
+                "action": action,
+                "device": status.get("device"),
+                "targetWidthM": width_m,
+                "target_width_m": width_m,
+                "speedMps": speed_mps,
+                "forceN": force_n,
+                "status": status,
+                "config": config_to_json(self.config),
             }
 
     def _stream_config_snapshot(self) -> FlexivRealSenseConfig:
@@ -3095,6 +3807,8 @@ class FlexivRealSenseManager:
                 self.config.record_depth = bool(payload["recordDepth"])
             if "recordDepthEveryNFrames" in payload and is_number(payload["recordDepthEveryNFrames"]):
                 self.config.record_depth_every_n_frames = max(1, int(payload["recordDepthEveryNFrames"]))
+            if "recordDepthFormat" in payload:
+                self.config.record_depth_format = normalize_depth_format(payload.get("recordDepthFormat"))
             if "captureIntervalSeconds" in payload and is_number(payload["captureIntervalSeconds"]):
                 self.config.capture_interval_seconds = float(payload["captureIntervalSeconds"])
             if "realsenseAutoExposure" in payload:
@@ -3123,11 +3837,16 @@ class FlexivRealSenseManager:
             if "controllerMotionEnabled" in payload:
                 self.config.controller_motion_enabled = bool(payload["controllerMotionEnabled"])
             if "controllerTranslationScale" in payload and is_number(payload["controllerTranslationScale"]):
-                self.config.controller_translation_scale = float(payload["controllerTranslationScale"])
+                self.config.controller_translation_scale = max(
+                    CONTROLLER_TRANSLATION_SCALE_MIN,
+                    min(CONTROLLER_TRANSLATION_SCALE_MAX, float(payload["controllerTranslationScale"])),
+                )
             if "controllerMaxStepM" in payload and is_number(payload["controllerMaxStepM"]):
                 self.config.controller_max_step_m = float(payload["controllerMaxStepM"])
             if "controllerMaxRotationStepDeg" in payload and is_number(payload["controllerMaxRotationStepDeg"]):
                 self.config.controller_max_rotation_step_deg = float(payload["controllerMaxRotationStepDeg"])
+            if "controllerTargetUpdateHz" in payload and is_number(payload["controllerTargetUpdateHz"]):
+                self.config.controller_target_update_hz = max(1.0, float(payload["controllerTargetUpdateHz"]))
             if "controllerJointLimitBufferRad" in payload and is_number(payload["controllerJointLimitBufferRad"]):
                 self.config.controller_joint_limit_buffer_rad = max(0.0, float(payload["controllerJointLimitBufferRad"]))
             if "controllerJointLimitGuardEnabled" in payload:
@@ -3160,15 +3879,31 @@ class FlexivRealSenseManager:
                 self.config.flexiv_network_interfaces,
                 wait_seconds=float(payload.get("waitSeconds") or 0.2),
             )
+            gripper_warmup = None
+            if self.config.gripper_enabled:
+                gripper_warmup = self.robot.enable_gripper(
+                    self.config.gripper_device,
+                    init_on_enable=self.config.gripper_init_on_enable,
+                )
+            motion_warmup = self.robot.arm_motion()
+            self.config.controller_motion_enabled = True
             warmup = self.warm_realsense_stream(REALSENSE_CONNECT_WARMUP_SECONDS)
             self.last_error = None
-            return {"ok": True, "state": state, "realsenseWarmup": warmup, "status": self.status()}
+            return {
+                "ok": True,
+                "state": state,
+                "gripperWarmup": gripper_warmup,
+                "motionWarmup": motion_warmup,
+                "realsenseWarmup": warmup,
+                "status": self.status(),
+            }
         except Exception as exc:  # pragma: no cover - hardware path
             self.last_error = str(exc)
             return {"ok": False, "error": self.last_error, "status": self.status()}
 
     def disconnect_robot(self) -> dict[str, Any]:
         self.robot.disconnect()
+        self.config.controller_motion_enabled = False
         return self.status()
 
     def arm_motion(self) -> dict[str, Any]:
@@ -3400,6 +4135,7 @@ class FlexivRealSenseManager:
                     stage = "freedrive_enabled"
                 elif control_mode == ROBOT_SESSION_CONTROL_TELEOP:
                     self.robot.disable_freedrive()
+                    self.robot.arm_motion()
                     self.config.controller_motion_enabled = True
                     stage = "teleop_ready"
                 else:
@@ -3463,9 +4199,19 @@ class FlexivRealSenseManager:
         summary = session.close()
         if getattr(session, "control_mode", ROBOT_SESSION_CONTROL_TELEOP) == ROBOT_SESSION_CONTROL_FREEDRIVE:
             self.robot.disable_freedrive()
+            try:
+                self.robot.arm_motion()
+                self.config.controller_motion_enabled = True
+            except Exception as exc:  # pragma: no cover - hardware path
+                self.last_error = str(exc)
+                self.config.controller_motion_enabled = False
         else:
-            self.robot.disarm_motion()
-        self.config.controller_motion_enabled = False
+            try:
+                self.robot.arm_motion()
+                self.config.controller_motion_enabled = True
+            except Exception as exc:  # pragma: no cover - hardware path
+                self.last_error = str(exc)
+                self.config.controller_motion_enabled = False
         with self.lock:
             if self.active_session is session:
                 self.active_session = None
@@ -3623,6 +4369,20 @@ def safe_filename(value: str) -> str:
             cleaned.append("_")
     name = "".join(cleaned).strip("_")
     return name or "camera"
+
+
+def normalize_depth_format(value: Any) -> str:
+    text = str(value or DEFAULT_RECORD_DEPTH_FORMAT).strip().lower()
+    aliases = {
+        "ffv1_mkv": "ffv1",
+        "mkv": "ffv1",
+        "lossless": "ffv1",
+        "bin": "raw",
+        "u16le": "raw",
+        "raw_u16le": "raw",
+    }
+    text = aliases.get(text, text)
+    return text if text in RECORD_DEPTH_FORMATS else DEFAULT_RECORD_DEPTH_FORMAT
 
 
 def async_camera_queue_size(fps: Any) -> int:
@@ -4780,6 +5540,25 @@ def rotation_angle_deg(rotation: np.ndarray) -> float:
     return float(math.degrees(math.acos(cosine)))
 
 
+def cartesian_target_near(
+    lhs: list[float],
+    rhs: list[float],
+    position_eps_m: float,
+    rotation_eps_deg: float,
+) -> bool:
+    if len(lhs) < 7 or len(rhs) < 7:
+        return False
+    try:
+        delta_position = np.asarray(lhs[:3], dtype=float) - np.asarray(rhs[:3], dtype=float)
+        if float(np.linalg.norm(delta_position)) > float(position_eps_m):
+            return False
+        lhs_rotation = quaternion_wxyz_to_matrix(lhs[3:7])
+        rhs_rotation = quaternion_wxyz_to_matrix(rhs[3:7])
+        return rotation_angle_deg(lhs_rotation @ rhs_rotation.T) <= float(rotation_eps_deg)
+    except Exception:
+        return False
+
+
 def clamp_rotation_angle(rotation: np.ndarray, max_angle_deg: float) -> np.ndarray:
     if max_angle_deg <= 0:
         return np.eye(3, dtype=float)
@@ -5171,11 +5950,13 @@ def config_from_json(payload: Any, fallback: FlexivRealSenseConfig | None = None
         ("poseField", "robot_pose_field"),
         ("cameraSerial", "camera_serial"),
         ("thirdCameraSerial", "third_camera_serial"),
+        ("recordDepthFormat", "record_depth_format"),
         ("gripperDevice", "gripper_device"),
     )
     for key, attr in string_fields:
         if key in payload and payload[key] is not None:
             setattr(config, attr, str(payload[key]).strip())
+    config.record_depth_format = normalize_depth_format(config.record_depth_format)
 
     if "flexivRdk" in payload:
         config.flexiv_rdk = Path(payload["flexivRdk"]) if payload["flexivRdk"] else None
@@ -5208,6 +5989,7 @@ def config_from_json(payload: Any, fallback: FlexivRealSenseConfig | None = None
         ("controllerTranslationScale", "controller_translation_scale"),
         ("controllerMaxStepM", "controller_max_step_m"),
         ("controllerMaxRotationStepDeg", "controller_max_rotation_step_deg"),
+        ("controllerTargetUpdateHz", "controller_target_update_hz"),
         ("controllerJointLimitBufferRad", "controller_joint_limit_buffer_rad"),
         ("gripperOpenWidthM", "gripper_open_width_m"),
         ("gripperCloseWidthM", "gripper_close_width_m"),
@@ -5267,6 +6049,7 @@ def config_to_json(config: FlexivRealSenseConfig) -> dict[str, Any]:
         "recordDepth": config.record_depth,
         "recordDepthAlignToColor": config.record_depth_align_to_color,
         "recordDepthEveryNFrames": config.record_depth_every_n_frames,
+        "recordDepthFormat": normalize_depth_format(config.record_depth_format),
         "warmupFrames": config.warmup_frames,
         "realsenseAutoExposure": config.realsense_auto_exposure,
         "realsenseExposure": config.realsense_exposure,
@@ -5290,6 +6073,7 @@ def config_to_json(config: FlexivRealSenseConfig) -> dict[str, Any]:
         "controllerMaxStepM": config.controller_max_step_m,
         "controllerMaxRotationDeg": None,
         "controllerMaxRotationStepDeg": config.controller_max_rotation_step_deg,
+        "controllerTargetUpdateHz": config.controller_target_update_hz,
         "controllerJointLimitBufferRad": config.controller_joint_limit_buffer_rad,
         "controllerJointLimitGuardEnabled": config.controller_joint_limit_guard_enabled,
         "gripperEnabled": config.gripper_enabled,
