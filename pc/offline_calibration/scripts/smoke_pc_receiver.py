@@ -94,8 +94,17 @@ def main() -> int:
         assert len(raw) == summary["rawMessagesWritten"], (len(raw), summary)
         assert len(raw) >= 2, (len(raw), summary)
         assert summary["rawSampleSkips"] > 0, summary
+        assert "writerDroppedSampleMessages" in summary, summary
+        assert "writerDroppedControlMessages" in summary, summary
+        assert "writerEnqueueBackpressureEvents" in summary, summary
         assert cache.get("ok") is True, cache
+        assert cache.get("cacheVersion") == 5, cache
         assert cache.get("payloadMode") == "visualization_cache", cache
+        decimation = cache.get("visualizationDecimation")
+        assert isinstance(decimation, dict), cache
+        assert decimation.get("originalSamples") == args.samples, decimation
+        assert decimation.get("visualizedSamples") == args.samples, decimation
+        assert int(decimation.get("maxSamples") or 0) >= args.samples, decimation
         print(
             json.dumps(
                 {
@@ -106,6 +115,7 @@ def main() -> int:
                     "samples": summary["samples"],
                     "rawRows": len(raw),
                     "rawSampleSkips": summary["rawSampleSkips"],
+                    "visualizedSamples": decimation.get("visualizedSamples"),
                     "cachePath": str(cache_path),
                     "kept": bool(args.keep),
                 },

@@ -1759,8 +1759,6 @@ class ColorStreamWriter:
             str(self.crf),
             "-pix_fmt",
             "yuv420p",
-            "-movflags",
-            "+faststart",
             str(self.path),
         ]
         self.stderr_path = self.path.with_name(self.path.name + ".ffmpeg.log")

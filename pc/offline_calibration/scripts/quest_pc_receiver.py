@@ -138,7 +138,9 @@ SESSION_CONTROL_THREAD_JOIN_SECONDS = 1.0
 SESSION_WRITER_THREAD_JOIN_SECONDS = 10.0
 SESSION_CLOSE_THREAD_JOIN_SECONDS = 0.05
 REPLAY_VISUALIZATION_CACHE = "replay_visualization.json"
-REPLAY_VISUALIZATION_CACHE_VERSION = 4
+REPLAY_VISUALIZATION_CACHE_VERSION = 5
+REPLAY_VISUALIZATION_MAX_SAMPLES = 12000
+REPLAY_VISUALIZATION_MAX_ROBOT_STATES = 12000
 
 
 def main() -> int:
@@ -773,8 +775,11 @@ class SessionWriter:
         self.write_queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=SESSION_WRITE_QUEUE_MAX)
         self.writer_error: str | None = None
         self.writer_dropped_messages = 0
+        self.writer_dropped_sample_messages = 0
+        self.writer_dropped_control_messages = 0
         self.writer_dropped_on_enqueue = 0
         self.writer_dropped_on_close = 0
+        self.writer_enqueue_backpressure_events = 0
         self.robot_record_sample_calls = 0
         self.robot_record_sample_skips = 0
         self.next_robot_record_perf = 0.0
@@ -850,30 +855,66 @@ class SessionWriter:
         except queue.Full:
             pass
 
-        if self._drop_one_queued_write(reason="enqueue"):
+        self.writer_enqueue_backpressure_events += 1
+        if self._drop_one_queued_write(reason="enqueue", require_droppable=True):
             try:
                 self.write_queue.put_nowait(wrapper)
                 return
             except queue.Full:
                 pass
 
-        self.writer_dropped_messages += 1
-        self.writer_dropped_on_enqueue += 1
+        if not self._queued_write_is_droppable(wrapper):
+            try:
+                self.write_queue.put(wrapper, timeout=0.05)
+                return
+            except queue.Full:
+                pass
+            if self._drop_one_queued_write(reason="enqueue", require_droppable=False):
+                try:
+                    self.write_queue.put_nowait(wrapper)
+                    return
+                except queue.Full:
+                    pass
 
-    def _drop_one_queued_write(self, reason: str) -> bool:
-        try:
-            dropped = self.write_queue.get_nowait()
-        except queue.Empty:
+        self._note_dropped_write(wrapper, "enqueue")
+
+    @staticmethod
+    def _queued_write_is_droppable(wrapper: dict[str, Any] | None) -> bool:
+        if not isinstance(wrapper, dict):
             return False
-        try:
-            if dropped is not None:
-                self.writer_dropped_messages += 1
-                if reason == "close":
-                    self.writer_dropped_on_close += 1
-                else:
-                    self.writer_dropped_on_enqueue += 1
-        finally:
-            self.write_queue.task_done()
+        message = wrapper.get("message")
+        return isinstance(message, dict) and message.get("type") == "sample"
+
+    def _note_dropped_write(self, wrapper: dict[str, Any] | None, reason: str) -> None:
+        self.writer_dropped_messages += 1
+        if reason == "close":
+            self.writer_dropped_on_close += 1
+        else:
+            self.writer_dropped_on_enqueue += 1
+        if self._queued_write_is_droppable(wrapper):
+            self.writer_dropped_sample_messages += 1
+        else:
+            self.writer_dropped_control_messages += 1
+
+    def _drop_one_queued_write(self, reason: str, *, require_droppable: bool) -> bool:
+        dropped: dict[str, Any] | None = None
+        with self.write_queue.mutex:
+            for index, item in enumerate(self.write_queue.queue):
+                if item is None:
+                    continue
+                if require_droppable and not self._queued_write_is_droppable(item):
+                    continue
+                dropped = item
+                del self.write_queue.queue[index]
+                if self.write_queue.unfinished_tasks > 0:
+                    self.write_queue.unfinished_tasks -= 1
+                    if self.write_queue.unfinished_tasks == 0:
+                        self.write_queue.all_tasks_done.notify_all()
+                self.write_queue.not_full.notify()
+                break
+        if dropped is None:
+            return False
+        self._note_dropped_write(dropped, reason)
         return True
 
     def _wait_for_writer_queue(self, timeout_seconds: float) -> int:
@@ -888,7 +929,7 @@ class SessionWriter:
 
     def _drain_writer_queue_for_close(self) -> int:
         dropped = 0
-        while self._drop_one_queued_write(reason="close"):
+        while self._drop_one_queued_write(reason="close", require_droppable=False):
             dropped += 1
         return dropped
 
@@ -898,7 +939,7 @@ class SessionWriter:
                 self.write_queue.put_nowait(None)
                 return
             except queue.Full:
-                if not self._drop_one_queued_write(reason="close"):
+                if not self._drop_one_queued_write(reason="close", require_droppable=False):
                     time.sleep(0.001)
 
     def _writer_loop(self) -> None:
@@ -1332,8 +1373,11 @@ class SessionWriter:
             "writerQueueMax": SESSION_WRITE_QUEUE_MAX,
             "writerQueueBacklog": self.write_queue.qsize(),
             "writerDroppedMessages": self.writer_dropped_messages,
+            "writerDroppedSampleMessages": self.writer_dropped_sample_messages,
+            "writerDroppedControlMessages": self.writer_dropped_control_messages,
             "writerDroppedOnEnqueue": self.writer_dropped_on_enqueue,
             "writerDroppedOnClose": self.writer_dropped_on_close,
+            "writerEnqueueBackpressureEvents": self.writer_enqueue_backpressure_events,
             "robotRecordSampleCalls": self.robot_record_sample_calls,
             "robotRecordSampleSkips": self.robot_record_sample_skips,
             "writerError": self.writer_error,
@@ -5024,12 +5068,20 @@ def build_and_write_replay_visualization_cache(
 def compact_recording_replay_payload(payload: dict[str, Any]) -> dict[str, Any]:
     result = dict(payload)
     result["summary"] = compact_replay_summary(result.get("summary"))
+    decimation: dict[str, Any] = {
+        "maxSamples": REPLAY_VISUALIZATION_MAX_SAMPLES,
+        "maxRobotStates": REPLAY_VISUALIZATION_MAX_ROBOT_STATES,
+    }
     samples = result.get("samples")
     if isinstance(samples, list):
-        result["samples"] = [compact_replay_sample(row) for row in samples if isinstance(row, dict)]
+        compact_samples = [compact_replay_sample(row) for row in samples if isinstance(row, dict)]
+        result["samples"] = evenly_downsample_rows(compact_samples, REPLAY_VISUALIZATION_MAX_SAMPLES)
+        decimation["originalSamples"] = len(compact_samples)
+        decimation["visualizedSamples"] = len(result["samples"])
     robot_realsense = result.get("robotRealSense")
     if isinstance(robot_realsense, dict):
-        result["robotRealSense"] = compact_robot_replay(robot_realsense)
+        result["robotRealSense"] = compact_robot_replay(robot_realsense, decimation)
+    result["visualizationDecimation"] = decimation
     result["payloadMode"] = "visualization_cache"
     return result
 
@@ -5057,14 +5109,33 @@ def compact_replay_summary(summary: Any) -> dict[str, Any]:
     return {key: summary.get(key) for key in keep if key in summary}
 
 
-def compact_robot_replay(robot_realsense: dict[str, Any]) -> dict[str, Any]:
+def evenly_downsample_rows(rows: list[dict[str, Any]], max_rows: int) -> list[dict[str, Any]]:
+    limit = max(2, int(max_rows))
+    count = len(rows)
+    if count <= limit:
+        return rows
+    last = count - 1
+    return [rows[int(round(index * last / (limit - 1)))] for index in range(limit)]
+
+
+def compact_robot_replay(robot_realsense: dict[str, Any], decimation: dict[str, Any] | None = None) -> dict[str, Any]:
     result = dict(robot_realsense)
     sample_rows = [row for row in robot_realsense.get("samples", []) if isinstance(row, dict)]
     state_rows = [row for row in robot_realsense.get("robotStates", []) if isinstance(row, dict)]
-    result["samples"] = [compact_robot_media_row(row) for row in sample_rows]
-    result["robotStates"] = [compact_robot_pose_row(row) for row in state_rows]
+    compact_samples = [compact_robot_media_row(row) for row in sample_rows]
+    result["samples"] = evenly_downsample_rows(compact_samples, REPLAY_VISUALIZATION_MAX_SAMPLES)
+    compact_states = [compact_robot_pose_row(row) for row in state_rows]
+    result["robotStates"] = evenly_downsample_rows(compact_states, REPLAY_VISUALIZATION_MAX_ROBOT_STATES)
     if not result["robotStates"]:
-        result["robotStates"] = [compact_robot_pose_row(row) for row in sample_rows]
+        result["robotStates"] = evenly_downsample_rows(
+            [compact_robot_pose_row(row) for row in sample_rows],
+            REPLAY_VISUALIZATION_MAX_ROBOT_STATES,
+        )
+    if decimation is not None:
+        decimation["originalRobotSamples"] = len(sample_rows)
+        decimation["visualizedRobotSamples"] = len(result["samples"])
+        decimation["originalRobotStates"] = len(compact_states)
+        decimation["visualizedRobotStates"] = len(result["robotStates"])
     return result
 
 
