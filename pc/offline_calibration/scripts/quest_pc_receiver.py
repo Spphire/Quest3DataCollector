@@ -8719,8 +8719,27 @@ const state = {
   questAdb: null,
   preflight: null,
   captureState: {phase: 'live', detail: 'not recording'},
-  lastPreflightRefreshMs: 0
+  lastPreflightRefreshMs: 0,
+  sampleTotal: 0,
+  lastSampleDomMs: 0,
+  renderDirty: true,
+  lastDrawMs: 0,
+  viewRect: null
 };
+
+const LIVE_RENDER_INTERVAL_MS = 33;
+
+function markRenderDirty() {
+  state.renderDirty = true;
+}
+
+function updateLiveMetrics(force = false) {
+  const now = performance.now();
+  if (!force && state.lastSampleDomMs && now - state.lastSampleDomMs < 100) return;
+  state.lastSampleDomMs = now;
+  mSamples.textContent = String(state.sampleTotal);
+  mCounts.textContent = `head ${state.counts.head}, left ${state.counts.left}, right ${state.counts.right}`;
+}
 
 function resize() {
   const dpr = window.devicePixelRatio || 1;
@@ -8743,6 +8762,7 @@ function requestViewFit() {
   state.viewFitTimer = window.setTimeout(() => {
     state.viewFitTimer = null;
     resetView();
+    markRenderDirty();
   }, 80);
 }
 
@@ -9333,6 +9353,7 @@ function updateRobotSample(event) {
   state.robotSample = event;
   if (!hadDrawableRobot && hasDrawableRobot()) requestViewFit();
   renderRobotStatus(state.robot);
+  markRenderDirty();
 }
 
 function updateRobotMotion(event) {
@@ -9353,6 +9374,7 @@ function updateRobotCalibration(event) {
   if (event.T_world_base?.matrix_4x4) state.robotWorldBase = event.T_world_base.matrix_4x4;
   if (changed && hasDrawableRobot()) requestViewFit();
   renderRobotStatus(state.robot);
+  markRenderDirty();
 }
 
 function applyRobotCalibrationCleared(event) {
@@ -9360,6 +9382,7 @@ function applyRobotCalibrationCleared(event) {
   state.robotCalibrationKey = null;
   state.robotWorldBase = null;
   renderRobotStatus(state.robot);
+  markRenderDirty();
 }
 
 function robotCalibrationKey(event) {
@@ -9407,6 +9430,7 @@ function applyRobotStatus(payload) {
   syncRobotLiveLoop();
   renderRobotStatus(payload);
   if (!hadDrawableRobot && hasDrawableRobot()) requestViewFit();
+  markRenderDirty();
   syncRobotStatusLoop();
 }
 
@@ -9727,16 +9751,17 @@ function ingest(sample) {
   if (state.frames.length > state.maxFrames) {
     state.frames.splice(0, state.frames.length - state.maxFrames);
   }
+  state.sampleTotal++;
   if (sample.head?.ok) state.counts.head++;
   if (sample.left?.ok) state.counts.left++;
   if (sample.right?.ok) state.counts.right++;
-  mSamples.textContent = String(Number(mSamples.textContent || '0') + 1);
-  mCounts.textContent = `head ${state.counts.head}, left ${state.counts.left}, right ${state.counts.right}`;
+  updateLiveMetrics();
   maybeRefreshPreflight();
   if (followHead && followHead.checked) {
     const p = relPose(sample.head);
     if (p) state.target = p;
   }
+  markRenderDirty();
 }
 
 function maybeRefreshPreflight() {
@@ -9889,6 +9914,7 @@ function updateCalibrationResult(event) {
     state.distance = Math.max(0.55, bounds.radius * 2.4);
   }
   renderCalibrationResult(event);
+  markRenderDirty();
 }
 
 function updateCalibrationFailure(event) {
@@ -9912,6 +9938,7 @@ function applyCalibrationCleared(event) {
   calibrationDetails.innerHTML = '<div class="calibration-alert">Calibration cleared. Using default board at origin.</div>';
   requestViewFit();
   loadPreflightStatus();
+  markRenderDirty();
 }
 
 async function clearCalibrationClick() {
@@ -10062,8 +10089,14 @@ function escapeHtml(value) {
     .replaceAll("'", '&#39;');
 }
 
-function draw() {
+function draw(now = performance.now()) {
+  requestAnimationFrame(draw);
+  if (!state.renderDirty) return;
+  if (now - state.lastDrawMs < LIVE_RENDER_INTERVAL_MS) return;
+  state.renderDirty = false;
+  state.lastDrawMs = now;
   const rect = canvas.getBoundingClientRect();
+  state.viewRect = rect;
   ctx.clearRect(0, 0, rect.width, rect.height);
   ctx.fillStyle = '#080a0c';
   ctx.fillRect(0, 0, rect.width, rect.height);
@@ -10086,7 +10119,6 @@ function draw() {
   } else {
     statusEl.textContent = 'Waiting for UDP telemetry...';
   }
-  requestAnimationFrame(draw);
 }
 
 function drawRobotLive() {
@@ -10183,6 +10215,7 @@ function preloadRobotMeshes(model) {
         .then(response => response.ok ? response.text() : '')
         .then(text => {
           if (text) state.robotMeshes[mesh.assetPath] = parseObjMesh(text);
+          if (text) markRenderDirty();
         })
         .catch(() => {})
         .finally(() => { delete state.robotMeshPending[mesh.assetPath]; });
@@ -10476,7 +10509,7 @@ function drawLine(a, b, color, width) {
 }
 
 function project(p) {
-  const rect = canvas.getBoundingClientRect();
+  const rect = state.viewRect || canvas.getBoundingClientRect();
   const x = p[0] - state.target[0];
   const y = p[1] - state.target[1];
   const z = p[2] - state.target[2];
@@ -10641,16 +10674,22 @@ canvas.addEventListener('pointermove', (event) => {
   state.lastPointer = [event.clientX, event.clientY];
   state.yaw += dx * 0.006;
   state.pitch = Math.max(-1.45, Math.min(1.45, state.pitch + dy * 0.006));
+  markRenderDirty();
 });
 canvas.addEventListener('pointerup', () => { state.dragging = false; });
 canvas.addEventListener('pointercancel', () => { state.dragging = false; });
 canvas.addEventListener('wheel', (event) => {
   event.preventDefault();
   state.distance = Math.max(0.06, state.distance * Math.exp(event.deltaY * 0.001));
+  markRenderDirty();
 }, {passive: false});
-resetButton.addEventListener('click', resetView);
+resetButton.addEventListener('click', () => {
+  resetView();
+  markRenderDirty();
+});
 clearButton.addEventListener('click', () => {
   state.frames = state.frames.slice(-1);
+  markRenderDirty();
 });
 robotRefresh.addEventListener('click', refreshCameras);
 robotStreamStart.addEventListener('click', startRobotStream);
@@ -10672,7 +10711,13 @@ for (const input of [robotCamera, robotThirdCamera, robotSn, robotPoseField, rob
 document.getElementById('records').addEventListener('click', () => {
   window.location.href = '/recordings';
 });
-window.addEventListener('resize', resize);
+for (const input of [showTrail, showGrid, showGaze, followHead]) {
+  input.addEventListener('change', markRenderDirty);
+}
+window.addEventListener('resize', () => {
+  resize();
+  markRenderDirty();
+});
 
 function initSidebarResize(storageKey, minWidth, maxWidth, defaultWidth) {
   const saved = Number(localStorage.getItem(storageKey));
@@ -10691,6 +10736,7 @@ function initSidebarResize(storageKey, minWidth, maxWidth, defaultWidth) {
     const width = window.innerWidth - event.clientX - 4;
     setSidebarWidth(width, minWidth, maxWidth, storageKey);
     resize();
+    markRenderDirty();
   });
   const stop = event => {
     if (!active) return;
@@ -10700,6 +10746,7 @@ function initSidebarResize(storageKey, minWidth, maxWidth, defaultWidth) {
     document.body.style.cursor = '';
     document.body.style.userSelect = '';
     resize();
+    markRenderDirty();
   };
   sidebarResizer.addEventListener('pointerup', stop);
   sidebarResizer.addEventListener('pointercancel', stop);
@@ -10981,10 +11028,16 @@ const state = {
   records: [],
   selected: null,
   selectedSource: null,
+  loadSeq: 0,
   data: null,
   playing: false,
   t: 0,
   idx: 0,
+  lastRenderedIdx: -1,
+  lastLabelIdx: -1,
+  renderDirty: true,
+  lastRenderMs: 0,
+  viewRect: null,
   yaw: -0.82,
   pitch: -0.34,
   distance: 1.45,
@@ -10995,8 +11048,18 @@ const state = {
   robotMeshes: {},
   robotMeshPending: {},
   cameraStripKey: '',
-  trails: {head: [], left: [], right: [], gaze: [], gazeFiltered: [], gazeBoardPlane: [], hit: [], robot: []}
+  trails: {head: [], left: [], right: [], gaze: [], gazeFiltered: [], gazeBoardPlane: [], hit: [], robot: []},
+  robotPoseTimedRows: [],
+  robotMediaTimedRows: [],
+  gripperTimedRows: []
 };
+
+const REPLAY_RENDER_INTERVAL_MS = 33;
+const REPLAY_MAX_TRAIL_POINTS = 2400;
+
+function markReplayDirty() {
+  state.renderDirty = true;
+}
 
 function resize() {
   const dpr = window.devicePixelRatio || 1;
@@ -11027,7 +11090,7 @@ async function loadRobotModel() {
     state.robotModel = null;
   }
   updateRobotInfo();
-  render();
+  markReplayDirty();
 }
 
 function renderRecordList() {
@@ -11118,6 +11181,7 @@ function calibrationRecordSummaryText(record) {
 }
 
 async function loadRecord(recordId, source = null) {
+  const loadSeq = ++state.loadSeq;
   state.selected = recordId;
   state.selectedSource = source;
   renderRecordList();
@@ -11128,20 +11192,26 @@ async function loadRecord(recordId, source = null) {
   const params = new URLSearchParams({recordId});
   if (source) params.set('source', source);
   const response = await fetch('/recordings/replay?' + params.toString(), {cache: 'no-store'});
+  if (loadSeq !== state.loadSeq) return;
   if (!response.ok) {
     recordSub.textContent = 'failed to load';
     return;
   }
-  state.data = await response.json();
+  const payload = await response.json();
+  if (loadSeq !== state.loadSeq) return;
+  state.data = payload;
   state.idx = 0;
   state.t = state.data.samples?.[0]?.recordingTimestampSeconds || 0;
+  state.lastRenderedIdx = -1;
+  state.lastLabelIdx = -1;
   state.cameraStripKey = '';
   buildTrails();
+  prepareReplayIndexes();
   updateScrub();
   updateSnapshotInfo();
   resetView();
   updateLabels();
-  render();
+  markReplayDirty();
 }
 
 function buildTrails() {
@@ -11159,6 +11229,38 @@ function buildTrails() {
     const p = matrixTranslation(row.T_display_ee?.matrix_4x4);
     if (p) state.trails.robot.push(p);
   }
+}
+
+function prepareReplayIndexes() {
+  state.robotPoseTimedRows = timedRows(robotPoseRows());
+  state.robotMediaTimedRows = timedRows(robotMediaRows());
+  const gripperRows = state.data?.robotRealSense?.gripper || [];
+  state.gripperTimedRows = timedRows(Array.isArray(gripperRows) ? gripperRows : []);
+}
+
+function timedRows(rows) {
+  return (Array.isArray(rows) ? rows : [])
+    .map(row => ({row, t: Number(row?.recordingTimestampSeconds)}))
+    .filter(item => Number.isFinite(item.t))
+    .sort((a, b) => a.t - b.t);
+}
+
+function nearestTimedRow(timedRows, fallbackRows, t) {
+  if (!Array.isArray(timedRows) || !timedRows.length) {
+    return Array.isArray(fallbackRows) && fallbackRows.length ? fallbackRows[0] : null;
+  }
+  if (!Number.isFinite(t)) return timedRows[0].row;
+  let lo = 0, hi = timedRows.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (timedRows[mid].t < t) lo = mid + 1;
+    else hi = mid;
+  }
+  const right = timedRows[lo];
+  const left = timedRows[Math.max(0, lo - 1)];
+  return Math.abs((left?.t ?? Infinity) - t) <= Math.abs((right?.t ?? Infinity) - t)
+    ? left.row
+    : right.row;
 }
 
 function updateScrub() {
@@ -11405,7 +11507,9 @@ function statText(stats, unit) {
   return `p95 ${p95}${unit}, p99 ${p99}${unit}, max ${max}${unit}`;
 }
 
-function updateLabels() {
+function updateLabels(force = false) {
+  if (!force && state.lastLabelIdx === state.idx) return;
+  state.lastLabelIdx = state.idx;
   const s = currentSample();
   if (!s) {
     timeLabel.textContent = '0.000s';
@@ -11496,18 +11600,7 @@ function robotControllerInputText(controller) {
 
 function nearestGripperEvent(t) {
   const rows = state.data?.robotRealSense?.gripper || [];
-  if (!rows.length || !Number.isFinite(t)) return rows[rows.length - 1] || null;
-  let best = null, bestDt = Infinity;
-  for (const row of rows) {
-    const rt = Number(row.recordingTimestampSeconds);
-    if (!Number.isFinite(rt)) continue;
-    const dt = Math.abs(rt - t);
-    if (dt < bestDt) {
-      best = row;
-      bestDt = dt;
-    }
-  }
-  return best;
+  return nearestTimedRow(state.gripperTimedRows, rows, t);
 }
 
 function replayGripperText(row) {
@@ -11571,6 +11664,8 @@ function resetView() {
 
 function render() {
   const rect = canvas.getBoundingClientRect();
+  state.viewRect = rect;
+  state.lastRenderedIdx = state.idx;
   ctx.clearRect(0, 0, rect.width, rect.height);
   ctx.fillStyle = '#080a0c';
   ctx.fillRect(0, 0, rect.width, rect.height);
@@ -11673,10 +11768,17 @@ function drawGazePoints(s) {
 }
 
 function drawTrail(points, color) {
+  if (!Array.isArray(points) || points.length < 2) return;
   let prev = null;
-  for (const p of points) {
+  const stride = Math.max(1, Math.ceil(points.length / REPLAY_MAX_TRAIL_POINTS));
+  for (let i = 0; i < points.length; i += stride) {
+    const p = points[i];
     if (prev) drawLine(prev, p, color, 1.1);
     prev = p;
+  }
+  if (stride > 1 && points.length) {
+    const p = points[points.length - 1];
+    if (prev && p !== prev) drawLine(prev, p, color, 1.1);
   }
 }
 
@@ -11771,6 +11873,7 @@ function preloadRobotMeshes(model) {
         .then(response => response.ok ? response.text() : '')
         .then(text => {
           if (text) state.robotMeshes[mesh.assetPath] = parseObjMesh(text);
+          if (text) markReplayDirty();
         })
         .catch(() => {})
         .finally(() => { delete state.robotMeshPending[mesh.assetPath]; });
@@ -11862,36 +11965,12 @@ function renderMeshPolygons(polygons) {
 
 function nearestRobotSample(t) {
   const rows = robotPoseRows();
-  if (!rows.length) return null;
-  if (!Number.isFinite(t)) return rows[0];
-  let best = rows[0], bestDt = Infinity;
-  for (const row of rows) {
-    const rt = Number(row.recordingTimestampSeconds);
-    if (!Number.isFinite(rt)) continue;
-    const dt = Math.abs(rt - t);
-    if (dt < bestDt) {
-      best = row;
-      bestDt = dt;
-    }
-  }
-  return best;
+  return nearestTimedRow(state.robotPoseTimedRows, rows, t);
 }
 
 function nearestRobotMediaSample(t) {
   const rows = robotMediaRows();
-  if (!rows.length) return null;
-  if (!Number.isFinite(t)) return rows[0];
-  let best = rows[0], bestDt = Infinity;
-  for (const row of rows) {
-    const rt = Number(row.recordingTimestampSeconds);
-    if (!Number.isFinite(rt)) continue;
-    const dt = Math.abs(rt - t);
-    if (dt < bestDt) {
-      best = row;
-      bestDt = dt;
-    }
-  }
-  return best;
+  return nearestTimedRow(state.robotMediaTimedRows, rows, t);
 }
 
 function drawPoint(p, color, radius, label) {
@@ -11924,7 +12003,7 @@ function drawLine(a, b, color, width) {
 }
 
 function project(p) {
-  const rect = canvas.getBoundingClientRect();
+  const rect = state.viewRect || canvas.getBoundingClientRect();
   const x = p[0] - state.target[0], y = p[1] - state.target[1], z = p[2] - state.target[2];
   const cy = Math.cos(state.yaw), sy = Math.sin(state.yaw);
   const cp = Math.cos(state.pitch), sp = Math.sin(state.pitch);
@@ -12083,20 +12162,28 @@ canvas.addEventListener('pointermove', event => {
   state.lastPointer = [event.clientX, event.clientY];
   state.yaw += dx * 0.006;
   state.pitch = Math.max(-1.45, Math.min(1.45, state.pitch + dy * 0.006));
+  markReplayDirty();
 });
 canvas.addEventListener('pointerup', () => { state.dragging = false; });
 canvas.addEventListener('pointercancel', () => { state.dragging = false; });
 canvas.addEventListener('wheel', event => {
   event.preventDefault();
   state.distance = Math.max(0.06, state.distance * Math.exp(event.deltaY * 0.001));
+  markReplayDirty();
 }, {passive: false});
 
 playBtn.onclick = () => {
   state.playing = !state.playing;
   playBtn.textContent = state.playing ? 'Pause' : 'Play';
 };
-resetBtn.onclick = resetView;
-gazeMode.onchange = () => { updateLabels(); render(); };
+resetBtn.onclick = () => {
+  resetView();
+  markReplayDirty();
+};
+gazeMode.onchange = () => {
+  updateLabels(true);
+  markReplayDirty();
+};
 refreshBtn.onclick = loadRecords;
 liveBtn.onclick = () => { window.location.href = '/'; };
 search.oninput = renderRecordList;
@@ -12105,9 +12192,12 @@ scrub.oninput = () => {
   state.idx = Math.max(0, Math.min(samples.length - 1, Number(scrub.value) || 0));
   state.t = samples[state.idx]?.recordingTimestampSeconds || 0;
   updateLabels();
-  render();
+  markReplayDirty();
 };
-window.addEventListener('resize', () => { resize(); render(); });
+window.addEventListener('resize', () => {
+  resize();
+  markReplayDirty();
+});
 
 function initDetailResize(storageKey, minWidth, maxWidth, defaultWidth) {
   const saved = Number(localStorage.getItem(storageKey));
@@ -12126,7 +12216,7 @@ function initDetailResize(storageKey, minWidth, maxWidth, defaultWidth) {
     const width = window.innerWidth - event.clientX - 4;
     setDetailWidth(width, minWidth, maxWidth, storageKey);
     resize();
-    render();
+    markReplayDirty();
   });
   const stop = event => {
     if (!active) return;
@@ -12136,7 +12226,7 @@ function initDetailResize(storageKey, minWidth, maxWidth, defaultWidth) {
     document.body.style.cursor = '';
     document.body.style.userSelect = '';
     resize();
-    render();
+    markReplayDirty();
   };
   detailResizer.addEventListener('pointerup', stop);
   detailResizer.addEventListener('pointercancel', stop);
@@ -12150,11 +12240,21 @@ function setDetailWidth(width, minWidth, maxWidth, storageKey) {
 }
 
 let lastFrame = performance.now();
+function renderIfNeeded(now, force = false) {
+  if (force) state.renderDirty = true;
+  if (!state.renderDirty) return;
+  if (!force && now - state.lastRenderMs < REPLAY_RENDER_INTERVAL_MS) return;
+  state.renderDirty = false;
+  state.lastRenderMs = now;
+  render();
+}
+
 function tick(now) {
   const dt = (now - lastFrame) / 1000;
   lastFrame = now;
   const samples = state.data?.samples || [];
   if (state.playing && samples.length) {
+    const previousIdx = state.idx;
     state.t += dt;
     const end = samples[samples.length - 1].recordingTimestampSeconds || 0;
     if (state.t > end) {
@@ -12165,10 +12265,13 @@ function tick(now) {
     }
     while (state.idx < samples.length - 1 && samples[state.idx + 1].recordingTimestampSeconds <= state.t) state.idx++;
     while (state.idx > 0 && samples[state.idx].recordingTimestampSeconds > state.t) state.idx--;
-    scrub.value = state.idx;
-    updateLabels();
+    if (state.idx !== previousIdx) {
+      scrub.value = state.idx;
+      updateLabels();
+      markReplayDirty();
+    }
   }
-  render();
+  renderIfNeeded(now);
   requestAnimationFrame(tick);
 }
 
