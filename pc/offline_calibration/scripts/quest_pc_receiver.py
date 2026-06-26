@@ -2327,10 +2327,12 @@ class PcCalibrationSession:
             if self.closed:
                 return self.summary("already_closed")
             self.closed = True
-            for writer in self.video_writers.values():
+            video_close_errors: list[dict[str, str]] = []
+            for side, writer in list(self.video_writers.items()):
                 try:
                     writer.close()
                 except Exception as exc:
+                    video_close_errors.append({"side": str(side), "error": str(exc)})
                     print(f"[calibration] video writer close failed: {exc}", file=sys.stderr)
             self.video_writers.clear()
             self.left_frames_file.close()
@@ -2348,7 +2350,10 @@ class PcCalibrationSession:
             self.metadata["legacyFlipVerticalParams"] = sorted(self.legacy_flip_vertical_params)
             self.metadata["appliedVerticalFlips"] = sorted(self.applied_vertical_flips)
             self.metadata["pcReceiverFlipPolicies"] = sorted(self.pc_receiver_flip_policies)
-            self.metadata["recordingQualitySummary"] = self._quality_summary()
+            self.metadata["videoCloseErrors"] = video_close_errors
+            self.metadata["recordingQualitySummary"] = (
+                "video_close_failed" if video_close_errors else self._quality_summary()
+            )
             robot_session = self.robot_session
             self.robot_session = None
             if robot_session is not None:
@@ -2367,12 +2372,25 @@ class PcCalibrationSession:
             summary = self.summary("calibration_stop")
             if robot_summary is not None:
                 summary["robotRealSense"] = robot_summary
+            summary["videoCloseErrors"] = video_close_errors
+            if video_close_errors:
+                summary["ok"] = False
+                summary["recordingQualitySummary"] = "video_close_failed"
             (self.directory / "pc_calibration_session_summary.json").write_text(
                 json.dumps(summary, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-        self.publish_status("recorded", 0.05, "PC calibration recording saved", summary=summary)
-        if self.run_calibration:
+        if video_close_errors:
+            self.publish_status(
+                "failed",
+                1.0,
+                "PC calibration video close failed",
+                summary=summary,
+                videoCloseErrors=video_close_errors,
+            )
+        else:
+            self.publish_status("recorded", 0.05, "PC calibration recording saved", summary=summary)
+        if self.run_calibration and not video_close_errors:
             thread = threading.Thread(target=self._run_calibration_worker, name=f"calibrate-{self.record_id}", daemon=True)
             thread.start()
         return summary

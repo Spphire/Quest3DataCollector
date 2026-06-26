@@ -2480,7 +2480,7 @@ class RobotRealsenseSession:
             try:
                 writer = self.video_writers.pop(role, None)
                 if writer is not None:
-                    writer.close()
+                    self._close_color_video_writer(role, writer)
                 self.video_codecs.pop(role, None)
                 self._close_depth_stream(role)
             finally:
@@ -2493,7 +2493,7 @@ class RobotRealsenseSession:
             for role, writer in list(self.video_writers.items()):
                 if role in alive_camera_roles:
                     continue
-                writer.close()
+                self._close_color_video_writer(role, writer)
                 self.video_writers.pop(role, None)
                 self.video_codecs.pop(role, None)
             for role in list(self.video_role_locks.keys()):
@@ -3067,6 +3067,17 @@ class RobotRealsenseSession:
                 lock = threading.RLock()
                 self.video_role_locks[role_name] = lock
             return lock
+
+    def _close_color_video_writer(self, role: str, writer: ColorStreamWriter | None) -> None:
+        if writer is None:
+            return
+        try:
+            writer.close()
+        except Exception as exc:
+            self._note_close_error("video_stream_close", f"{role}: {exc}")
+        self.video_frame_counts[role] = int(
+            getattr(writer, "frame_count", self.video_frame_counts.get(role, 0)) or 0
+        )
 
     def _close_depth_stream(self, role: str) -> None:
         writer = self.depth_stream_handles.pop(role, None)
@@ -4196,25 +4207,55 @@ class FlexivRealSenseManager:
     def stop_session(self, session: RobotRealsenseSession | None) -> dict[str, Any] | None:
         if session is None:
             return None
-        summary = session.close()
-        if getattr(session, "control_mode", ROBOT_SESSION_CONTROL_TELEOP) == ROBOT_SESSION_CONTROL_FREEDRIVE:
-            self.robot.disable_freedrive()
+        close_errors: list[dict[str, str]] = []
+
+        def note_close_error(stage: str, exc: BaseException) -> None:
+            message = str(exc)
+            close_errors.append({"stage": stage, "error": message})
+            self.last_error = message
+
+        summary: dict[str, Any] | None = None
+        try:
+            summary = session.close()
+        except Exception as exc:  # pragma: no cover - hardware/video close path
+            note_close_error("session_close", exc)
+            try:
+                summary = session.summary("close_failed")
+            except Exception as summary_exc:  # pragma: no cover - defensive fallback
+                note_close_error("session_summary_after_close_failure", summary_exc)
+                summary = {
+                    "ok": False,
+                    "closedReason": "close_failed",
+                    "recordDirectory": str(getattr(session, "directory", "")),
+                }
+        finally:
+            if getattr(session, "control_mode", ROBOT_SESSION_CONTROL_TELEOP) == ROBOT_SESSION_CONTROL_FREEDRIVE:
+                try:
+                    self.robot.disable_freedrive()
+                except Exception as exc:  # pragma: no cover - hardware path
+                    note_close_error("disable_freedrive", exc)
             try:
                 self.robot.arm_motion()
                 self.config.controller_motion_enabled = True
             except Exception as exc:  # pragma: no cover - hardware path
-                self.last_error = str(exc)
+                note_close_error("robot_mode_restore", exc)
                 self.config.controller_motion_enabled = False
-        else:
+            with self.lock:
+                if self.active_session is session:
+                    self.active_session = None
+        if summary is None:
+            summary = {"ok": False, "closedReason": "close_failed"}
+        if close_errors:
+            summary["ok"] = False
+            existing_errors = summary.get("closeErrors")
+            if not isinstance(existing_errors, list):
+                existing_errors = []
+            existing_errors.extend(close_errors)
+            summary["closeErrors"] = existing_errors
             try:
-                self.robot.arm_motion()
-                self.config.controller_motion_enabled = True
-            except Exception as exc:  # pragma: no cover - hardware path
+                write_json(summary, session.summary_path)
+            except Exception as exc:  # pragma: no cover - filesystem path
                 self.last_error = str(exc)
-                self.config.controller_motion_enabled = False
-        with self.lock:
-            if self.active_session is session:
-                self.active_session = None
         return summary
 
     def calibrate_session(
