@@ -1,9 +1,11 @@
 __pycache__/
 *.pyc
+.venv*/
+venv/
+env/
 pc_recordings/
 raw/
 outputs/
 *.log
 *.mp4
 *.jsonl
-
