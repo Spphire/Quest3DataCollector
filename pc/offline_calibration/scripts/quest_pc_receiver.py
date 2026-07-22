@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
@@ -33,6 +34,7 @@ except Exception:
     pass
 
 from flexiv_realsense_bridge import (
+    ASYNC_QUEST_ALIGNED_SAMPLE_HZ,
     DEFAULT_END_CAMERA_SERIAL,
     DEFAULT_FLEXIV_RDK_ROOT,
     DEFAULT_FLEXIV_ROBOT_SN,
@@ -59,6 +61,7 @@ from flexiv_realsense_bridge import (
     DEFAULT_CONTROLLER_TRANSLATION_SCALE,
     ROBOT_SESSION_RECORD_ASYNC,
     ROBOT_SESSION_CONTROL_FREEDRIVE,
+    ROBOT_SESSION_CONTROL_RECORD_ONLY,
     ROBOT_SESSION_CONTROL_TELEOP,
     ColorStreamWriter,
     FlexivRealSenseConfig,
@@ -95,6 +98,13 @@ from quest_coordinate_frames import (
     unity_quaternion_wxyz_to_pc,
     unity_vec3_to_pc,
 )
+from teleop_latency_analysis import (
+    DEFAULT_LATENCY_ANALYSIS_JSON,
+    analyze_session as analyze_teleop_latency_session,
+    load_or_build_latency_analysis,
+    print_latency_summary,
+    write_latency_analysis as write_teleop_latency_analysis,
+)
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
@@ -127,12 +137,13 @@ DEFAULT_RECEIVE_FLUSH_EVERY = 32
 DEFAULT_RECEIVE_FLUSH_INTERVAL_SECONDS = 0.25
 DEFAULT_SAMPLE_LOG_INTERVAL_SECONDS = 1.0
 DEFAULT_UDP_RECEIVE_BUFFER_BYTES = 4 * 1024 * 1024
+GZIP_UDP_DATAGRAM_PREFIX = b"QGZ1"
 DEFAULT_RECORDING_IDLE_TIMEOUT_SECONDS = 2.0
 SESSION_WRITE_QUEUE_MAX = 2048
 SESSION_WRITE_QUEUE_CLOSE_DRAIN_SECONDS = 2.0
-ROBOT_SESSION_ASYNC_SAMPLE_HZ = 5.0
-SESSION_RAW_SAMPLE_HZ = 5.0
-SESSION_CONTROLLER_CSV_HZ = 5.0
+FORMAL_ALIGNED_SAMPLE_HZ = ASYNC_QUEST_ALIGNED_SAMPLE_HZ
+FORMAL_ALIGNED_INITIAL_DELAY_SECONDS = 0.008
+FORMAL_ALIGNED_FRESH_SOURCE_WAIT_SECONDS = 0.015
 LIVE_VISUALIZER_SAMPLE_HZ = 30.0
 SESSION_CONTROL_THREAD_JOIN_SECONDS = 1.0
 SESSION_WRITER_THREAD_JOIN_SECONDS = 10.0
@@ -141,6 +152,43 @@ REPLAY_VISUALIZATION_CACHE = "replay_visualization.json"
 REPLAY_VISUALIZATION_CACHE_VERSION = 5
 REPLAY_VISUALIZATION_MAX_SAMPLES = 12000
 REPLAY_VISUALIZATION_MAX_ROBOT_STATES = 12000
+
+
+def decode_quest_udp_datagram(data: bytes) -> tuple[dict[str, Any], dict[str, Any]]:
+    encoding = "json"
+    json_bytes = data
+    if data.startswith(GZIP_UDP_DATAGRAM_PREFIX):
+        encoding = "gzip-json"
+        json_bytes = gzip.decompress(data[len(GZIP_UDP_DATAGRAM_PREFIX) :])
+    message = json.loads(json_bytes)
+    if not isinstance(message, dict):
+        raise ValueError("expected JSON object")
+    return message, {
+        "encoding": encoding,
+        "wireBytes": len(data),
+        "jsonBytes": len(json_bytes),
+    }
+
+
+def note_quest_udp_wire_datagram(
+    data: bytes,
+    remote_host: str,
+    received_perf_counter: float,
+    recent: dict[tuple[Any, ...], float],
+    *,
+    ttl_seconds: float = 5.0,
+) -> bool:
+    identity = (remote_host, data)
+    previous = recent.get(identity)
+    if previous is not None and received_perf_counter - previous <= ttl_seconds:
+        return True
+    recent[identity] = received_perf_counter
+    if len(recent) > 8192:
+        cutoff = received_perf_counter - ttl_seconds
+        stale = [key for key, seen_perf in recent.items() if seen_perf < cutoff]
+        for key in stale:
+            recent.pop(key, None)
+    return False
 
 
 def main() -> int:
@@ -502,6 +550,15 @@ def main() -> int:
         help=f"Scale from right-controller displacement to robot TCP displacement. Default: {DEFAULT_CONTROLLER_TRANSLATION_SCALE:g}",
     )
     receive_parser.add_argument(
+        "--formal-control-mode",
+        choices=[ROBOT_SESSION_CONTROL_TELEOP, ROBOT_SESSION_CONTROL_RECORD_ONLY],
+        default=ROBOT_SESSION_CONTROL_TELEOP,
+        help=(
+            "Control mode for A-button formal recordings. Use record_only for no-motion performance tests. "
+            f"Default: {ROBOT_SESSION_CONTROL_TELEOP}."
+        ),
+    )
+    receive_parser.add_argument(
         "--controller-motion-max-offset",
         type=float,
         default=None,
@@ -657,26 +714,68 @@ def main() -> int:
     perf_parser.add_argument(
         "--min-robot-target-ratio",
         type=float,
-        default=0.80,
-        help="Minimum robot state effectiveHz / targetHz ratio. Default: 0.80.",
+        default=0.95,
+        help="Minimum robot state effectiveHz / targetHz ratio. Default: 0.95.",
+    )
+    perf_parser.add_argument(
+        "--max-robot-lateness-p95-seconds",
+        type=float,
+        default=0.006,
+        help="Maximum p95 lateness of the fixed 90Hz robot-state sampler. Default: 0.006s.",
+    )
+    perf_parser.add_argument(
+        "--min-aligned-target-ratio",
+        type=float,
+        default=0.95,
+        help="Minimum final aligned-sample effectiveHz / 30Hz ratio. Default: 0.95.",
+    )
+    perf_parser.add_argument(
+        "--max-aligned-lateness-p95-seconds",
+        type=float,
+        default=0.016,
+        help="Maximum p95 lateness of the fixed 30Hz aligned sampler. Default: 0.016s.",
+    )
+    perf_parser.add_argument(
+        "--max-quest-source-age-p95-seconds",
+        type=float,
+        default=0.060,
+        help="Maximum p95 age of the Quest source sample used by a 30Hz aligned row. Default: 0.060s.",
+    )
+    perf_parser.add_argument(
+        "--max-aligned-reused-source-ratio",
+        type=float,
+        default=0.10,
+        help="Maximum fraction of 30Hz aligned rows that reuse the previous Quest source sample. Default: 0.10.",
+    )
+    perf_parser.add_argument(
+        "--max-udp-sequence-loss-ratio",
+        type=float,
+        default=0.001,
+        help="Maximum missing Quest UDP sequence ratio. Default: 0.001 (0.1%).",
+    )
+    perf_parser.add_argument(
+        "--max-udp-datagram-bytes",
+        type=int,
+        default=1472,
+        help="Maximum Quest UDP datagram size used to avoid IPv4 fragmentation on a 1500-byte MTU. Default: 1472.",
     )
     perf_parser.add_argument(
         "--min-camera-target-ratio",
         type=float,
-        default=0.80,
-        help="Minimum camera video effectiveHz / targetHz ratio for each recorded role. Default: 0.80.",
+        default=0.95,
+        help="Minimum camera video effectiveHz / targetHz ratio for each recorded role. Default: 0.95.",
     )
     perf_parser.add_argument(
         "--max-camera-drop-ratio",
         type=float,
-        default=0.05,
-        help="Maximum queue drop ratio for each camera role. Default: 0.05.",
+        default=0.0,
+        help="Maximum queue drop ratio for each camera role. Default: 0 (no drops).",
     )
     perf_parser.add_argument(
         "--max-camera-latency-p95-seconds",
         type=float,
-        default=1.0,
-        help="Maximum p95 capture-to-write latency for each camera role when available. Default: 1.0.",
+        default=0.10,
+        help="Maximum p95 capture-to-write latency for each camera role when available. Default: 0.10s.",
     )
     perf_parser.add_argument(
         "--output-json",
@@ -685,8 +784,195 @@ def main() -> int:
     )
     perf_parser.set_defaults(func=audit_performance)
 
+    latency_parser = subparsers.add_parser(
+        "teleop-latency",
+        help="Estimate controller/command to robot TCP motion latency for a PC record.",
+    )
+    latency_parser.add_argument(
+        "--pc-session",
+        type=Path,
+        help="PC session folder. Defaults to the newest record_* folder under --output-root.",
+    )
+    latency_parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=DEFAULT_OUTPUT_ROOT,
+        help=f"Used only when --pc-session is omitted. Default: {DEFAULT_OUTPUT_ROOT}",
+    )
+    latency_parser.add_argument(
+        "--output-json",
+        type=Path,
+        help=f"Optional path to write latency JSON. Default: session/{DEFAULT_LATENCY_ANALYSIS_JSON}",
+    )
+    latency_parser.add_argument("--force", action="store_true", help="Recompute even when cached JSON is up to date.")
+    latency_parser.set_defaults(func=analyze_teleop_latency)
+
     args = parser.parse_args()
     return args.func(args)
+
+
+class FixedRateLatestSampler:
+    def __init__(
+        self,
+        hz: float,
+        callback: Any,
+        *,
+        name: str,
+        initial_delay_seconds: float = 0.0,
+        fresh_source_wait_seconds: float = 0.0,
+    ) -> None:
+        self.hz = max(1.0, float(hz))
+        self.period_seconds = 1.0 / self.hz
+        self.initial_delay_seconds = max(0.0, float(initial_delay_seconds))
+        self.fresh_source_wait_seconds = max(0.0, float(fresh_source_wait_seconds))
+        self.callback = callback
+        self.condition = threading.Condition()
+        self.stop_event = threading.Event()
+        self.latest_value: Any = None
+        self.latest_version = 0
+        self.last_consumed_version = -1
+        self.last_result: Any = None
+        self.thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self.tick_count = 0
+        self.missed_tick_count = 0
+        self.reused_source_count = 0
+        self.callback_error_count = 0
+        self.last_callback_error: str | None = None
+        self.first_target_perf: float | None = None
+        self.last_target_perf: float | None = None
+        self.first_actual_perf: float | None = None
+        self.last_actual_perf: float | None = None
+        self.lateness_seconds: list[float] = []
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def submit(self, value: Any) -> None:
+        with self.condition:
+            self.latest_value = value
+            self.latest_version += 1
+            self.condition.notify_all()
+
+    def stop(self, timeout_seconds: float) -> None:
+        self.stop_event.set()
+        with self.condition:
+            self.condition.notify_all()
+        if self.thread.is_alive() and self.thread is not threading.current_thread():
+            self.thread.join(timeout=max(0.0, float(timeout_seconds)))
+
+    def latest_result_payload(self) -> Any:
+        with self.condition:
+            return self.last_result
+
+    def summary(self) -> dict[str, Any]:
+        with self.condition:
+            tick_count = int(self.tick_count)
+            first_target = self.first_target_perf
+            last_target = self.last_target_perf
+            first_actual = self.first_actual_perf
+            last_actual = self.last_actual_perf
+            lateness = list(self.lateness_seconds)
+            payload: dict[str, Any] = {
+                "targetHz": self.hz,
+                "periodSeconds": self.period_seconds,
+                "initialDelaySeconds": self.initial_delay_seconds,
+                "freshSourceWaitSeconds": self.fresh_source_wait_seconds,
+                "ticks": tick_count,
+                "missedTicks": int(self.missed_tick_count),
+                "reusedSourceTicks": int(self.reused_source_count),
+                "callbackErrors": int(self.callback_error_count),
+                "lastCallbackError": self.last_callback_error,
+                "threadAlive": bool(self.thread.is_alive()),
+            }
+        if tick_count >= 2 and first_target is not None and last_target is not None:
+            target_duration = max(0.0, float(last_target - first_target))
+            payload["targetDurationSeconds"] = target_duration
+            payload["scheduledHz"] = float((tick_count - 1) / target_duration) if target_duration > 0 else None
+        if tick_count >= 2 and first_actual is not None and last_actual is not None:
+            actual_duration = max(0.0, float(last_actual - first_actual))
+            payload["actualDurationSeconds"] = actual_duration
+            payload["effectiveHz"] = float((tick_count - 1) / actual_duration) if actual_duration > 0 else None
+        if lateness:
+            values = np.asarray(lateness, dtype=float)
+            payload["latenessSeconds"] = {
+                "mean": float(np.mean(values)),
+                "median": float(np.median(values)),
+                "p95": float(np.percentile(values, 95)),
+                "max": float(np.max(values)),
+            }
+        return payload
+
+    def _run(self) -> None:
+        next_target_perf: float | None = None
+        while not self.stop_event.is_set():
+            with self.condition:
+                while self.latest_value is None and not self.stop_event.is_set():
+                    self.condition.wait(timeout=0.1)
+                if self.stop_event.is_set():
+                    return
+                now_perf = time.perf_counter()
+                if next_target_perf is None:
+                    next_target_perf = now_perf + self.initial_delay_seconds
+                delay = next_target_perf - now_perf
+                if delay > 0:
+                    self.condition.wait(timeout=delay)
+                    continue
+                target_perf = next_target_perf
+                fresh_deadline_perf = target_perf + self.fresh_source_wait_seconds
+                while (
+                    self.latest_version == self.last_consumed_version
+                    and not self.stop_event.is_set()
+                ):
+                    fresh_wait = fresh_deadline_perf - time.perf_counter()
+                    if fresh_wait <= 0:
+                        break
+                    self.condition.wait(timeout=fresh_wait)
+                if self.stop_event.is_set():
+                    return
+                value = self.latest_value
+                version = self.latest_version
+                source_reused = version == self.last_consumed_version
+
+            actual_perf = time.perf_counter()
+            tick = {
+                "targetPerfCounterSeconds": target_perf,
+                "actualPerfCounterSeconds": actual_perf,
+                "latenessSeconds": max(0.0, actual_perf - target_perf),
+                "sourceVersion": version,
+                "sourceReused": source_reused,
+            }
+            result = None
+            error = None
+            try:
+                result = self.callback(value, tick)
+            except Exception as exc:  # pragma: no cover - background safety net
+                error = f"{type(exc).__name__}: {exc}"
+            finished_perf = time.perf_counter()
+
+            with self.condition:
+                self.tick_count += 1
+                self.last_consumed_version = version
+                self.last_result = result
+                self.first_target_perf = target_perf if self.first_target_perf is None else self.first_target_perf
+                self.last_target_perf = target_perf
+                self.first_actual_perf = actual_perf if self.first_actual_perf is None else self.first_actual_perf
+                self.last_actual_perf = actual_perf
+                if source_reused:
+                    self.reused_source_count += 1
+                self.lateness_seconds.append(float(tick["latenessSeconds"]))
+                if len(self.lateness_seconds) > 4096:
+                    del self.lateness_seconds[: len(self.lateness_seconds) - 4096]
+                if error is not None:
+                    self.callback_error_count += 1
+                    self.last_callback_error = error
+
+            next_target_perf += self.period_seconds
+            overdue_seconds = finished_perf - next_target_perf
+            if overdue_seconds >= self.period_seconds:
+                missed_ticks = int(overdue_seconds // self.period_seconds)
+                next_target_perf += missed_ticks * self.period_seconds
+                with self.condition:
+                    self.missed_tick_count += missed_ticks
 
 
 class SessionWriter:
@@ -704,6 +990,7 @@ class SessionWriter:
         calibration_raw_root: Path | None = None,
         robot_manager: FlexivRealSenseManager | None = None,
         visualizer: "LiveTelemetryVisualizer | None" = None,
+        formal_control_mode: str = ROBOT_SESSION_CONTROL_TELEOP,
     ) -> None:
         safe_record_id = sanitize_name(record_id or "unknown_record")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -768,6 +1055,11 @@ class SessionWriter:
         self.calibration_snapshot_end: dict[str, Any] | None = None
         self.robot_manager = robot_manager
         self.visualizer = visualizer
+        self.formal_control_mode = (
+            formal_control_mode
+            if formal_control_mode in (ROBOT_SESSION_CONTROL_TELEOP, ROBOT_SESSION_CONTROL_RECORD_ONLY)
+            else ROBOT_SESSION_CONTROL_TELEOP
+        )
         self.robot_session: RobotRealsenseSession | None = None
         self.robot_realsense_directory: Path | None = None
         self.robot_start_status: dict[str, Any] | None = None
@@ -782,13 +1074,10 @@ class SessionWriter:
         self.writer_enqueue_backpressure_events = 0
         self.robot_record_sample_calls = 0
         self.robot_record_sample_skips = 0
-        self.next_robot_record_perf = 0.0
         self.raw_messages_written = 0
         self.raw_sample_skips = 0
-        self.next_raw_sample_perf = 0.0
         self.controller_csv_rows_written = 0
         self.controller_csv_sample_skips = 0
-        self.next_controller_csv_perf = 0.0
         self.last_close_metrics: dict[str, Any] | None = None
         self.close_errors: list[dict[str, Any]] = []
         self.control_thread: threading.Thread | None = None
@@ -797,6 +1086,7 @@ class SessionWriter:
         self.latest_control_wrapper: dict[str, Any] | None = None
         self.latest_control_sequence: Any = None
         self.last_control_sequence: Any = None
+        self.aligned_sampler: FixedRateLatestSampler | None = None
 
         self.messages = 0
         self.samples = 0
@@ -819,7 +1109,7 @@ class SessionWriter:
                 self.visualizer.publish_event if self.visualizer is not None else None,
                 robot_alignment_result=robot_alignment,
                 require_controller_alignment=True,
-                control_mode=ROBOT_SESSION_CONTROL_TELEOP,
+                control_mode=self.formal_control_mode,
                 record_mode=ROBOT_SESSION_RECORD_ASYNC,
             )
             if self.robot_session is not None:
@@ -830,6 +1120,15 @@ class SessionWriter:
                     daemon=True,
                 )
                 self.control_thread.start()
+                if getattr(self.robot_session, "record_mode", None) == ROBOT_SESSION_RECORD_ASYNC:
+                    self.aligned_sampler = FixedRateLatestSampler(
+                        FORMAL_ALIGNED_SAMPLE_HZ,
+                        self._record_aligned_sample,
+                        name=f"pc-session-aligned-{sanitize_name(self.record_id)}",
+                        initial_delay_seconds=FORMAL_ALIGNED_INITIAL_DELAY_SECONDS,
+                        fresh_source_wait_seconds=FORMAL_ALIGNED_FRESH_SOURCE_WAIT_SECONDS,
+                    )
+                    self.aligned_sampler.start()
             self.robot_start_status = self._robot_start_status(
                 "recording" if self.robot_session is not None else "not_recording"
             )
@@ -967,9 +1266,8 @@ class SessionWriter:
             self.quest_output_directory = output_directory
 
         self.messages += 1
-        if self._should_write_raw_wrapper(wrapper, message):
-            self.raw_file.write(json_line(wrapper))
-            self.raw_messages_written += 1
+        self.raw_file.write(json_line(wrapper))
+        self.raw_messages_written += 1
 
         if message.get("type") == "sample":
             self.samples += 1
@@ -989,17 +1287,6 @@ class SessionWriter:
         ):
             self.flush()
 
-    def _should_write_raw_wrapper(self, wrapper: dict[str, Any], message: dict[str, Any]) -> bool:
-        if message.get("type") != "sample":
-            return True
-        now_perf = wrapper.get("pcReceivePerfCounterSeconds")
-        now_perf = float(now_perf) if is_number(now_perf) else time.perf_counter()
-        if now_perf < self.next_raw_sample_perf:
-            self.raw_sample_skips += 1
-            return False
-        self.next_raw_sample_perf = now_perf + (1.0 / max(1.0, SESSION_RAW_SAMPLE_HZ))
-        return True
-
     def _publish_latest_control_sample(self, wrapper: dict[str, Any]) -> None:
         if self.robot_session is None or self.control_thread is None:
             return
@@ -1010,6 +1297,25 @@ class SessionWriter:
             self.latest_control_wrapper = wrapper
             self.latest_control_sequence = message.get("sequence")
             self.control_condition.notify()
+        if self.aligned_sampler is not None:
+            self.aligned_sampler.submit(wrapper)
+
+    def _record_aligned_sample(self, wrapper: dict[str, Any], tick: dict[str, Any]) -> dict[str, Any] | None:
+        robot_session = self.robot_session
+        if robot_session is None:
+            return None
+        message = wrapper.get("message")
+        if not isinstance(message, dict) or message.get("type") != "sample":
+            return None
+        robot_sample = dict(message)
+        robot_sample["pcReceivePerfCounterSeconds"] = wrapper.get("pcReceivePerfCounterSeconds")
+        robot_sample["alignedTargetPerfCounterSeconds"] = tick.get("targetPerfCounterSeconds")
+        robot_sample["alignedActualPerfCounterSeconds"] = tick.get("actualPerfCounterSeconds")
+        robot_sample["alignedLatenessSeconds"] = tick.get("latenessSeconds")
+        robot_sample["alignedSourceVersion"] = tick.get("sourceVersion")
+        robot_sample["alignedSourceReused"] = tick.get("sourceReused")
+        self.robot_record_sample_calls += 1
+        return robot_session.record_sample(robot_sample)
 
     def _control_loop(self) -> None:
         while not self.control_stop_event.is_set():
@@ -1080,31 +1386,22 @@ class SessionWriter:
         if pc_world is not None:
             compact["pcWorld"] = pc_world
         self.samples_file.write(json_line(compact))
-        write_controller_csv = self._should_write_controller_csv(wrapper)
-        if not write_controller_csv:
-            self.controller_csv_sample_skips += 1
-        self._write_controller_csv_row(wrapper, message, "left", write_csv=write_controller_csv)
-        self._write_controller_csv_row(wrapper, message, "right", write_csv=write_controller_csv)
-
-    def _should_write_controller_csv(self, wrapper: dict[str, Any]) -> bool:
-        now_perf = wrapper.get("pcReceivePerfCounterSeconds")
-        now_perf = float(now_perf) if is_number(now_perf) else time.perf_counter()
-        if now_perf < self.next_controller_csv_perf:
-            return False
-        self.next_controller_csv_perf = now_perf + (1.0 / max(1.0, SESSION_CONTROLLER_CSV_HZ))
-        return True
+        self._write_controller_csv_row(wrapper, message, "left", write_csv=True)
+        self._write_controller_csv_row(wrapper, message, "right", write_csv=True)
 
     def _write_robot_sample_for_record(self, wrapper: dict[str, Any], message: dict[str, Any]) -> dict[str, Any] | None:
         robot_session = self.robot_session
         if robot_session is None:
             return None
         if getattr(robot_session, "record_mode", None) == ROBOT_SESSION_RECORD_ASYNC:
-            now_perf = wrapper.get("pcReceivePerfCounterSeconds")
-            now_perf = float(now_perf) if is_number(now_perf) else time.perf_counter()
-            if now_perf < self.next_robot_record_perf:
+            if self.aligned_sampler is None:
                 self.robot_record_sample_skips += 1
                 return None
-            self.next_robot_record_perf = now_perf + (1.0 / max(1.0, ROBOT_SESSION_ASYNC_SAMPLE_HZ))
+            row = self.aligned_sampler.latest_result_payload()
+            if not isinstance(row, dict):
+                self.robot_record_sample_skips += 1
+                return None
+            return row
         robot_sample = dict(message)
         robot_sample["pcReceivePerfCounterSeconds"] = wrapper.get("pcReceivePerfCounterSeconds")
         self.robot_record_sample_calls += 1
@@ -1227,6 +1524,22 @@ class SessionWriter:
         unfinished_before_drop = 0
         dropped_on_close = 0
         robot_summary = None
+        aligned_sampler_stopped_perf = close_started_perf
+        try:
+            if self.aligned_sampler is not None:
+                self.aligned_sampler.stop(SESSION_CONTROL_THREAD_JOIN_SECONDS)
+        except Exception as exc:  # pragma: no cover - defensive close path
+            self._note_close_error("aligned_sampler_join", exc)
+        aligned_sampler_stopped_perf = time.perf_counter()
+        try:
+            self.control_stop_event.set()
+            with self.control_condition:
+                self.control_condition.notify_all()
+            if self.control_thread is not None and self.control_thread.is_alive():
+                self.control_thread.join(timeout=SESSION_CONTROL_THREAD_JOIN_SECONDS)
+        except Exception as exc:  # pragma: no cover - defensive close path
+            self._note_close_error("control_thread_join", exc)
+        control_joined_perf = time.perf_counter()
         try:
             unfinished_before_drop = self._wait_for_writer_queue(SESSION_WRITE_QUEUE_CLOSE_DRAIN_SECONDS)
         except Exception as exc:  # pragma: no cover - defensive close path
@@ -1248,15 +1561,6 @@ class SessionWriter:
         except Exception as exc:  # pragma: no cover - defensive close path
             self._note_close_error("writer_thread_join", exc)
         writer_joined_perf = time.perf_counter()
-        try:
-            self.control_stop_event.set()
-            with self.control_condition:
-                self.control_condition.notify_all()
-            if self.control_thread is not None and self.control_thread.is_alive():
-                self.control_thread.join(timeout=SESSION_CONTROL_THREAD_JOIN_SECONDS)
-        except Exception as exc:  # pragma: no cover - defensive close path
-            self._note_close_error("control_thread_join", exc)
-        control_joined_perf = time.perf_counter()
 
         try:
             self.calibration_snapshot_end = recording_calibration_snapshot(self.calibration_output_root)
@@ -1282,11 +1586,12 @@ class SessionWriter:
                 self._note_close_error("robot_session_stop", exc)
         robot_stopped_perf = time.perf_counter()
         self.last_close_metrics = {
-            "writerDrainSeconds": writer_drained_perf - close_started_perf,
+            "alignedSamplerStopSeconds": aligned_sampler_stopped_perf - close_started_perf,
+            "controlJoinSeconds": control_joined_perf - aligned_sampler_stopped_perf,
+            "writerDrainSeconds": writer_drained_perf - control_joined_perf,
             "writerQueueDropSeconds": writer_queue_dropped_perf - writer_drained_perf,
             "writerJoinSeconds": writer_joined_perf - writer_queue_dropped_perf,
-            "controlJoinSeconds": control_joined_perf - writer_joined_perf,
-            "robotStopSeconds": robot_stopped_perf - control_joined_perf,
+            "robotStopSeconds": robot_stopped_perf - writer_joined_perf,
             "totalSeconds": robot_stopped_perf - close_started_perf,
             "writerUnfinishedTasksBeforeDrop": unfinished_before_drop,
             "writerDroppedOnClose": dropped_on_close,
@@ -1307,6 +1612,19 @@ class SessionWriter:
         except Exception as exc:
             summary["replayVisualizationError"] = str(exc)
             self._note_close_error("replay_visualization_cache", exc)
+        try:
+            latency_path = write_teleop_latency_analysis(self.directory)
+            latency_payload = read_json_if_exists(latency_path)
+            summary["teleopLatencyAnalysisJson"] = str(latency_path)
+            if isinstance(latency_payload, dict):
+                summary["teleopLatency"] = {
+                    "ok": bool(latency_payload.get("ok")),
+                    "primary": latency_payload.get("primary"),
+                    "warnings": latency_payload.get("warnings"),
+                }
+        except Exception as exc:
+            summary["teleopLatencyAnalysisError"] = str(exc)
+            self._note_close_error("teleop_latency_analysis", exc)
         self._write_summary_safely(summary, "summary_final")
         self.closed = True
         return summary
@@ -1380,6 +1698,8 @@ class SessionWriter:
             "writerEnqueueBackpressureEvents": self.writer_enqueue_backpressure_events,
             "robotRecordSampleCalls": self.robot_record_sample_calls,
             "robotRecordSampleSkips": self.robot_record_sample_skips,
+            "formalAlignedSampleHz": FORMAL_ALIGNED_SAMPLE_HZ,
+            "alignedSampler": self.aligned_sampler.summary() if self.aligned_sampler is not None else None,
             "writerError": self.writer_error,
         }
         if self.close_errors:
@@ -1424,8 +1744,12 @@ class SessionWriter:
         freedrive_send_signature = robot.get("cartesianSendSignature") if isinstance(robot, dict) else None
         controller_motion = bool(isinstance(config, dict) and config.get("controllerMotionEnabled"))
         control_mode = active.get("controlMode") if isinstance(active, dict) else ROBOT_SESSION_CONTROL_TELEOP
-        if control_mode not in (ROBOT_SESSION_CONTROL_TELEOP, ROBOT_SESSION_CONTROL_FREEDRIVE):
-            control_mode = ROBOT_SESSION_CONTROL_TELEOP
+        if control_mode not in (
+            ROBOT_SESSION_CONTROL_TELEOP,
+            ROBOT_SESSION_CONTROL_FREEDRIVE,
+            ROBOT_SESSION_CONTROL_RECORD_ONLY,
+        ):
+            control_mode = self.formal_control_mode
         recording = bool(self.robot_session is not None)
         reason = "recording"
         if not connected:
@@ -1438,6 +1762,8 @@ class SessionWriter:
             reason = "recording; robot free-drag mode is enabled"
         elif control_mode == ROBOT_SESSION_CONTROL_FREEDRIVE:
             reason = self.robot_manager.last_error or "robot free-drag mode is not enabled"
+        elif control_mode == ROBOT_SESSION_CONTROL_RECORD_ONLY:
+            reason = "recording; robot motion commands are disabled"
         elif active and active.get("controllerAlignmentRequired") and not active.get("controllerAlignmentAvailable"):
             reason = "recording; Quest-robot alignment is required before right-controller teleop"
         elif control_mode == ROBOT_SESSION_CONTROL_TELEOP and not controller_motion:
@@ -1645,6 +1971,11 @@ class LiveTelemetryVisualizer:
             if latest is not None:
                 payload["lastCalibration"] = latest
         return payload
+
+    def robot_safety_status_payload(self) -> dict[str, Any]:
+        if self.robot_manager is None:
+            return {"ok": False, "enabled": False, "reason": "disabled"}
+        return self.robot_manager.safety_status()
 
     def clear_calibration_payload(self) -> dict[str, Any]:
         self.calibration_state_cleared = True
@@ -1932,6 +2263,9 @@ class LiveTelemetryVisualizer:
                     return
                 if parsed.path == "/robot/status":
                     self._send_json(visualizer.robot_status_payload())
+                    return
+                if parsed.path == "/robot/safety-status":
+                    self._send_json(visualizer.robot_safety_status_payload())
                     return
                 if parsed.path == "/robot/gripper/status":
                     self._send_json(visualizer.robot_gripper_status_payload())
@@ -2983,7 +3317,8 @@ def receive(args: argparse.Namespace) -> int:
                 gripper_trigger_close_threshold=args.gripper_trigger_close_threshold,
                 gripper_trigger_open_threshold=args.gripper_trigger_open_threshold,
                 gripper_init_on_enable=args.gripper_init_on_enable,
-            )
+            ),
+            formal_control_mode=args.formal_control_mode,
         )
     visualizer = None
     if args.visualize:
@@ -3032,6 +3367,8 @@ def receive(args: argparse.Namespace) -> int:
     close_threads: list[threading.Thread] = []
     total_messages = 0
     total_samples = 0
+    duplicate_datagrams_ignored = 0
+    recent_udp_datagrams: dict[tuple[Any, ...], float] = {}
     last_datagram_perf = time.perf_counter()
     last_active_recording_perf: float | None = None
     last_sample_log_perf = float("-inf")
@@ -3186,15 +3523,20 @@ def receive(args: argparse.Namespace) -> int:
             if not data or data.isspace():
                 continue
 
+            if note_quest_udp_wire_datagram(
+                data,
+                str(remote[0]),
+                pc_receive_perf_counter_seconds,
+                recent_udp_datagrams,
+            ):
+                duplicate_datagrams_ignored += 1
+                continue
             try:
-                message = json.loads(data)
-            except json.JSONDecodeError as exc:
+                message, udp_transport = decode_quest_udp_datagram(data)
+            except (gzip.BadGzipFile, json.JSONDecodeError, OSError, ValueError) as exc:
                 print(f"[bad-json] {remote[0]}:{remote[1]} {exc}: {data[:200]!r}", file=sys.stderr)
                 continue
-
-            if not isinstance(message, dict):
-                print(f"[bad-message] {remote[0]}:{remote[1]} expected JSON object", file=sys.stderr)
-                continue
+            udp_transport["duplicateDatagramsIgnoredBefore"] = duplicate_datagrams_ignored
 
             msg_type = str(message.get("type") or "?")
             record_id = str(message.get("recordId") or "orphan")
@@ -3230,6 +3572,7 @@ def receive(args: argparse.Namespace) -> int:
                 "pcReceiveUnixSeconds": pc_receive_unix_seconds,
                 "pcReceivePerfCounterSeconds": pc_receive_perf_counter_seconds,
                 "remote": f"{remote[0]}:{remote[1]}",
+                "udpTransport": udp_transport,
                 "message": message,
             }
 
@@ -3325,6 +3668,7 @@ def receive(args: argparse.Namespace) -> int:
                     args.calibration_raw_root.resolve() if not args.no_calibration_http else None,
                     robot_manager,
                     visualizer,
+                    args.formal_control_mode,
                 )
                 last_active_recording_perf = pc_receive_perf_counter_seconds
                 print(f"Started PC session: {active.directory}", flush=True)
@@ -3750,6 +4094,13 @@ def audit_performance(args: argparse.Namespace) -> int:
     robot_summary = robot_realsense_record_summary(session_dir)
     thresholds = {
         "minRobotTargetRatio": float(args.min_robot_target_ratio),
+        "maxRobotLatenessP95Seconds": float(args.max_robot_lateness_p95_seconds),
+        "minAlignedTargetRatio": float(args.min_aligned_target_ratio),
+        "maxAlignedLatenessP95Seconds": float(args.max_aligned_lateness_p95_seconds),
+        "maxQuestSourceAgeP95Seconds": float(args.max_quest_source_age_p95_seconds),
+        "maxAlignedReusedSourceRatio": float(args.max_aligned_reused_source_ratio),
+        "maxUdpSequenceLossRatio": float(args.max_udp_sequence_loss_ratio),
+        "maxUdpDatagramBytes": float(args.max_udp_datagram_bytes),
         "minCameraTargetRatio": float(args.min_camera_target_ratio),
         "maxCameraDropRatio": float(args.max_camera_drop_ratio),
         "maxCameraLatencyP95Seconds": float(args.max_camera_latency_p95_seconds),
@@ -3761,6 +4112,17 @@ def audit_performance(args: argparse.Namespace) -> int:
         print(f"Wrote performance audit JSON: {args.output_json}", flush=True)
     print_performance_audit(audit)
     return 0 if audit.get("ok") else 1
+
+
+def analyze_teleop_latency(args: argparse.Namespace) -> int:
+    session_dir = resolve_performance_audit_session(args.pc_session, args.output_root)
+    payload = load_or_build_latency_analysis(
+        session_dir,
+        output_json=args.output_json,
+        force=bool(args.force),
+    )
+    print_latency_summary(payload)
+    return 0 if payload.get("ok") else 1
 
 
 def resolve_performance_audit_session(pc_session: Path | None, output_root: Path) -> Path:
@@ -3846,6 +4208,50 @@ def build_performance_audit(
     }
     pc_summary = pc_summary if isinstance(pc_summary, dict) else {}
     checks.extend(pc_recording_integrity_checks(pc_summary))
+    udp_transport = quest_udp_transport_summary(session_dir)
+    udp_sequence_count = finite_int(udp_transport.get("sequenceCount"), 0)
+    udp_missing_count = finite_int(udp_transport.get("missingSequenceCount"), 0)
+    udp_loss_ratio = udp_transport.get("sequenceLossRatio")
+    checks.append(
+        audit_item(
+            "quest_udp_sequence_loss",
+            "Quest UDP sequence loss",
+            bool(
+                udp_sequence_count >= 2
+                and is_number(udp_loss_ratio)
+                and float(udp_loss_ratio) <= thresholds["maxUdpSequenceLossRatio"]
+            ),
+            f"{udp_missing_count} missing of {finite_int(udp_transport.get('expectedSequenceCount'), 0)} "
+            f"({format_percent(udp_loss_ratio)})",
+            performance=udp_transport,
+        )
+    )
+    udp_duplicates = finite_int(udp_transport.get("duplicateSequenceCount"), 0)
+    udp_reordered = finite_int(udp_transport.get("reorderedSequenceCount"), 0)
+    checks.append(
+        audit_item(
+            "quest_udp_sequence_order",
+            "Quest UDP sequence order",
+            bool(udp_sequence_count >= 2 and udp_duplicates == 0 and udp_reordered == 0),
+            f"{udp_duplicates} duplicate, {udp_reordered} reordered",
+            performance=udp_transport,
+        )
+    )
+    udp_wire_bytes = udp_transport.get("wireBytes") if isinstance(udp_transport.get("wireBytes"), dict) else {}
+    udp_wire_max = udp_wire_bytes.get("max")
+    checks.append(
+        audit_item(
+            "quest_udp_mtu",
+            "Quest UDP datagrams fit MTU",
+            bool(
+                is_number(udp_wire_max)
+                and float(udp_wire_max) <= thresholds["maxUdpDatagramBytes"]
+            ),
+            f"max {format_bytes(udp_wire_max)}, limit {format_bytes(thresholds['maxUdpDatagramBytes'])}",
+            performance=udp_wire_bytes,
+        )
+    )
+    payload["udpTransport"] = udp_transport
     if not isinstance(robot_summary, dict):
         checks.append(
             audit_item(
@@ -3887,12 +4293,112 @@ def build_performance_audit(
             audit_item(
                 "robot_state_gap_p95",
                 "Robot state p95 gap",
-                float(robot_gap["p95"]) <= (2.5 / target_hz),
+                float(robot_gap["p95"]) <= (1.5 / target_hz),
                 f"gap p95 {format_seconds(robot_gap.get('p95'))}",
                 performance=robot_gap,
-                required=False,
-            )
+            ),
         )
+
+    robot_lateness = (
+        performance.get("robotStateLatenessSeconds")
+        if isinstance(performance.get("robotStateLatenessSeconds"), dict)
+        else {}
+    )
+    robot_lateness_p95 = robot_lateness.get("p95")
+    checks.append(
+        audit_item(
+            "robot_state_lateness_p95",
+            "Robot state sampler p95 lateness",
+            bool(
+                is_number(robot_lateness_p95)
+                and float(robot_lateness_p95) <= thresholds["maxRobotLatenessP95Seconds"]
+            ),
+            f"lateness p95 {format_seconds(robot_lateness_p95)}",
+            performance=robot_lateness,
+        )
+    )
+    robot_missed_ticks = finite_int(performance.get("robotStateMissedTicks"), 0)
+    checks.append(
+        audit_item(
+            "robot_state_missed_ticks",
+            "Robot state sampler missed ticks",
+            robot_missed_ticks == 0,
+            f"{robot_missed_ticks} missed tick(s)",
+        )
+    )
+
+    aligned_perf = performance.get("alignedSamples") if isinstance(performance.get("alignedSamples"), dict) else {}
+    aligned_ratio = aligned_perf.get("targetRatio")
+    checks.append(
+        audit_item(
+            "aligned_sample_rate",
+            "Final aligned sample effective rate",
+            bool(is_number(aligned_ratio) and float(aligned_ratio) >= thresholds["minAlignedTargetRatio"]),
+            robot_rate_detail(aligned_perf),
+            performance=aligned_perf,
+        )
+    )
+    aligned_lateness = (
+        performance.get("alignedSampleLatenessSeconds")
+        if isinstance(performance.get("alignedSampleLatenessSeconds"), dict)
+        else {}
+    )
+    aligned_lateness_p95 = aligned_lateness.get("p95")
+    checks.append(
+        audit_item(
+            "aligned_sample_lateness_p95",
+            "Final aligned sample p95 lateness",
+            bool(
+                is_number(aligned_lateness_p95)
+                and float(aligned_lateness_p95) <= thresholds["maxAlignedLatenessP95Seconds"]
+            ),
+            f"lateness p95 {format_seconds(aligned_lateness_p95)}",
+            performance=aligned_lateness,
+        )
+    )
+    quest_source_age = (
+        performance.get("alignedQuestSourceAgeSeconds")
+        if isinstance(performance.get("alignedQuestSourceAgeSeconds"), dict)
+        else {}
+    )
+    quest_source_age_p95 = quest_source_age.get("p95")
+    checks.append(
+        audit_item(
+            "aligned_quest_source_age_p95",
+            "Aligned Quest source age p95",
+            bool(
+                is_number(quest_source_age_p95)
+                and float(quest_source_age_p95) <= thresholds["maxQuestSourceAgeP95Seconds"]
+            ),
+            f"source age p95 {format_seconds(quest_source_age_p95)}",
+            performance=quest_source_age,
+        )
+    )
+    aligned_count = finite_int(aligned_perf.get("count"), 0)
+    aligned_reused = finite_int(performance.get("alignedReusedSourceSamples"), 0)
+    aligned_reused_ratio = float(aligned_reused / aligned_count) if aligned_count > 0 else None
+    checks.append(
+        audit_item(
+            "aligned_quest_source_reuse",
+            "Aligned Quest source reuse",
+            bool(
+                is_number(aligned_reused_ratio)
+                and float(aligned_reused_ratio) <= thresholds["maxAlignedReusedSourceRatio"]
+            ),
+            f"{aligned_reused} reused of {aligned_count} ({format_percent(aligned_reused_ratio)})",
+        )
+    )
+    aligned_sampler = pc_summary.get("alignedSampler") if isinstance(pc_summary.get("alignedSampler"), dict) else {}
+    aligned_missed_ticks = finite_int(aligned_sampler.get("missedTicks"), 0)
+    checks.append(
+        audit_item(
+            "aligned_sample_missed_ticks",
+            "Final aligned sampler missed ticks",
+            bool(aligned_sampler and aligned_missed_ticks == 0),
+            f"{aligned_missed_ticks} missed tick(s)",
+            sampler=aligned_sampler,
+        )
+    )
 
     camera_perf = performance.get("cameras") if isinstance(performance.get("cameras"), dict) else {}
     close_errors = robot_summary.get("closeErrors") if isinstance(robot_summary.get("closeErrors"), list) else []
@@ -3965,6 +4471,77 @@ def build_performance_audit(
     payload["summary"] = audit_summary_text(checks)
     payload["performance"] = performance
     return payload
+
+
+def quest_udp_transport_summary(session_dir: Path) -> dict[str, Any]:
+    raw_path = session_dir / "pc_telemetry_raw.jsonl"
+    rows = read_jsonl(raw_path) if raw_path.exists() else []
+    sequences: list[int] = []
+    wire_bytes: list[float] = []
+    json_bytes: list[float] = []
+    encodings: dict[str, int] = {}
+    duplicate_datagrams_ignored = 0
+    sample_datagrams = 0
+    for row in rows:
+        message = row.get("message") if isinstance(row.get("message"), dict) else {}
+        sequence = message.get("sequence")
+        if is_number(sequence):
+            sequences.append(int(sequence))
+        if message.get("type") == "sample":
+            sample_datagrams += 1
+        transport = row.get("udpTransport") if isinstance(row.get("udpTransport"), dict) else {}
+        encoding = str(transport.get("encoding") or "unknown")
+        encodings[encoding] = encodings.get(encoding, 0) + 1
+        if is_number(transport.get("wireBytes")):
+            wire_bytes.append(float(transport["wireBytes"]))
+        if is_number(transport.get("jsonBytes")):
+            json_bytes.append(float(transport["jsonBytes"]))
+        duplicate_datagrams_ignored = max(
+            duplicate_datagrams_ignored,
+            finite_int(transport.get("duplicateDatagramsIgnoredBefore"), 0),
+        )
+
+    seen: set[int] = set()
+    duplicate_count = 0
+    reordered_count = 0
+    max_seen: int | None = None
+    for sequence in sequences:
+        if sequence in seen:
+            duplicate_count += 1
+            continue
+        if max_seen is not None and sequence < max_seen:
+            reordered_count += 1
+        seen.add(sequence)
+        max_seen = sequence if max_seen is None else max(max_seen, sequence)
+
+    unique_sorted = sorted(seen)
+    expected_count = unique_sorted[-1] - unique_sorted[0] + 1 if unique_sorted else 0
+    missing_count = max(0, expected_count - len(unique_sorted))
+    first_missing: list[int] = []
+    for left, right in zip(unique_sorted, unique_sorted[1:]):
+        if right <= left + 1:
+            continue
+        first_missing.extend(range(left + 1, min(right, left + 1 + max(0, 20 - len(first_missing)))))
+        if len(first_missing) >= 20:
+            break
+    return {
+        "rawPath": str(raw_path),
+        "datagrams": len(rows),
+        "sampleDatagrams": sample_datagrams,
+        "sequenceCount": len(sequences),
+        "firstSequence": sequences[0] if sequences else None,
+        "lastSequence": sequences[-1] if sequences else None,
+        "expectedSequenceCount": expected_count,
+        "missingSequenceCount": missing_count,
+        "firstMissingSequences": first_missing,
+        "sequenceLossRatio": float(missing_count / expected_count) if expected_count > 0 else None,
+        "duplicateSequenceCount": duplicate_count,
+        "reorderedSequenceCount": reordered_count,
+        "redundantDuplicateDatagramsIgnored": duplicate_datagrams_ignored,
+        "encodings": encodings,
+        "wireBytes": stats_summary(wire_bytes),
+        "jsonBytes": stats_summary(json_bytes),
+    }
 
 
 def print_performance_audit(audit: dict[str, Any]) -> None:
@@ -4627,6 +5204,7 @@ def robot_realsense_performance_summary(
 ) -> dict[str, Any]:
     existing = session.get("performance") if isinstance(session.get("performance"), dict) else None
     robot_states = read_jsonl_relaxed(robot_dir / "robot_states.jsonl")
+    aligned_samples = read_jsonl_relaxed(robot_dir / "samples.jsonl")
     video_frames = read_jsonl_relaxed(robot_dir / "video_frames.jsonl")
     target_robot_hz = max(1e-6, finite_float(config.get("robotStateHz") or session.get("robotStateHz"), 90.0))
     target_camera_hz = max(1e-6, finite_float(config.get("fps"), 30.0))
@@ -4635,6 +5213,37 @@ def robot_realsense_performance_summary(
     target_depth_hz = target_camera_hz / depth_every if record_depth else 0.0
 
     robot_times = [float(row["pc_perf_counter_seconds"]) for row in robot_states if is_number(row.get("pc_perf_counter_seconds"))]
+    robot_target_times = [
+        float(row["target_perf_counter_seconds"])
+        for row in robot_states
+        if is_number(row.get("target_perf_counter_seconds"))
+    ]
+    robot_lateness = [
+        float(row["lateness_seconds"])
+        for row in robot_states
+        if is_number(row.get("lateness_seconds"))
+    ]
+    aligned_times = [
+        float(row["pc_perf_counter_seconds"])
+        for row in aligned_samples
+        if is_number(row.get("pc_perf_counter_seconds"))
+    ]
+    aligned_target_times = [
+        float(row["aligned_target_perf_counter_seconds"])
+        for row in aligned_samples
+        if is_number(row.get("aligned_target_perf_counter_seconds"))
+    ]
+    aligned_lateness = [
+        float(row["aligned_lateness_seconds"])
+        for row in aligned_samples
+        if is_number(row.get("aligned_lateness_seconds"))
+    ]
+    aligned_source_ages = [
+        max(0.0, float(row["pc_perf_counter_seconds"]) - float(row["quest_pc_receive_perf_counter_seconds"]))
+        for row in aligned_samples
+        if is_number(row.get("pc_perf_counter_seconds"))
+        and is_number(row.get("quest_pc_receive_perf_counter_seconds"))
+    ]
     by_role: dict[str, list[dict[str, Any]]] = {}
     for row in video_frames:
         role = str(row.get("role") or "camera")
@@ -4647,12 +5256,7 @@ def robot_realsense_performance_summary(
         else {}
     )
     for role, rows in sorted(by_role.items()):
-        video_times = [
-            timestamp
-            for row in rows
-            for timestamp in [row_time_seconds(row, "pc_perf_counter_seconds", "captured_at")]
-            if timestamp is not None
-        ]
+        video_times = [timestamp for row in rows for timestamp in [camera_frame_time_seconds(row)] if timestamp is not None]
         write_durations = [
             float(row["write_duration_seconds"])
             for row in rows
@@ -4665,10 +5269,7 @@ def robot_realsense_performance_summary(
                 latencies.append(latency)
         depth_rows = [row for row in rows if isinstance(row.get("depth"), dict) and row["depth"].get("path")]
         depth_times = [
-            timestamp
-            for row in depth_rows
-            for timestamp in [row_time_seconds(row, "pc_perf_counter_seconds", "captured_at")]
-            if timestamp is not None
+            timestamp for row in depth_rows for timestamp in [camera_frame_time_seconds(row)] if timestamp is not None
         ]
         session_drops = finite_int(queue_drops.get(role), 0)
         hub_drops = finite_int(subscriber_drops.get(role), 0)
@@ -4687,6 +5288,14 @@ def robot_realsense_performance_summary(
         }
     computed = {
         "robotState": time_series_summary(robot_times, target_robot_hz),
+        "robotStateTargets": time_series_summary(robot_target_times, target_robot_hz),
+        "robotStateLatenessSeconds": stats_summary(robot_lateness),
+        "alignedSamples": time_series_summary(aligned_times, FORMAL_ALIGNED_SAMPLE_HZ),
+        "alignedSampleTargets": time_series_summary(aligned_target_times, FORMAL_ALIGNED_SAMPLE_HZ),
+        "alignedSampleLatenessSeconds": stats_summary(aligned_lateness),
+        "alignedQuestSourceAgeSeconds": stats_summary(aligned_source_ages),
+        "alignedReusedSourceSamples": sum(1 for row in aligned_samples if row.get("aligned_source_reused")),
+        "targetAlignedSampleHz": FORMAL_ALIGNED_SAMPLE_HZ,
         "cameras": cameras,
         "targetRobotStateHz": target_robot_hz,
         "targetCameraHz": target_camera_hz,
@@ -4936,6 +5545,7 @@ def build_recording_replay_payload_uncached(
     gaze_diagnostics = build_gaze_depth_diagnostics(raw_rows, snapshot)
     enrich_replay_samples_with_gaze_diagnostics(samples, gaze_diagnostics, board_origin_world)
     robot_realsense = build_robot_realsense_replay(session_dir, board_origin_world)
+    teleop_latency = replay_teleop_latency_analysis(session_dir)
     raw_artifacts = replay_raw_artifacts(session_dir, summary, resolved_source, calibration_output_root)
     recording_audit = build_recording_audit(session_dir, raw_rows, samples, snapshot, robot_realsense)
 
@@ -4956,6 +5566,7 @@ def build_recording_replay_payload_uncached(
         "gazeDepthDiagnostics": gaze_diagnostics.get("summary", {}),
         "robotRealSense": robot_realsense,
         "recordingAudit": recording_audit,
+        "teleopLatency": teleop_latency,
         "rawArtifacts": raw_artifacts,
         "samples": samples,
     }
@@ -4986,9 +5597,11 @@ def replay_visualization_payload(
                 session_dir / "pc_calibration_snapshot.json",
                 session_dir / "robot_realsense" / "samples.jsonl",
                 session_dir / "robot_realsense" / "robot_states.jsonl",
+                session_dir / "robot_realsense" / "controller_motion.jsonl",
                 session_dir / "robot_realsense" / "session_summary.json",
                 session_dir / "robot_realsense" / "robot_hand_eye_result.json",
                 session_dir / "robot_realsense" / "robot_hand_eye_failure.json",
+                session_dir / DEFAULT_LATENCY_ANALYSIS_JSON,
             )
             if path is not None and path.exists()
         ]
@@ -5105,6 +5718,9 @@ def compact_replay_summary(summary: Any) -> dict[str, Any]:
         "closeMetrics",
         "replayVisualizationJson",
         "replayVisualizationError",
+        "teleopLatency",
+        "teleopLatencyAnalysisJson",
+        "teleopLatencyAnalysisError",
     )
     return {key: summary.get(key) for key in keep if key in summary}
 
@@ -5436,7 +6052,21 @@ def replay_raw_artifacts(
         if video_dir.exists():
             for path in sorted(video_dir.glob("*.mp4")):
                 artifacts[f"robotVideo_{path.stem}"] = artifact_payload(path, f"Robot video {path.name}")
+    latency_path = session_dir / DEFAULT_LATENCY_ANALYSIS_JSON
+    if latency_path.exists():
+        artifacts["teleopLatency"] = artifact_payload(latency_path, "Teleop latency analysis")
     return artifacts
+
+
+def replay_teleop_latency_analysis(session_dir: Path) -> dict[str, Any]:
+    try:
+        return load_or_build_latency_analysis(session_dir)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "analysisJson": str(session_dir / DEFAULT_LATENCY_ANALYSIS_JSON),
+        }
 
 
 def audit_item(id_value: str, label: str, ok: bool, detail: str, **extra: Any) -> dict[str, Any]:
@@ -5679,6 +6309,13 @@ def row_capture_to_write_latency_seconds(row: dict[str, Any]) -> float | None:
     return float(write_t - capture_t)
 
 
+def camera_frame_time_seconds(row: dict[str, Any]) -> float | None:
+    capture_t = row_time_seconds(row, "frame_captured_perf_counter_seconds", "frame_captured_at_utc")
+    if capture_t is not None:
+        return capture_t
+    return row_time_seconds(row, "pc_perf_counter_seconds", "captured_at")
+
+
 def parse_iso_timestamp_seconds(value: Any) -> float | None:
     if not isinstance(value, str) or not value:
         return None
@@ -5722,6 +6359,10 @@ def format_seconds(value: Any) -> str:
 
 def format_percent(value: Any) -> str:
     return f"{float(value) * 100.0:.1f}%" if is_number(value) else "n/a"
+
+
+def format_bytes(value: Any) -> str:
+    return f"{int(float(value))}B" if is_number(value) else "n/a"
 
 
 def audit_summary_text(checks: list[dict[str, Any]]) -> str:
@@ -8747,6 +9388,7 @@ function resize() {
   canvas.width = Math.max(1, Math.floor(rect.width * dpr));
   canvas.height = Math.max(1, Math.floor(rect.height * dpr));
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (state.data) drawLatencyChart(state.data.teleopLatency?.chart || []);
 }
 
 function resetView() {
@@ -10889,6 +11531,23 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
 .scrub { width: 100%; }
 .kv { display: grid; grid-template-columns: 120px minmax(0,1fr); gap: 4px 8px; margin-top: 8px; }
 .kv span:nth-child(odd) { color: #8492a1; }
+.latency-chart {
+  display: block;
+  width: 100%;
+  height: 120px;
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #080a0c;
+}
+.latency-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: #b7c4d1;
+}
 .artifact-list { display: grid; gap: 5px; margin-top: 8px; }
 .artifact-link {
   color: #a8d8ff;
@@ -10992,6 +11651,16 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
       <div class="kv" id="robotKv"></div>
     </div>
     <div class="section">
+      <div class="ok">Teleop latency</div>
+      <div class="kv" id="latencyKv"></div>
+      <canvas id="latencyChart" class="latency-chart"></canvas>
+      <div class="latency-legend">
+        <span style="color:#ffd166">target</span>
+        <span style="color:#7dd3fc">robot TCP</span>
+        <span style="color:#c084fc">controller</span>
+      </div>
+    </div>
+    <div class="section">
       <div class="ok">Sample</div>
       <div class="kv" id="sampleKv"></div>
       <div class="camera-strip" id="cameraStrip"></div>
@@ -11021,6 +11690,8 @@ const snapKv = document.getElementById('snapKv');
 const artifactList = document.getElementById('artifactList');
 const depthKv = document.getElementById('depthKv');
 const robotKv = document.getElementById('robotKv');
+const latencyKv = document.getElementById('latencyKv');
+const latencyChart = document.getElementById('latencyChart');
 const sampleKv = document.getElementById('sampleKv');
 const cameraStrip = document.getElementById('cameraStrip');
 
@@ -11302,6 +11973,7 @@ function updateSnapshotInfo() {
   updateArtifactLinks();
   updateDepthInfo();
   updateRobotInfo();
+  updateLatencyInfo();
   recordSub.textContent = `${state.data.samples.length} samples`;
 }
 
@@ -11315,7 +11987,8 @@ function updateArtifactLinks() {
     'calibrationFailure',
     'calibrationResult',
     'detectionSummary',
-    'calibrationLog'
+    'calibrationLog',
+    'teleopLatency'
   ];
   const keys = order.filter(key => artifacts[key]).concat(
     Object.keys(artifacts).filter(key => !order.includes(key)).sort()
@@ -11434,6 +12107,113 @@ function updateRobotInfo() {
   ];
   robotKv.innerHTML = kv.map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
   robotKv.innerHTML += renderAuditKvRows(audit);
+}
+
+function updateLatencyInfo() {
+  const payload = state.data?.teleopLatency;
+  if (!payload) {
+    latencyKv.innerHTML = '<span>status</span><span>no analysis</span>';
+    drawLatencyChart([]);
+    return;
+  }
+  if (!payload.ok) {
+    const warnings = Array.isArray(payload.warnings) ? payload.warnings.join('; ') : '';
+    latencyKv.innerHTML = [
+      ['status', 'unavailable'],
+      ['reason', payload.error || warnings || 'not enough teleop/robot motion']
+    ].map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
+    drawLatencyChart(payload.chart || []);
+    return;
+  }
+  const primary = payload.primary || {};
+  const latency = primary.eventLatencySeconds || {};
+  const corrLag = Number(primary.correlationLagSeconds);
+  const corr = Number(primary.correlation);
+  const rows = [
+    ['source', latencySourceText(primary.source)],
+    ['corr lag', Number.isFinite(corrLag) ? `${(corrLag * 1000).toFixed(1)} ms` : 'n/a'],
+    ['corr', Number.isFinite(corr) ? corr.toFixed(3) : 'n/a'],
+    ['event p50', Number.isFinite(Number(latency.median)) ? `${(Number(latency.median) * 1000).toFixed(1)} ms` : 'n/a'],
+    ['event p95', Number.isFinite(Number(latency.p95)) ? `${(Number(latency.p95) * 1000).toFixed(1)} ms` : 'n/a'],
+    ['events', primary.eventCount ?? latency.count ?? 'n/a']
+  ];
+  latencyKv.innerHTML = rows.map(([k,v]) => `<span>${escapeHtml(k)}</span><span>${escapeHtml(String(v))}</span>`).join('');
+  drawLatencyChart(payload.chart || []);
+}
+
+function latencySourceText(source) {
+  if (source === 'targetToRobot') return 'command target -> robot';
+  if (source === 'controllerToRobot') return 'Quest controller -> robot';
+  return source || 'n/a';
+}
+
+function drawLatencyChart(rows) {
+  const rect = latencyChart.getBoundingClientRect();
+  const width = Math.max(1, Math.floor(rect.width || 260));
+  const height = Math.max(1, Math.floor(rect.height || 120));
+  const dpr = window.devicePixelRatio || 1;
+  latencyChart.width = Math.floor(width * dpr);
+  latencyChart.height = Math.floor(height * dpr);
+  const c = latencyChart.getContext('2d');
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.clearRect(0, 0, width, height);
+  c.fillStyle = '#080a0c';
+  c.fillRect(0, 0, width, height);
+  c.strokeStyle = '#1f2a33';
+  c.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    const y = (height * i) / 4;
+    c.beginPath();
+    c.moveTo(0, y);
+    c.lineTo(width, y);
+    c.stroke();
+  }
+  if (!Array.isArray(rows) || rows.length < 2) {
+    c.fillStyle = '#8492a1';
+    c.fillText('no speed chart', 10, 20);
+    return;
+  }
+  const finiteTimes = rows.map(row => Number(row.t)).filter(Number.isFinite);
+  if (!finiteTimes.length) {
+    c.fillStyle = '#8492a1';
+    c.fillText('no speed chart', 10, 20);
+    return;
+  }
+  const finiteValues = rows.flatMap(row => ['targetSpeedMps', 'robotSpeedMps', 'controllerSpeedMps']
+    .map(key => Number(row[key]))
+    .filter(Number.isFinite));
+  const maxT = Math.max(...finiteTimes);
+  const maxY = Math.max(0.001, ...finiteValues);
+  drawLatencySeries(c, rows, 'targetSpeedMps', '#ffd166', width, height, maxT, maxY);
+  drawLatencySeries(c, rows, 'robotSpeedMps', '#7dd3fc', width, height, maxT, maxY);
+  drawLatencySeries(c, rows, 'controllerSpeedMps', '#c084fc', width, height, maxT, maxY);
+  c.fillStyle = '#8492a1';
+  c.font = '11px system-ui';
+  c.fillText(`${maxY.toFixed(3)} m/s`, 8, 14);
+}
+
+function drawLatencySeries(c, rows, key, color, width, height, maxT, maxY) {
+  c.strokeStyle = color;
+  c.lineWidth = 1.6;
+  let drawing = false;
+  c.beginPath();
+  for (const row of rows) {
+    const t = Number(row.t);
+    const value = Number(row[key]);
+    if (!Number.isFinite(t) || !Number.isFinite(value)) {
+      drawing = false;
+      continue;
+    }
+    const x = maxT > 0 ? (t / maxT) * width : 0;
+    const y = height - Math.max(0, Math.min(1, value / maxY)) * (height - 18) - 8;
+    if (!drawing) {
+      c.moveTo(x, y);
+      drawing = true;
+    } else {
+      c.lineTo(x, y);
+    }
+  }
+  c.stroke();
 }
 
 function renderAuditKvRows(audit) {

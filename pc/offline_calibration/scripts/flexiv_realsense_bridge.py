@@ -23,6 +23,11 @@ import cv2
 import numpy as np
 
 try:
+    sys.setswitchinterval(0.001)
+except (AttributeError, ValueError):
+    pass
+
+try:
     cv2.ocl.setUseOpenCL(False)
 except Exception:
     pass
@@ -52,9 +57,11 @@ DEFAULT_ROBOT_STATE_HZ = 90.0
 DEFAULT_RECORD_DEPTH_EVERY_N_FRAMES = 3
 DEFAULT_RECORD_DEPTH_FORMAT = "ffv1"
 RECORD_DEPTH_FORMATS = {"ffv1", "raw"}
+DEFAULT_FFMPEG_ENCODER_THREADS = 2
+DEFAULT_FFMPEG_NICE_LEVEL = 10
 ASYNC_JSONL_FLUSH_ROWS = 16
 ASYNC_JSONL_FLUSH_INTERVAL_SECONDS = 0.25
-ASYNC_QUEST_ALIGNED_SAMPLE_HZ = 10.0
+ASYNC_QUEST_ALIGNED_SAMPLE_HZ = 30.0
 ASYNC_CAMERA_QUEUE_SECONDS = 0.25
 ASYNC_CAMERA_QUEUE_MIN_FRAMES = 4
 ASYNC_CAMERA_QUEUE_MAX_FRAMES = 8
@@ -141,6 +148,7 @@ ROBOT_CARTESIAN_SEND_FATAL_MARKERS = (
 )
 ROBOT_CARTESIAN_TARGET_POSITION_EPS_M = 0.001
 ROBOT_CARTESIAN_TARGET_ROTATION_EPS_DEG = 0.25
+POSE_DIVERSITY_MAX_PAIRWISE_SAMPLES = 512
 FREEDRIVE_FLOATING_CARTESIAN_PRIMITIVE = "FloatingCartesian()"
 
 
@@ -243,6 +251,35 @@ class OnlineTimeSeriesStats:
         if gap_summary.get("count"):
             payload["gapSeconds"] = gap_summary
         return payload
+
+
+def time_series_rate_quality(
+    summary: dict[str, Any],
+    target_hz: float,
+    *,
+    min_target_ratio: float = 0.95,
+    max_p95_gap_factor: float = 1.5,
+) -> dict[str, Any]:
+    effective_hz = summary.get("effectiveHz")
+    gap_summary = summary.get("gapSeconds") if isinstance(summary.get("gapSeconds"), dict) else {}
+    p95_gap = gap_summary.get("p95")
+    expected_gap = 1.0 / max(1e-9, float(target_hz))
+    min_hz = float(target_hz) * float(min_target_ratio)
+    max_p95_gap = expected_gap * float(max_p95_gap_factor)
+    enough_samples = int(summary.get("count") or 0) >= 2
+    rate_ok = is_number(effective_hz) and float(effective_hz) >= min_hz
+    gap_ok = is_number(p95_gap) and float(p95_gap) <= max_p95_gap
+    return {
+        "ok": bool(enough_samples and rate_ok and gap_ok),
+        "targetHz": float(target_hz),
+        "minimumEffectiveHz": min_hz,
+        "maximumP95GapSeconds": max_p95_gap,
+        "effectiveHz": effective_hz,
+        "p95GapSeconds": p95_gap,
+        "enoughSamples": enough_samples,
+        "rateOk": bool(rate_ok),
+        "gapOk": bool(gap_ok),
+    }
 
 
 @dataclass
@@ -776,8 +813,6 @@ class FlexivRobotClient:
                 ROBOT_CARTESIAN_TARGET_POSITION_EPS_M,
                 ROBOT_CARTESIAN_TARGET_ROTATION_EPS_DEG,
             ):
-                self.motion_last_target_pose = target
-                self.freedrive_hold_pose = target
                 guard["targetQueued"] = False
                 guard["commandSent"] = False
                 guard["reason"] = "target_unchanged"
@@ -1696,6 +1731,14 @@ DEFAULT_COLOR_VIDEO_CRF = 23
 DEFAULT_COLOR_VIDEO_PRESET = "veryfast"
 
 
+def ffmpeg_encoder_command_prefix(ffmpeg: str) -> list[str]:
+    if os.name == "posix" and DEFAULT_FFMPEG_NICE_LEVEL > 0:
+        nice = shutil.which("nice")
+        if nice:
+            return [nice, "-n", str(DEFAULT_FFMPEG_NICE_LEVEL), ffmpeg]
+    return [ffmpeg]
+
+
 class ColorStreamWriter:
     """Encode BGR frames to H.264 via a system ffmpeg pipe (libx264).
 
@@ -1735,7 +1778,7 @@ class ColorStreamWriter:
         if not ffmpeg:
             raise RuntimeError("ffmpeg executable not found")
         command = [
-            ffmpeg,
+            *ffmpeg_encoder_command_prefix(ffmpeg),
             "-hide_banner",
             "-loglevel",
             "error",
@@ -1753,6 +1796,8 @@ class ColorStreamWriter:
             "-an",
             "-c:v",
             "libx264",
+            "-threads",
+            str(DEFAULT_FFMPEG_ENCODER_THREADS),
             "-preset",
             self.preset,
             "-crf",
@@ -1795,7 +1840,7 @@ class ColorStreamWriter:
             raise RuntimeError("ffmpeg color writer is not open")
         if not bgr.flags["C_CONTIGUOUS"] or bgr.dtype != np.uint8:
             bgr = np.ascontiguousarray(bgr, dtype=np.uint8)
-        self.process.stdin.write(bgr.tobytes(order="C"))
+        self.process.stdin.write(memoryview(bgr).cast("B"))
         self.frame_count += 1
 
     def close(self) -> None:
@@ -1873,7 +1918,7 @@ class DepthStreamWriter:
         if not ffmpeg:
             raise RuntimeError("ffmpeg executable not found")
         command = [
-            ffmpeg,
+            *ffmpeg_encoder_command_prefix(ffmpeg),
             "-hide_banner",
             "-loglevel",
             "error",
@@ -1891,6 +1936,8 @@ class DepthStreamWriter:
             "-an",
             "-c:v",
             "ffv1",
+            "-threads",
+            str(DEFAULT_FFMPEG_ENCODER_THREADS),
             "-level",
             "3",
             "-g",
@@ -1931,7 +1978,10 @@ class DepthStreamWriter:
                 f"depth frame shape changed from {self.width}x{self.height} "
                 f"to {int(depth.shape[1])}x{int(depth.shape[0])}"
             )
-        data = depth.tobytes(order="C")
+        if depth.dtype != np.uint16 or not depth.flags["C_CONTIGUOUS"]:
+            depth = np.ascontiguousarray(depth, dtype=np.uint16)
+        data = memoryview(depth).cast("B")
+        byte_length = data.nbytes
         frame_index = self.frame_count
         byte_offset = self.byte_count
         if self.encoding == "ffv1":
@@ -1943,13 +1993,13 @@ class DepthStreamWriter:
                 raise RuntimeError("raw depth writer is not open")
             self.handle.write(data)
         self.frame_count += 1
-        self.byte_count += len(data)
+        self.byte_count += byte_length
         return {
             "streamFrameIndex": frame_index,
             "byteOffset": byte_offset if self.encoding == "raw" else None,
-            "byteLength": len(data) if self.encoding == "raw" else None,
+            "byteLength": byte_length if self.encoding == "raw" else None,
             "sourceByteOffset": byte_offset,
-            "sourceByteLength": len(data),
+            "sourceByteLength": byte_length,
         }
 
     def close(self) -> None:
@@ -2058,6 +2108,14 @@ class RobotRealsenseSession:
         self.recording_start_perf_counter: float | None = None
         self.recording_start_unix_seconds: float | None = None
         self.robot_state_perf_stats = OnlineTimeSeriesStats()
+        self.robot_state_target_perf_stats = OnlineTimeSeriesStats()
+        self.robot_state_lateness_stats = OnlineNumericStats()
+        self.robot_state_missed_tick_count = 0
+        self.aligned_sample_perf_stats = OnlineTimeSeriesStats()
+        self.aligned_sample_target_perf_stats = OnlineTimeSeriesStats()
+        self.aligned_sample_lateness_stats = OnlineNumericStats()
+        self.aligned_quest_source_age_stats = OnlineNumericStats()
+        self.aligned_reused_source_count = 0
         self.video_frame_perf_stats_by_role: dict[str, OnlineTimeSeriesStats] = {}
         self.depth_frame_perf_stats_by_role: dict[str, OnlineTimeSeriesStats] = {}
         self.camera_write_duration_stats_by_role: dict[str, OnlineNumericStats] = {}
@@ -2109,7 +2167,6 @@ class RobotRealsenseSession:
         now_perf = time.perf_counter()
         self.text_last_flush_perf = now_perf
         self.video_last_flush_perf = now_perf
-        self.next_async_sample_write_perf = 0.0
         self.robot_alignment_result = robot_alignment_result if isinstance(robot_alignment_result, dict) else None
         self.require_controller_alignment = require_controller_alignment
         self.t_ee_end_camera = self._alignment_transform("end_camera", "T_ee_realsense")
@@ -2381,22 +2438,25 @@ class RobotRealsenseSession:
                 "quest_recording_timestamp_seconds": quest_sample.get("recordingTimestampSeconds"),
             }
 
-        should_write = False
-        now_perf = time.perf_counter()
         with self.lock:
             if self.closed:
                 return row
-            if now_perf >= self.next_async_sample_write_perf or not row.get("ok"):
-                period = 1.0 / max(1.0, ASYNC_QUEST_ALIGNED_SAMPLE_HZ)
-                self.next_async_sample_write_perf = now_perf + period
-                should_write = True
-            if should_write and self.samples_handle is not None:
+            if self.samples_handle is not None:
                 row["written_sample_index"] = self.sample_count
                 self.samples_handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
                 self._note_text_write_locked("samples")
                 self.sample_count += 1
-        if should_write:
-            self._publish(robot_sample_event(row))
+                actual_perf = row.get("pc_perf_counter_seconds")
+                target_perf = row.get("aligned_target_perf_counter_seconds")
+                quest_perf = row.get("quest_pc_receive_perf_counter_seconds")
+                self.aligned_sample_perf_stats.add(actual_perf)
+                self.aligned_sample_target_perf_stats.add(target_perf)
+                self.aligned_sample_lateness_stats.add(row.get("aligned_lateness_seconds"))
+                if is_number(actual_perf) and is_number(quest_perf):
+                    self.aligned_quest_source_age_stats.add(max(0.0, float(actual_perf) - float(quest_perf)))
+                if row.get("aligned_source_reused"):
+                    self.aligned_reused_source_count += 1
+        self._publish(robot_sample_event(row))
         return row
 
     def close(self) -> dict[str, Any]:
@@ -2625,9 +2685,53 @@ class RobotRealsenseSession:
                 "videoFramesWritten": written,
                 "depthFramesWritten": int(depth_stats.count),
             }
+        robot_state_summary = self.robot_state_perf_stats.summary(float(self.config.robot_state_hz))
+        robot_state_target_summary = self.robot_state_target_perf_stats.summary(float(self.config.robot_state_hz))
+        aligned_sample_summary = self.aligned_sample_perf_stats.summary(ASYNC_QUEST_ALIGNED_SAMPLE_HZ)
+        aligned_target_summary = self.aligned_sample_target_perf_stats.summary(ASYNC_QUEST_ALIGNED_SAMPLE_HZ)
+        robot_quality = time_series_rate_quality(robot_state_summary, float(self.config.robot_state_hz))
+        aligned_quality = time_series_rate_quality(aligned_sample_summary, ASYNC_QUEST_ALIGNED_SAMPLE_HZ)
+        robot_lateness_summary = self.robot_state_lateness_stats.summary()
+        aligned_lateness_summary = self.aligned_sample_lateness_stats.summary()
+        robot_lateness_p95 = robot_lateness_summary.get("p95")
+        aligned_lateness_p95 = aligned_lateness_summary.get("p95")
+        robot_quality["p95LatenessSeconds"] = robot_lateness_p95
+        robot_quality["missedTicks"] = int(self.robot_state_missed_tick_count)
+        robot_quality["ok"] = bool(
+            robot_quality.get("ok")
+            and is_number(robot_lateness_p95)
+            and float(robot_lateness_p95) <= 0.006
+            and self.robot_state_missed_tick_count == 0
+        )
+        aligned_quality["p95LatenessSeconds"] = aligned_lateness_p95
+        aligned_quality["ok"] = bool(
+            aligned_quality.get("ok")
+            and is_number(aligned_lateness_p95)
+            and float(aligned_lateness_p95) <= 0.016
+        )
+        camera_quality = {
+            role: {
+                **time_series_rate_quality(payload.get("video") or {}, target_camera_hz),
+                "queueDrops": int(payload.get("queueDrops") or 0),
+                "queueDropRatio": float(payload.get("queueDropRatio") or 0.0),
+            }
+            for role, payload in cameras.items()
+        }
+        for payload in camera_quality.values():
+            payload["ok"] = bool(payload.get("ok") and int(payload.get("queueDrops") or 0) == 0)
+        quality_checks = [robot_quality, aligned_quality, *camera_quality.values()]
         return {
             "recordingDurationSeconds": elapsed,
-            "robotState": self.robot_state_perf_stats.summary(float(self.config.robot_state_hz)),
+            "robotState": robot_state_summary,
+            "robotStateTargets": robot_state_target_summary,
+            "robotStateLatenessSeconds": robot_lateness_summary,
+            "robotStateMissedTicks": int(self.robot_state_missed_tick_count),
+            "alignedSamples": aligned_sample_summary,
+            "alignedSampleTargets": aligned_target_summary,
+            "alignedSampleLatenessSeconds": aligned_lateness_summary,
+            "alignedQuestSourceAgeSeconds": self.aligned_quest_source_age_stats.summary(),
+            "alignedReusedSourceSamples": int(self.aligned_reused_source_count),
+            "targetAlignedSampleHz": ASYNC_QUEST_ALIGNED_SAMPLE_HZ,
             "cameras": cameras,
             "targetCameraHz": target_camera_hz,
             "recordDepth": bool(self.config.record_depth),
@@ -2635,6 +2739,13 @@ class RobotRealsenseSession:
             "depthStreamEncodings": dict(self.depth_stream_encodings),
             "recordDepthEveryNFrames": depth_every,
             "targetDepthHz": target_depth_hz,
+            "quality": {
+                "ok": bool(quality_checks and all(bool(item.get("ok")) for item in quality_checks)),
+                "robotState": robot_quality,
+                "alignedSamples": aligned_quality,
+                "cameras": camera_quality,
+                "criteria": "effective rate >= 95% of target, p95 gap <= 1.5x target period, robot p95 lateness <= 6ms with zero missed ticks, aligned p95 lateness <= 16ms, and zero camera queue drops",
+            },
         }
 
     def _camera_subscriber_drops_since_start(
@@ -2778,7 +2889,13 @@ class RobotRealsenseSession:
         captured_at = datetime.now(timezone.utc).isoformat()
         pc_perf_counter_seconds = time.perf_counter()
         pc_unix_seconds = time.time()
-        state_row = self.latest_robot_state_row
+        with self.lock:
+            state_row = self.latest_robot_state_row
+            latest_video_frame_rows = {
+                role: dict(frame_row)
+                for role, frame_row in self.latest_video_frame_rows.items()
+                if isinstance(frame_row, dict)
+            }
         if not isinstance(state_row, dict):
             state_row = self._build_robot_state_row(
                 sample_index=self.robot_state_count,
@@ -2789,7 +2906,8 @@ class RobotRealsenseSession:
             )
         videos: dict[str, dict[str, Any]] = {}
         video_frames: dict[str, dict[str, Any]] = {}
-        for role, frame_row in self.latest_video_frame_rows.items():
+        for role, frame_row in latest_video_frame_rows.items():
+            frame_perf = frame_row.get("capturedPerfCounterSeconds")
             videos[role] = {
                 "path": frame_row.get("video"),
                 "frameIndex": frame_row.get("frameIndex"),
@@ -2800,6 +2918,13 @@ class RobotRealsenseSession:
                 "serial": frame_row.get("serial"),
                 "frameIndex": frame_row.get("frameIndex"),
                 "capturedAtUtc": frame_row.get("capturedAtUtc"),
+                "capturedPerfCounterSeconds": frame_perf,
+                "writtenPerfCounterSeconds": frame_row.get("pcPerfCounterSeconds"),
+                "ageSeconds": (
+                    max(0.0, pc_perf_counter_seconds - float(frame_perf))
+                    if is_number(frame_perf)
+                    else None
+                ),
                 "streamSequence": frame_row.get("streamSequence"),
             }
         quest_gaze3d_pc_world = unity_vec3_to_pc(quest_sample.get("gazePoint3DWorld"))
@@ -2816,6 +2941,11 @@ class RobotRealsenseSession:
             "quest_sample_index": quest_sample.get("sampleIndex"),
             "quest_recording_timestamp_seconds": quest_sample.get("recordingTimestampSeconds"),
             "quest_pc_receive_perf_counter_seconds": quest_sample.get("pcReceivePerfCounterSeconds"),
+            "aligned_target_perf_counter_seconds": quest_sample.get("alignedTargetPerfCounterSeconds"),
+            "aligned_actual_perf_counter_seconds": quest_sample.get("alignedActualPerfCounterSeconds"),
+            "aligned_lateness_seconds": quest_sample.get("alignedLatenessSeconds"),
+            "aligned_source_version": quest_sample.get("alignedSourceVersion"),
+            "aligned_source_reused": bool(quest_sample.get("alignedSourceReused")),
             "quest_gaze3d_world": quest_sample.get("gazePoint3DWorld"),
             "quest_gaze3d_pc_world": quest_gaze3d_pc_world,
             "quest_gaze3d_source": quest_sample.get("gazePoint3DSource") or quest_sample.get("gazeSource"),
@@ -2824,6 +2954,11 @@ class RobotRealsenseSession:
             "robot_state_sample_index": state_row.get("sample_index"),
             "robot_state_captured_at": state_row.get("captured_at"),
             "robot_state_pc_perf_counter_seconds": state_row.get("pc_perf_counter_seconds"),
+            "robot_state_age_seconds": (
+                max(0.0, pc_perf_counter_seconds - float(state_row.get("pc_perf_counter_seconds")))
+                if is_number(state_row.get("pc_perf_counter_seconds"))
+                else None
+            ),
             "images": {},
             "videos": videos,
             "videoFrames": video_frames,
@@ -2834,10 +2969,23 @@ class RobotRealsenseSession:
         if stop_event is None:
             return
         period = 1.0 / max(1.0, float(self.config.robot_state_hz))
+        next_target_perf = time.perf_counter()
         while not stop_event.is_set():
+            now_perf = time.perf_counter()
+            if now_perf < next_target_perf and stop_event.wait(next_target_perf - now_perf):
+                return
             started = time.perf_counter()
+            lateness_seconds = max(0.0, started - next_target_perf)
             try:
-                row = self._build_robot_state_row(lightweight=True, derived_transforms=True)
+                row = self._build_robot_state_row(
+                    captured_at=datetime.now(timezone.utc).isoformat(),
+                    pc_perf_counter_seconds=started,
+                    pc_unix_seconds=time.time(),
+                    lightweight=True,
+                    derived_transforms=True,
+                )
+                row["target_perf_counter_seconds"] = next_target_perf
+                row["lateness_seconds"] = lateness_seconds
                 with self.lock:
                     if self.closed or self.robot_states_handle is None:
                         return
@@ -2850,13 +2998,20 @@ class RobotRealsenseSession:
                     self.robot_state_count += 1
                     self.latest_robot_state_row = row
                     self.robot_state_perf_stats.add(row.get("pc_perf_counter_seconds") or time.perf_counter())
+                    self.robot_state_target_perf_stats.add(next_target_perf)
+                    self.robot_state_lateness_stats.add(lateness_seconds)
             except Exception as exc:  # pragma: no cover - hardware path
                 with self.lock:
                     self.robot_state_error_count += 1
                     self.last_robot_state_error = str(exc)
                     self.last_error = str(exc)
-            elapsed = time.perf_counter() - started
-            stop_event.wait(max(0.0, period - elapsed))
+            next_target_perf += period
+            overdue_seconds = time.perf_counter() - next_target_perf
+            if overdue_seconds >= period:
+                missed_ticks = int(overdue_seconds // period)
+                next_target_perf += missed_ticks * period
+                with self.lock:
+                    self.robot_state_missed_tick_count += missed_ticks
 
     def _camera_record_loop(self) -> None:
         stop_event = self.stop_event
@@ -2891,6 +3046,8 @@ class RobotRealsenseSession:
                             "frameIndex": frame_row.get("frame_index"),
                             "video": frame_row.get("video"),
                             "capturedAtUtc": frame.get("capturedAtUtc"),
+                            "capturedPerfCounterSeconds": frame.get("capturedAtPerfCounterSeconds"),
+                            "pcPerfCounterSeconds": frame_row.get("pc_perf_counter_seconds"),
                             "streamSequence": frame.get("sequence"),
                             "depth": frame_row.get("depth"),
                         }
@@ -2928,6 +3085,8 @@ class RobotRealsenseSession:
                         "frameIndex": frame_row.get("frame_index"),
                         "video": frame_row.get("video"),
                         "capturedAtUtc": frame.get("capturedAtUtc"),
+                        "capturedPerfCounterSeconds": frame.get("capturedAtPerfCounterSeconds"),
+                        "pcPerfCounterSeconds": frame_row.get("pc_perf_counter_seconds"),
                         "streamSequence": frame.get("sequence"),
                         "depth": frame_row.get("depth"),
                     }
@@ -3041,17 +3200,18 @@ class RobotRealsenseSession:
             }
         with self.video_io_lock:
             self.video_frame_count += 1
-            self.video_frame_perf_stats_by_role.setdefault(role, OnlineTimeSeriesStats()).add(write_finished_perf)
+            captured_perf = frame.get("capturedAtPerfCounterSeconds")
+            frame_perf = float(captured_perf) if is_number(captured_perf) else write_finished_perf
+            self.video_frame_perf_stats_by_role.setdefault(role, OnlineTimeSeriesStats()).add(frame_perf)
             self.camera_write_duration_stats_by_role.setdefault(role, OnlineNumericStats()).add(
                 float(write_finished_perf - write_started_perf)
             )
-            captured_perf = frame.get("capturedAtPerfCounterSeconds")
             if is_number(captured_perf):
                 self.camera_capture_to_write_latency_stats_by_role.setdefault(role, OnlineNumericStats()).add(
                     float(write_finished_perf - float(captured_perf))
                 )
             if depth_info is not None:
-                self.depth_frame_perf_stats_by_role.setdefault(role, OnlineTimeSeriesStats()).add(write_finished_perf)
+                self.depth_frame_perf_stats_by_role.setdefault(role, OnlineTimeSeriesStats()).add(frame_perf)
             if self.video_frames_handle is not None:
                 self.video_frames_handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
                 self._note_video_write_locked()
@@ -3675,8 +3835,21 @@ class RobotRealsenseSession:
 
 
 class FlexivRealSenseManager:
-    def __init__(self, config: FlexivRealSenseConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: FlexivRealSenseConfig | None = None,
+        *,
+        formal_control_mode: str = ROBOT_SESSION_CONTROL_TELEOP,
+    ) -> None:
         self.config = config or FlexivRealSenseConfig()
+        self.formal_control_mode = (
+            formal_control_mode
+            if formal_control_mode in (ROBOT_SESSION_CONTROL_TELEOP, ROBOT_SESSION_CONTROL_RECORD_ONLY)
+            else ROBOT_SESSION_CONTROL_RECORD_ONLY
+        )
+        self.motion_commands_allowed = self.formal_control_mode != ROBOT_SESSION_CONTROL_RECORD_ONLY
+        if not self.motion_commands_allowed:
+            self.config.controller_motion_enabled = False
         self.robot = FlexivRobotClient()
         self.lock = threading.RLock()
         self.stream_hub = RealSenseStreamHub()
@@ -3697,11 +3870,39 @@ class FlexivRealSenseManager:
             return {
                 "ok": True,
                 "enabled": True,
+                "formalControlMode": self.formal_control_mode,
+                "motionCommandsAllowed": self.motion_commands_allowed,
                 "config": config_to_json(self.config),
                 "robot": robot_status,
                 "activeSession": active,
                 "realsenseStream": self.stream_hub.status(),
                 "lastCalibration": self.last_calibration,
+                "lastError": self.last_error,
+            }
+
+    def safety_status(self) -> dict[str, Any]:
+        with self.lock:
+            robot_status = self.robot.status(include_state=True, include_devices=False)
+            state = robot_status.get("state") if isinstance(robot_status, dict) else None
+            if isinstance(state, dict) and robot_status.get("connected"):
+                state["jointLimitGuard"] = self.robot.joint_limit_guard(
+                    self.config.controller_joint_limit_buffer_rad,
+                    self.config.controller_joint_limit_guard_enabled,
+                )
+            active = None
+            if self.active_session is not None:
+                active = {
+                    "recordId": self.active_session.record_id,
+                    "controlMode": self.active_session.control_mode,
+                    "closed": bool(self.active_session.closed),
+                }
+            return {
+                "ok": True,
+                "enabled": True,
+                "formalControlMode": self.formal_control_mode,
+                "motionCommandsAllowed": self.motion_commands_allowed,
+                "robot": robot_status,
+                "activeSession": active,
                 "lastError": self.last_error,
             }
 
@@ -3894,8 +4095,12 @@ class FlexivRealSenseManager:
                     self.config.gripper_device,
                     init_on_enable=self.config.gripper_init_on_enable,
                 )
-            motion_warmup = self.robot.arm_motion()
-            self.config.controller_motion_enabled = True
+            motion_warmup = None
+            if self.motion_commands_allowed:
+                motion_warmup = self.robot.arm_motion()
+                self.config.controller_motion_enabled = True
+            else:
+                self.config.controller_motion_enabled = False
             warmup = self.warm_realsense_stream(REALSENSE_CONNECT_WARMUP_SECONDS)
             self.last_error = None
             return {
@@ -3903,6 +4108,8 @@ class FlexivRealSenseManager:
                 "state": state,
                 "gripperWarmup": gripper_warmup,
                 "motionWarmup": motion_warmup,
+                "formalControlMode": self.formal_control_mode,
+                "motionCommandsAllowed": self.motion_commands_allowed,
                 "realsenseWarmup": warmup,
                 "status": self.status(),
             }
@@ -3916,6 +4123,8 @@ class FlexivRealSenseManager:
         return self.status()
 
     def arm_motion(self) -> dict[str, Any]:
+        if not self.motion_commands_allowed:
+            return self._motion_command_blocked("arm")
         try:
             state = self.robot.arm_motion()
             with self.lock:
@@ -3929,6 +4138,8 @@ class FlexivRealSenseManager:
             return {"ok": False, "error": self.last_error, "status": self.status()}
 
     def disarm_motion(self) -> dict[str, Any]:
+        if not self.motion_commands_allowed:
+            return self._motion_command_blocked("disarm")
         try:
             self.robot.disarm_motion()
             with self.lock:
@@ -3942,6 +4153,8 @@ class FlexivRealSenseManager:
             return {"ok": False, "error": self.last_error, "status": self.status()}
 
     def enable_freedrive(self) -> dict[str, Any]:
+        if not self.motion_commands_allowed:
+            return self._motion_command_blocked("enable_freedrive")
         try:
             state = self.robot.enable_freedrive()
             with self.lock:
@@ -3955,6 +4168,8 @@ class FlexivRealSenseManager:
             return {"ok": False, "error": self.last_error, "status": self.status()}
 
     def disable_freedrive(self) -> dict[str, Any]:
+        if not self.motion_commands_allowed:
+            return self._motion_command_blocked("disable_freedrive")
         try:
             self.robot.disable_freedrive()
             self.config.controller_motion_enabled = False
@@ -3963,6 +4178,18 @@ class FlexivRealSenseManager:
         except Exception as exc:  # pragma: no cover - hardware path
             self.last_error = str(exc)
             return {"ok": False, "error": self.last_error, "status": self.status()}
+
+    def _motion_command_blocked(self, action: str) -> dict[str, Any]:
+        self.config.controller_motion_enabled = False
+        error = f"{action} blocked by {ROBOT_SESSION_CONTROL_RECORD_ONLY} mode"
+        return {
+            "ok": False,
+            "blocked": True,
+            "action": action,
+            "error": error,
+            "formalControlMode": self.formal_control_mode,
+            "status": self.status(),
+        }
 
     def list_cameras(self) -> dict[str, Any]:
         try:
@@ -4113,15 +4340,18 @@ class FlexivRealSenseManager:
     ) -> RobotRealsenseSession | None:
         if control_mode not in ROBOT_SESSION_CONTROL_MODES:
             control_mode = ROBOT_SESSION_CONTROL_TELEOP
+        if not self.motion_commands_allowed:
+            control_mode = ROBOT_SESSION_CONTROL_RECORD_ONLY
         if record_mode not in ROBOT_SESSION_RECORD_MODES:
             record_mode = ROBOT_SESSION_RECORD_SYNC
         with self.lock:
             if self.active_session is not None:
                 previous = self.active_session
                 previous.close()
-                if getattr(previous, "control_mode", ROBOT_SESSION_CONTROL_TELEOP) == ROBOT_SESSION_CONTROL_FREEDRIVE:
+                previous_mode = getattr(previous, "control_mode", ROBOT_SESSION_CONTROL_TELEOP)
+                if self.motion_commands_allowed and previous_mode == ROBOT_SESSION_CONTROL_FREEDRIVE:
                     self.robot.disable_freedrive()
-                else:
+                elif self.motion_commands_allowed and previous_mode == ROBOT_SESSION_CONTROL_TELEOP:
                     self.robot.disarm_motion()
                 self.config.controller_motion_enabled = False
                 self.active_session = None
@@ -4148,8 +4378,6 @@ class FlexivRealSenseManager:
                     self.config.controller_motion_enabled = True
                     stage = "teleop_ready"
                 else:
-                    self.robot.disarm_motion()
-                    self.robot.disable_freedrive()
                     self.config.controller_motion_enabled = False
                     stage = "record_only"
                 self.last_error = None
@@ -4227,16 +4455,20 @@ class FlexivRealSenseManager:
                     "recordDirectory": str(getattr(session, "directory", "")),
                 }
         finally:
-            if getattr(session, "control_mode", ROBOT_SESSION_CONTROL_TELEOP) == ROBOT_SESSION_CONTROL_FREEDRIVE:
+            session_control_mode = getattr(session, "control_mode", ROBOT_SESSION_CONTROL_TELEOP)
+            if self.motion_commands_allowed and session_control_mode == ROBOT_SESSION_CONTROL_FREEDRIVE:
                 try:
                     self.robot.disable_freedrive()
                 except Exception as exc:  # pragma: no cover - hardware path
                     note_close_error("disable_freedrive", exc)
-            try:
-                self.robot.arm_motion()
-                self.config.controller_motion_enabled = True
-            except Exception as exc:  # pragma: no cover - hardware path
-                note_close_error("robot_mode_restore", exc)
+            if self.motion_commands_allowed:
+                try:
+                    self.robot.arm_motion()
+                    self.config.controller_motion_enabled = True
+                except Exception as exc:  # pragma: no cover - hardware path
+                    note_close_error("robot_mode_restore", exc)
+                    self.config.controller_motion_enabled = False
+            else:
                 self.config.controller_motion_enabled = False
             with self.lock:
                 if self.active_session is session:
@@ -5037,11 +5269,20 @@ def transform_pose_span(poses: list[np.ndarray]) -> dict[str, Any]:
 
 def ee_pose_diversity(poses: list[np.ndarray]) -> dict[str, Any]:
     translations = np.asarray([pose[:3, 3] for pose in poses], dtype=float)
+    pairwise_poses = poses
+    if len(poses) > POSE_DIVERSITY_MAX_PAIRWISE_SAMPLES:
+        indices = np.linspace(
+            0,
+            len(poses) - 1,
+            num=POSE_DIVERSITY_MAX_PAIRWISE_SAMPLES,
+            dtype=int,
+        )
+        pairwise_poses = [poses[int(index)] for index in indices]
     max_translation = 0.0
     max_rotation = 0.0
     pair_count = 0
-    for i, a in enumerate(poses):
-        for b in poses[i + 1 :]:
+    for i, a in enumerate(pairwise_poses):
+        for b in pairwise_poses[i + 1 :]:
             pair_count += 1
             delta = invert_transform(a) @ b
             max_translation = max(max_translation, float(np.linalg.norm(delta[:3, 3])))
@@ -5049,7 +5290,10 @@ def ee_pose_diversity(poses: list[np.ndarray]) -> dict[str, Any]:
     axis_span = np.ptp(translations, axis=0) if translations.size else np.zeros(3, dtype=float)
     return {
         "samples": len(poses),
+        "analyzedSamples": len(pairwise_poses),
         "pairCount": pair_count,
+        "totalPairCount": len(poses) * max(0, len(poses) - 1) // 2,
+        "pairwiseDownsampled": len(pairwise_poses) < len(poses),
         "eeTranslationSpanM": float(max_translation),
         "eeRotationSpanDeg": float(max_rotation),
         "eeAxisSpanM": [float(v) for v in axis_span],

@@ -8,7 +8,7 @@ recording, robot/RealSense capture, and replay pages.
 The lab PC currently used for the live receiver is:
 
 ```text
-10.128.0.227
+10.128.1.95
 ```
 
 Remote project root:
@@ -20,13 +20,13 @@ Remote project root:
 Open the live viewer from another PC on the same network:
 
 ```text
-http://10.128.0.227:8765/
+http://10.128.1.95:8765/
 ```
 
 If the browser appears stale after a deployment, add a cache-busting query:
 
 ```text
-http://10.128.0.227:8765/?reload=1
+http://10.128.1.95:8765/?reload=1
 ```
 
 The current lab receiver command is:
@@ -40,7 +40,7 @@ The script stops only existing `quest_pc_receiver.py receive` processes, starts
 the receiver under `nohup`, writes logs to `receiver.log`, and uses the current
 lab defaults: UDP `9100`, viewer `8765`, Flexiv interface `192.168.2.108`,
 end RealSense `244222073667`, third RealSense `750612070265`, robot state
-`60 Hz`, and depth every `3` RGB frames.
+`90 Hz`, and depth every `3` RGB frames.
 
 With `--enable-gripper`, the default gripper device is `auto`: the receiver
 asks the connected Flexiv robot for the Elements device list, prefers online
@@ -79,6 +79,21 @@ Useful receiver options:
 - `--sample-log-interval-seconds <T>` limits the console sample-status print rate during high-frequency runs. Default: `1`.
 - `--udp-receive-buffer-bytes <N>` requests a larger UDP receive buffer for Quest telemetry bursts. The effective value may still be capped by the remote OS socket limits.
 - `--recording-idle-timeout-seconds <T>` closes an active PC recording if its own recording datagrams stop arriving for too long, which helps recover when a `recording_stop` packet is lost.
+- `--formal-control-mode record_only` keeps A-button formal recording in a no-arm-motion mode for safe performance benchmarks. Robot state, cameras, Quest data, and optional gripper handling remain available.
+
+Formal A-button recording rates:
+
+- Flexiv state is sampled on a fixed `90 Hz` deadline into `robot_realsense/robot_states.jsonl`.
+- RealSense RGB is recorded at `30 Hz` per camera role.
+- `robot_realsense/samples.jsonl` is the final fixed `30 Hz` aligned stream for training conversion.
+- `pc_samples.jsonl`, `pc_telemetry_raw.jsonl`, and `pc_controllers.csv` preserve every received formal Quest sample; the fixed 30 Hz training timeline is `robot_realsense/samples.jsonl`.
+
+After recording, enforce the rate and jitter gates:
+
+```bash
+.venv312/bin/python pc/offline_calibration/scripts/quest_pc_receiver.py audit-performance \
+  --pc-session pc/offline_calibration/pc_recordings/<record_id>
+```
 
 ## Install the Quest App
 
@@ -303,6 +318,30 @@ pipeline can show long-tail scheduling gaps at a requested 90 Hz when dual
 RGB-D recording is active. A failed audit means the record is still often
 replayable, but it should not be treated as a healthy high-frequency data
 capture.
+
+To evaluate teleoperation responsiveness, run the latency analysis after a
+formal recording with robot teleop enabled:
+
+```bash
+cd /ssd1/shenyibo/Quest3DataCollector
+.venv312/bin/python pc/offline_calibration/scripts/quest_pc_receiver.py teleop-latency \
+  --pc-session pc/offline_calibration/pc_recordings/<record_id>
+```
+
+The receiver also writes `teleop_latency_analysis.json` automatically at the
+end of each formal recording, and the replay page shows a `Teleop latency`
+panel. The primary metric is `command target -> robot`: it compares
+`robot_realsense/controller_motion.jsonl` target TCP motion against
+`robot_realsense/robot_states.jsonl` TCP motion on the same PC perf-counter
+timeline. Positive lag means the robot follows the command after that delay.
+When target commands are missing, the analyzer falls back to `Quest controller
+-> robot` using right-controller motion in `pc_samples.jsonl`.
+
+Interpret the two displayed numbers differently: `corr lag` is the best
+cross-correlation lag for continuous following, while `event p50/p95` measures
+threshold-crossing motion onset delay. The chart overlays command target speed,
+robot TCP speed, and controller speed. This is a system responsiveness metric,
+not an absolute one-way network latency measurement.
 
 To check receiver performance without wearing the Quest, use the synthetic
 formal-recording probe on the lab machine:

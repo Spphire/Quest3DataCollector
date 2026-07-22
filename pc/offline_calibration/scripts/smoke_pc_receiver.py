@@ -92,8 +92,10 @@ def main() -> int:
         assert summary["samples"] == args.samples, summary
         assert len(samples) == args.samples, (len(samples), summary)
         assert len(raw) == summary["rawMessagesWritten"], (len(raw), summary)
-        assert len(raw) >= 2, (len(raw), summary)
-        assert summary["rawSampleSkips"] > 0, summary
+        assert summary["rawMessagesWritten"] == summary["messages"], summary
+        assert summary["rawSampleSkips"] == 0, summary
+        assert summary["controllerCsvRowsWritten"] == args.samples * 2, summary
+        assert summary["controllerCsvSampleSkips"] == 0, summary
         assert "writerDroppedSampleMessages" in summary, summary
         assert "writerDroppedControlMessages" in summary, summary
         assert "writerEnqueueBackpressureEvents" in summary, summary

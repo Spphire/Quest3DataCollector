@@ -13,10 +13,12 @@ FLEXIV_IFACE="${QUEST3_FLEXIV_NETWORK_INTERFACE:-192.168.2.108}"
 END_CAMERA="${QUEST3_END_REALSENSE_SERIAL:-244222073667}"
 THIRD_CAMERA="${QUEST3_THIRD_REALSENSE_SERIAL:-750612070265}"
 ROBOT_STATE_HZ="${QUEST3_ROBOT_STATE_HZ:-90}"
+FORMAL_CONTROL_MODE="${QUEST3_FORMAL_CONTROL_MODE:-record_only}"
 DEPTH_EVERY="${QUEST3_RECORD_DEPTH_EVERY_N_FRAMES:-3}"
 DEPTH_FORMAT="${QUEST3_RECORD_DEPTH_FORMAT:-ffv1}"
 GRIPPER_DEVICE="${QUEST3_GRIPPER_DEVICE:-Robotiq-2F-85}"
 GRIPPER_FORCE="${QUEST3_GRIPPER_FORCE_N:-40}"
+ENABLE_GRIPPER="${QUEST3_ENABLE_GRIPPER:-0}"
 GRIPPER_INIT_ON_ENABLE="${QUEST3_GRIPPER_INIT_ON_ENABLE:-0}"
 
 usage() {
@@ -38,8 +40,10 @@ Environment overrides:
   QUEST3_END_REALSENSE_SERIAL
   QUEST3_THIRD_REALSENSE_SERIAL
   QUEST3_ROBOT_STATE_HZ
+  QUEST3_FORMAL_CONTROL_MODE
   QUEST3_RECORD_DEPTH_EVERY_N_FRAMES
   QUEST3_RECORD_DEPTH_FORMAT
+  QUEST3_ENABLE_GRIPPER
   QUEST3_GRIPPER_DEVICE
   QUEST3_GRIPPER_FORCE_N
   QUEST3_GRIPPER_INIT_ON_ENABLE
@@ -125,16 +129,23 @@ cmd=(
   --realsense-serial "$END_CAMERA"
   --third-realsense-serial "$THIRD_CAMERA"
   --robot-state-hz "$ROBOT_STATE_HZ"
+  --formal-control-mode "$FORMAL_CONTROL_MODE"
   --record-realsense-depth-every-n-frames "$DEPTH_EVERY"
   --record-realsense-depth-format "$DEPTH_FORMAT"
-  --enable-gripper
-  --gripper-device "$GRIPPER_DEVICE"
-  --gripper-force "$GRIPPER_FORCE"
 )
 
-case "${GRIPPER_INIT_ON_ENABLE,,}" in
+case "${ENABLE_GRIPPER,,}" in
   1|true|yes|on)
-    cmd+=(--gripper-init-on-enable)
+    cmd+=(
+      --enable-gripper
+      --gripper-device "$GRIPPER_DEVICE"
+      --gripper-force "$GRIPPER_FORCE"
+    )
+    case "${GRIPPER_INIT_ON_ENABLE,,}" in
+      1|true|yes|on)
+        cmd+=(--gripper-init-on-enable)
+        ;;
+    esac
     ;;
 esac
 
