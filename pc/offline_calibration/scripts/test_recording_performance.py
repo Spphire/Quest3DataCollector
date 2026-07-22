@@ -31,6 +31,7 @@ from flexiv_realsense_bridge import (
 from bounded_teleop_probe import DelayedRedundantUdpSender
 from quest_pc_receiver import (
     FixedRateLatestSampler,
+    RECORDINGS_REPLAY_HTML,
     build_performance_audit,
     decode_quest_udp_datagram,
     note_quest_udp_wire_datagram,
@@ -60,6 +61,14 @@ class FakeProcess:
 
 
 class RecordingPerformanceTests(unittest.TestCase):
+    def test_replay_layout_keeps_video_before_collapsed_details(self) -> None:
+        camera_index = RECORDINGS_REPLAY_HTML.index('id="cameraStrip"')
+        details_index = RECORDINGS_REPLAY_HTML.index('id="replayDetails"')
+
+        self.assertLess(camera_index, details_index)
+        self.assertIn('id="detailsBtn"', RECORDINGS_REPLAY_HTML)
+        self.assertIn("setReplayDetailsExpanded(false);", RECORDINGS_REPLAY_HTML)
+
     def test_recording_chronology_uses_record_id_instead_of_mtime_or_sample_count(self) -> None:
         records = [
             {"recordId": "record_20260722_190001", "source": "pc", "mtime": 300.0, "samples": 9000},

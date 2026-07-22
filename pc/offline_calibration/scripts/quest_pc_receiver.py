@@ -11501,6 +11501,36 @@ nav, aside {
   padding: 12px;
 }
 nav { border-right: 1px solid var(--line); }
+.replay-pane {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  padding-bottom: 58px;
+}
+.replay-primary { flex: 0 0 auto; }
+.replay-details {
+  display: none;
+  min-height: 0;
+  overflow: auto;
+  margin-top: 12px;
+  padding: 0 5px 20px 0;
+  border-top: 1px solid var(--line);
+}
+.replay-pane.details-open .replay-details {
+  display: block;
+  flex: 1 1 auto;
+}
+.details-toggle {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  z-index: 4;
+  min-width: 92px;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.35);
+}
 .detail-resizer {
   width: 8px;
   border-left: 1px solid var(--line);
@@ -11601,14 +11631,33 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 8px;
-  margin-top: 8px;
+  margin-top: 10px;
+  min-height: 144px;
 }
 .camera-strip a {
   display: grid;
+  grid-template-rows: 120px auto;
   gap: 4px;
+  min-width: 0;
   color: #a8d8ff;
   text-decoration: none;
   font-size: 12px;
+}
+.camera-strip a span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.camera-strip:empty::before {
+  content: "Video frames loading...";
+  grid-column: 1 / -1;
+  display: grid;
+  height: 120px;
+  place-items: center;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #080a0c;
 }
 .camera-strip img,
 .camera-strip video {
@@ -11626,7 +11675,8 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
 @media (max-width: 1050px) {
   #app { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr) auto; }
   .detail-resizer { display: none; }
-  nav, aside { max-height: 34vh; border: 0; border-bottom: 1px solid var(--line); }
+  nav { max-height: 24vh; border: 0; border-bottom: 1px solid var(--line); }
+  aside { height: 46vh; border: 0; border-bottom: 1px solid var(--line); }
   aside { border-top: 1px solid var(--line); }
 }
 </style>
@@ -11645,67 +11695,70 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
   </nav>
   <canvas id="view"></canvas>
   <div id="detailResizer" class="detail-resizer" title="Drag to resize details"></div>
-  <aside>
-    <h1 id="recordTitle">Select a record</h1>
-    <div class="sub" id="recordSub">Drag to orbit, wheel to zoom.</div>
-    <div class="topbar">
-      <button id="playBtn">Play</button>
-      <button id="resetBtn">Reset</button>
-      <span class="pill">pivot origin</span>
-    </div>
-    <div class="topbar">
-      <label class="pill">Gaze
-        <select id="gazeMode">
-          <option value="raw">raw</option>
-          <option value="filtered">median depth</option>
-          <option value="board">board plane</option>
-          <option value="all">all</option>
-        </select>
-      </label>
-    </div>
-    <input id="scrub" class="scrub" type="range" min="0" max="0" value="0" step="1">
-    <div class="row tiny">
-      <span id="timeLabel">0.000s</span>
-      <span id="sampleLabel">sample 0</span>
-      <span id="recordingLabel"></span>
-    </div>
-    <div class="row" style="margin-top:10px">
-      <span class="pill"><span class="dot" style="background:var(--head)"></span>Head</span>
-      <span class="pill"><span class="dot" style="background:var(--eye)"></span>Eyes</span>
-      <span class="pill"><span class="dot" style="background:var(--left)"></span>Left</span>
-      <span class="pill"><span class="dot" style="background:var(--right)"></span>Right</span>
-      <span class="pill"><span class="dot" style="background:var(--gaze)"></span>Gaze3D</span>
-      <span class="pill"><span class="dot" style="background:var(--hit)"></span>Hit</span>
-      <span class="pill"><span class="dot" style="background:var(--robot)"></span>Robot EE</span>
-    </div>
-    <div class="section">
-      <div class="ok">Calibration snapshot</div>
-      <div class="kv" id="snapKv"></div>
-      <div class="artifact-list" id="artifactList"></div>
-    </div>
-    <div class="section">
-      <div class="ok">Gaze depth</div>
-      <div class="kv" id="depthKv"></div>
-    </div>
-    <div class="section">
-      <div class="ok">Robot / RealSense</div>
-      <div class="kv" id="robotKv"></div>
-    </div>
-    <div class="section">
-      <div class="ok">Teleop latency</div>
-      <div class="kv" id="latencyKv"></div>
-      <canvas id="latencyChart" class="latency-chart"></canvas>
-      <div class="latency-legend">
-        <span style="color:#ffd166">target</span>
-        <span style="color:#7dd3fc">robot TCP</span>
-        <span style="color:#c084fc">controller</span>
+  <aside id="replayPane" class="replay-pane">
+    <div class="replay-primary">
+      <h1 id="recordTitle">Select a record</h1>
+      <div class="sub" id="recordSub">Drag to orbit, wheel to zoom.</div>
+      <div class="topbar">
+        <button id="playBtn">Play</button>
+        <button id="resetBtn">Reset</button>
+        <span class="pill">pivot origin</span>
+        <label class="pill">Gaze
+          <select id="gazeMode">
+            <option value="raw">raw</option>
+            <option value="filtered">median depth</option>
+            <option value="board">board plane</option>
+            <option value="all">all</option>
+          </select>
+        </label>
       </div>
-    </div>
-    <div class="section">
-      <div class="ok">Sample</div>
-      <div class="kv" id="sampleKv"></div>
+      <input id="scrub" class="scrub" type="range" min="0" max="0" value="0" step="1">
+      <div class="row tiny">
+        <span id="timeLabel">0.000s</span>
+        <span id="sampleLabel">sample 0</span>
+        <span id="recordingLabel"></span>
+      </div>
       <div class="camera-strip" id="cameraStrip"></div>
     </div>
+    <div id="replayDetails" class="replay-details">
+      <div class="row" style="margin-top:10px">
+        <span class="pill"><span class="dot" style="background:var(--head)"></span>Head</span>
+        <span class="pill"><span class="dot" style="background:var(--eye)"></span>Eyes</span>
+        <span class="pill"><span class="dot" style="background:var(--left)"></span>Left</span>
+        <span class="pill"><span class="dot" style="background:var(--right)"></span>Right</span>
+        <span class="pill"><span class="dot" style="background:var(--gaze)"></span>Gaze3D</span>
+        <span class="pill"><span class="dot" style="background:var(--hit)"></span>Hit</span>
+        <span class="pill"><span class="dot" style="background:var(--robot)"></span>Robot EE</span>
+      </div>
+      <div class="section">
+        <div class="ok">Calibration snapshot</div>
+        <div class="kv" id="snapKv"></div>
+        <div class="artifact-list" id="artifactList"></div>
+      </div>
+      <div class="section">
+        <div class="ok">Gaze depth</div>
+        <div class="kv" id="depthKv"></div>
+      </div>
+      <div class="section">
+        <div class="ok">Robot / RealSense</div>
+        <div class="kv" id="robotKv"></div>
+      </div>
+      <div class="section">
+        <div class="ok">Teleop latency</div>
+        <div class="kv" id="latencyKv"></div>
+        <canvas id="latencyChart" class="latency-chart"></canvas>
+        <div class="latency-legend">
+          <span style="color:#ffd166">target</span>
+          <span style="color:#7dd3fc">robot TCP</span>
+          <span style="color:#c084fc">controller</span>
+        </div>
+      </div>
+      <div class="section">
+        <div class="ok">Sample</div>
+        <div class="kv" id="sampleKv"></div>
+      </div>
+    </div>
+    <button id="detailsBtn" class="details-toggle" type="button" aria-controls="replayDetails" aria-expanded="false">Show details</button>
   </aside>
 </div>
 <script>
@@ -11713,6 +11766,9 @@ const canvas = document.getElementById('view');
 const ctx = canvas.getContext('2d');
 const app = document.getElementById('app');
 const detailResizer = document.getElementById('detailResizer');
+const replayPane = document.getElementById('replayPane');
+const replayDetails = document.getElementById('replayDetails');
+const detailsBtn = document.getElementById('detailsBtn');
 const recordList = document.getElementById('recordList');
 const rootLabel = document.getElementById('rootLabel');
 const search = document.getElementById('search');
@@ -12956,7 +13012,12 @@ function robotPoseRows() {
 
 function robotMediaRows() {
   const rows = state.data?.robotRealSense?.samples;
-  return Array.isArray(rows) ? rows : [];
+  if (!Array.isArray(rows)) return [];
+  return rows.filter(row => {
+    const videos = row?.videos || {};
+    const images = row?.images || {};
+    return Object.values(videos).some(item => item?.url) || Object.values(images).some(item => item?.url);
+  });
 }
 
 function robotFrames(model, jointpose, baseMatrix) {
@@ -13058,6 +13119,20 @@ playBtn.onclick = () => {
   playBtn.textContent = state.playing ? 'Pause' : 'Play';
   syncVisibleReplayVideos(true);
 };
+detailsBtn.onclick = () => {
+  setReplayDetailsExpanded(!replayPane.classList.contains('details-open'));
+};
+
+function setReplayDetailsExpanded(expanded) {
+  replayPane.classList.toggle('details-open', Boolean(expanded));
+  replayDetails.setAttribute('aria-hidden', expanded ? 'false' : 'true');
+  detailsBtn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+  detailsBtn.textContent = expanded ? 'Hide details' : 'Show details';
+  if (expanded) {
+    updateSnapshotInfo();
+    updateLabels(true);
+  }
+}
 resetBtn.onclick = () => {
   resetView();
   markReplayDirty();
@@ -13159,6 +13234,7 @@ function tick(now) {
 }
 
 initDetailResize('questReplayDetailWidth', 300, 760, 340);
+setReplayDetailsExpanded(false);
 resize();
 loadRobotModel();
 loadRecords().catch(error => { rootLabel.textContent = String(error); });
