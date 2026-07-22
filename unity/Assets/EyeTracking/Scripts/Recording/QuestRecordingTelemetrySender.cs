@@ -368,6 +368,18 @@ namespace EyeTracking.Recording
                 }
             }
 
+            telemetry.input = new ControllerInputTelemetry
+            {
+                hasAny = true,
+                indexTrigger = telemetry.indexTrigger,
+                handTrigger = telemetry.handTrigger,
+                indexTriggerPressed = telemetry.indexTriggerPressed,
+                handTriggerPressed = telemetry.handTriggerPressed,
+                aButton = telemetry.aButton,
+                bButton = telemetry.bButton,
+                teleopHeld = telemetry.handTriggerPressed || telemetry.handTrigger >= 0.65f,
+                teleopThreshold = 0.65f
+            };
         }
 
         private void LogSampleStatusIfNeeded(TelemetrySampleMessage message)
@@ -1008,6 +1020,21 @@ namespace EyeTracking.Recording
             public bool handTriggerPressed;
             public bool aButton;
             public bool bButton;
+            public ControllerInputTelemetry input;
+        }
+
+        [Serializable]
+        public sealed class ControllerInputTelemetry
+        {
+            public bool hasAny;
+            public float indexTrigger;
+            public float handTrigger;
+            public bool indexTriggerPressed;
+            public bool handTriggerPressed;
+            public bool aButton;
+            public bool bButton;
+            public bool teleopHeld;
+            public float teleopThreshold;
         }
     }
 }

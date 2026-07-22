@@ -42,6 +42,10 @@ PATTERN_COLS = 11
 PATTERN_ROWS = 8
 SQUARE_SIZE_M = 0.025
 IMAGE_SIZE = (640, 480)
+RED_ANCHOR_RADIUS_GRID_SPACING = 2.0
+RED_ANCHOR_MIN_PIXELS = 16
+RED_ANCHOR_MIN_RATIO = 0.002
+RED_ANCHOR_MIN_BEST_SECOND_RATIO = 1.8
 APPEARANCE_ANCHOR_MIN_CONTRAST = 18.0
 DEFAULT_DIVERSE_DETECTION_FRAMES_PER_SIDE = 220
 DEFAULT_DIVERSE_FIT_FRAMES_PER_SIDE = 180
@@ -90,6 +94,11 @@ class Batch:
     corners: np.ndarray
     camera_positions: np.ndarray
     camera_rotations: Rotation
+    red_anchor_observed_indices: np.ndarray
+    red_anchor_best_scores: np.ndarray
+    red_anchor_score_ratios: np.ndarray
+    red_anchor_target_indices: np.ndarray
+    red_anchor_orders: np.ndarray
     appearance_anchor_observed_indices: np.ndarray
     appearance_anchor_contrasts: np.ndarray
     appearance_anchor_target_indices: np.ndarray
@@ -284,6 +293,20 @@ def main() -> int:
         help=f"Minimum luminance contrast for the checker appearance anchor. Default: {APPEARANCE_ANCHOR_MIN_CONTRAST:g}.",
     )
     parser.add_argument(
+        "--disable-red-anchor",
+        action="store_true",
+        help="Disable red-near-corner anchor detection for resolving 180-degree checkerboard ambiguity.",
+    )
+    parser.add_argument(
+        "--red-anchor-target-index",
+        type=int,
+        default=None,
+        help=(
+            "Optional physical red-corner target index. Default: auto, choose the smaller index from the detected "
+            "180-degree corner pair, e.g. 0 for 0/87 or 10 for 10/77."
+        ),
+    )
+    parser.add_argument(
         "--disable-diverse-frame-selection",
         action="store_true",
         help="Use every recorded frame instead of pose-diverse frame selection.",
@@ -381,6 +404,9 @@ def main() -> int:
         emit_progress("loading_detections", 0.55, records=records)
         detection_summary = read_existing_detection_summary(records, detections_root, output_root)
 
+    red_anchor_global = infer_global_red_anchor(records, detections_root, args)
+    setattr(args, "resolved_red_anchor_target_index", red_anchor_global.get("target_index"))
+    setattr(args, "red_anchor_global_summary", red_anchor_global)
     emit_progress("fitting", 0.65, records=records)
     try:
         result = fit_per_record(records, raw_root, detections_root, args)
@@ -413,6 +439,7 @@ def main() -> int:
     result["pattern"] = [args.pattern_cols, args.pattern_rows]
     result["square_size_m"] = args.square_size
     result["detection_summary"] = detection_summary
+    result["red_anchor_global"] = red_anchor_global
     result["coordinate_frame"] = PC_WORLD_FRAME
     result["raw_trajectory_frame"] = PC_WORLD_FRAME
     result["source_trajectory_frame"] = UNITY_WORLD_FRAME
@@ -449,18 +476,8 @@ def emit_progress(stage: str, progress: float, **extra: Any) -> None:
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(row, dict):
-                rows.append(row)
-    return rows
+        return [json.loads(line) for line in handle if line.strip()]
 
 
 def resolve_requested_image_y_axis(records: list[str], raw_root: Path, requested_axis: str) -> str:
@@ -530,6 +547,110 @@ def checkerboard_corner_indices(cols: int, rows: int) -> list[int]:
     return [0, cols - 1, (rows - 1) * cols, rows * cols - 1]
 
 
+def red_anchor_order_for_observed(observed_index: int, target_index: int, order_180: np.ndarray) -> str | None:
+    if observed_index < 0 or target_index < 0:
+        return None
+    if int(observed_index) == int(target_index):
+        return "identity"
+    if int(order_180[int(observed_index)]) == int(target_index):
+        return "rot180"
+    return None
+
+
+def red_anchor_target_index_for_observed(observed_index: int, args: argparse.Namespace, order_180: np.ndarray) -> int | None:
+    total = args.pattern_cols * args.pattern_rows
+    if observed_index < 0 or observed_index >= total:
+        return None
+    configured = getattr(args, "resolved_red_anchor_target_index", None)
+    if configured is None:
+        configured = getattr(args, "red_anchor_target_index", None)
+    if configured is not None:
+        target = int(configured)
+        return target if 0 <= target < total else None
+    paired = int(order_180[int(observed_index)])
+    return int(min(int(observed_index), paired))
+
+
+def infer_global_red_anchor(records: list[str], detections_root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    order_180 = rot180_index(args)
+    total = args.pattern_cols * args.pattern_rows
+    configured = getattr(args, "red_anchor_target_index", None)
+    if getattr(args, "disable_red_anchor", False):
+        return {"enabled": False, "target_index": None, "source": "disabled", "ok_frames": 0, "counts": {}}
+    if configured is not None:
+        target = int(configured)
+        return {
+            "enabled": True,
+            "target_index": target if 0 <= target < total else None,
+            "source": "configured",
+            "ok_frames": 0,
+            "counts": {},
+        }
+    counts: dict[int, int] = {}
+    observed_counts: dict[int, int] = {}
+    score_sum: dict[int, float] = {}
+    for record in records:
+        for side in ("left", "right"):
+            path = detections_root / f"{record}_{side}_checkerboard_25mm.npz"
+            if not path.exists():
+                continue
+            det = dict(np.load(path, allow_pickle=True))
+            ok_values = np.asarray(det.get("red_anchor_ok", []), dtype=bool)
+            observed_values = np.asarray(det.get("red_anchor_observed_indices", []), dtype=int)
+            best_scores = np.asarray(det.get("red_anchor_best_scores", []), dtype=float)
+            for i, ok in enumerate(ok_values):
+                if not bool(ok) or i >= len(observed_values):
+                    continue
+                observed = int(observed_values[i])
+                if observed < 0 or observed >= total:
+                    continue
+                target = int(min(observed, int(order_180[observed])))
+                counts[target] = counts.get(target, 0) + 1
+                observed_counts[observed] = observed_counts.get(observed, 0) + 1
+                score_sum[target] = score_sum.get(target, 0.0) + (float(best_scores[i]) if i < len(best_scores) else 0.0)
+    if not counts:
+        return {
+            "enabled": True,
+            "target_index": None,
+            "source": "none_detected",
+            "ok_frames": 0,
+            "counts": {},
+            "observed_counts": {},
+        }
+    target = max(counts, key=lambda idx: (counts[idx], score_sum.get(idx, 0.0)))
+    return {
+        "enabled": True,
+        "target_index": int(target),
+        "source": "auto_from_any_reliable_red_anchor",
+        "ok_frames": int(sum(counts.values())),
+        "counts": {str(key): int(value) for key, value in sorted(counts.items())},
+        "observed_counts": {str(key): int(value) for key, value in sorted(observed_counts.items())},
+        "score_sum": {str(key): float(value) for key, value in sorted(score_sum.items())},
+        "note": "Red anchor is a global optional orientation hint; frames without red fall back to identity/rot180 reprojection matching.",
+    }
+
+
+def detection_red_anchor_order(det: dict[str, Any], det_index: int, args: argparse.Namespace, order_180: np.ndarray) -> tuple[str | None, int | None, int | None, float, float]:
+    if getattr(args, "disable_red_anchor", False):
+        return None, None, None, 0.0, 0.0
+    ok_values = det.get("red_anchor_ok")
+    observed_values = det.get("red_anchor_observed_indices")
+    if ok_values is None or observed_values is None or det_index >= len(observed_values):
+        return None, None, None, 0.0, 0.0
+    if not bool(np.asarray(ok_values)[det_index]):
+        return None, None, None, 0.0, 0.0
+    observed = int(np.asarray(observed_values, dtype=int)[det_index])
+    target = red_anchor_target_index_for_observed(observed, args, order_180)
+    if target is None:
+        return None, observed, None, 0.0, 0.0
+    order = red_anchor_order_for_observed(observed, target, order_180)
+    best_scores = det.get("red_anchor_best_scores")
+    ratios = det.get("red_anchor_score_ratios")
+    best_score = float(np.asarray(best_scores, dtype=float)[det_index]) if best_scores is not None and det_index < len(best_scores) else 0.0
+    ratio = float(np.asarray(ratios, dtype=float)[det_index]) if ratios is not None and det_index < len(ratios) else 0.0
+    return order, observed, target, best_score, ratio
+
+
 def detection_appearance_anchor_order(det: dict[str, Any], det_index: int, args: argparse.Namespace) -> tuple[str | None, int | None, int | None, float]:
     if getattr(args, "disable_appearance_anchor", False):
         return None, None, None, 0.0
@@ -558,9 +679,13 @@ def detection_corner_order(
     order_180: np.ndarray,
 ) -> tuple[str | None, str, dict[str, Any]]:
     appearance_order, app_observed, app_target, app_contrast = detection_appearance_anchor_order(det, det_index, args)
+    red_order, red_observed, red_target, red_score, red_ratio = detection_red_anchor_order(det, det_index, args, order_180)
     if appearance_order in ("identity", "rot180"):
         order = appearance_order
         source = "appearance_anchor"
+    elif red_order in ("identity", "rot180"):
+        order = red_order
+        source = "red_anchor"
     else:
         order = None
         source = ""
@@ -569,6 +694,97 @@ def detection_corner_order(
         "appearance_observed": int(app_observed) if app_observed is not None else -1,
         "appearance_target": int(app_target) if app_target is not None else -1,
         "appearance_contrast": float(app_contrast),
+        "red_order": red_order or "",
+        "red_observed": int(red_observed) if red_observed is not None else -1,
+        "red_target": int(red_target) if red_target is not None else -1,
+        "red_best_score": float(red_score),
+        "red_score_ratio": float(red_ratio),
+    }
+
+
+def corner_grid_spacing_px(corners: np.ndarray, cols: int, rows: int) -> float:
+    points = np.asarray(corners, dtype=float).reshape(rows, cols, 2)
+    diffs: list[np.ndarray] = []
+    if cols >= 2:
+        diffs.append(np.linalg.norm(np.diff(points, axis=1), axis=2).reshape(-1))
+    if rows >= 2:
+        diffs.append(np.linalg.norm(np.diff(points, axis=0), axis=2).reshape(-1))
+    if not diffs:
+        return 12.0
+    values = np.concatenate(diffs)
+    values = values[np.isfinite(values) & (values > 1.0)]
+    return float(np.median(values)) if values.size else 12.0
+
+
+def red_mask_bgr(image: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    hsv_mask = (((h <= 10) | (h >= 170)) & (s >= 70) & (v >= 45))
+    b, g, r = cv2.split(image)
+    rgb_mask = (r >= 80) & (r.astype(np.float32) >= 1.25 * g.astype(np.float32)) & (r.astype(np.float32) >= 1.25 * b.astype(np.float32))
+    return (hsv_mask | rgb_mask).astype(np.uint8)
+
+
+def detect_red_corner_anchor(image: np.ndarray, corners: np.ndarray, cols: int, rows: int) -> dict[str, Any]:
+    points = np.asarray(corners, dtype=float).reshape(-1, 2)
+    corner_indices = checkerboard_corner_indices(cols, rows)
+    spacing = corner_grid_spacing_px(points, cols, rows)
+    radius = max(8.0, RED_ANCHOR_RADIUS_GRID_SPACING * spacing)
+    radius = min(radius, 0.35 * float(min(image.shape[:2])))
+    mask = red_mask_bgr(image)
+    height, width = mask.shape[:2]
+    scores: dict[str, float] = {}
+    red_pixels: dict[str, int] = {}
+    areas: dict[str, int] = {}
+    centers: dict[str, list[float]] = {}
+    for index in corner_indices:
+        x, y = points[index]
+        centers[str(index)] = [float(x), float(y)]
+        x0 = max(0, int(np.floor(x - radius)))
+        x1 = min(width, int(np.ceil(x + radius + 1)))
+        y0 = max(0, int(np.floor(y - radius)))
+        y1 = min(height, int(np.ceil(y + radius + 1)))
+        if x0 >= x1 or y0 >= y1:
+            scores[str(index)] = 0.0
+            red_pixels[str(index)] = 0
+            areas[str(index)] = 0
+            continue
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        circle = (xx - x) * (xx - x) + (yy - y) * (yy - y) <= radius * radius
+        roi = mask[y0:y1, x0:x1]
+        area = int(np.count_nonzero(circle))
+        count = int(np.count_nonzero(roi[circle]))
+        scores[str(index)] = float(count / max(1, area))
+        red_pixels[str(index)] = count
+        areas[str(index)] = area
+    ranked = sorted(corner_indices, key=lambda idx: (scores[str(idx)], red_pixels[str(idx)]), reverse=True)
+    best = ranked[0]
+    second = ranked[1] if len(ranked) > 1 else best
+    best_score = float(scores[str(best)])
+    second_score = float(scores[str(second)]) if second != best else 0.0
+    score_ratio = float(best_score / max(second_score, 1e-9))
+    ok = (
+        red_pixels[str(best)] >= RED_ANCHOR_MIN_PIXELS
+        and best_score >= RED_ANCHOR_MIN_RATIO
+        and score_ratio >= RED_ANCHOR_MIN_BEST_SECOND_RATIO
+    )
+    reason = "ok" if ok else "weak_or_ambiguous_red_corner"
+    return {
+        "ok": bool(ok),
+        "observedIndex": int(best) if ok else -1,
+        "bestIndex": int(best),
+        "secondIndex": int(second),
+        "bestScore": best_score,
+        "secondScore": second_score,
+        "scoreRatio": score_ratio,
+        "redPixels": red_pixels,
+        "areas": areas,
+        "scoresByCorner": scores,
+        "centersByCorner": centers,
+        "radiusPx": float(radius),
+        "gridSpacingPx": float(spacing),
+        "cornerIndices": [int(v) for v in corner_indices],
+        "reason": reason,
     }
 
 
@@ -630,6 +846,17 @@ def scan_video(record_dir: Path, side: str, metadata: dict[str, Any], out_dir: P
     tvecs: list[np.ndarray] = []
     reproj_errors: list[float] = []
     methods: list[str] = []
+    red_anchor_ok: list[bool] = []
+    red_anchor_observed_indices: list[int] = []
+    red_anchor_best_indices: list[int] = []
+    red_anchor_second_indices: list[int] = []
+    red_anchor_best_scores: list[float] = []
+    red_anchor_second_scores: list[float] = []
+    red_anchor_score_ratios: list[float] = []
+    red_anchor_radius_px: list[float] = []
+    red_anchor_grid_spacing_px: list[float] = []
+    red_anchor_scores_by_corner: list[np.ndarray] = []
+    red_anchor_red_pixels_by_corner: list[np.ndarray] = []
     appearance_anchor_ok: list[bool] = []
     appearance_anchor_observed_indices: list[int] = []
     appearance_anchor_target_indices: list[int] = []
@@ -638,7 +865,7 @@ def scan_video(record_dir: Path, side: str, metadata: dict[str, Any], out_dir: P
     appearance_anchor_luminance_by_corner: list[np.ndarray] = []
     best_payload = None
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    corner_indices = checkerboard_corner_indices(args.pattern_cols, args.pattern_rows)
+    red_corner_indices = checkerboard_corner_indices(args.pattern_cols, args.pattern_rows)
 
     frame_index = 0
     while True:
@@ -650,6 +877,11 @@ def scan_video(record_dir: Path, side: str, metadata: dict[str, Any], out_dir: P
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             found, corners, method = detect_corners(gray, pattern)
             if found and corners is not None:
+                red_anchor = (
+                    detect_red_corner_anchor(frame, corners, args.pattern_cols, args.pattern_rows)
+                    if not args.disable_red_anchor
+                    else {"ok": False, "observedIndex": -1, "reason": "disabled"}
+                )
                 appearance_anchor = (
                     detect_checkerboard_appearance_anchor(
                         frame,
@@ -670,6 +902,19 @@ def scan_video(record_dir: Path, side: str, metadata: dict[str, Any], out_dir: P
                 tvecs.append(tvec)
                 reproj_errors.append(reproj)
                 methods.append(method)
+                red_anchor_ok.append(bool(red_anchor.get("ok")))
+                red_anchor_observed_indices.append(int(red_anchor.get("observedIndex", -1)))
+                red_anchor_best_indices.append(int(red_anchor.get("bestIndex", -1)))
+                red_anchor_second_indices.append(int(red_anchor.get("secondIndex", -1)))
+                red_anchor_best_scores.append(float(red_anchor.get("bestScore", 0.0)))
+                red_anchor_second_scores.append(float(red_anchor.get("secondScore", 0.0)))
+                red_anchor_score_ratios.append(float(red_anchor.get("scoreRatio", 0.0)))
+                red_anchor_radius_px.append(float(red_anchor.get("radiusPx", 0.0)))
+                red_anchor_grid_spacing_px.append(float(red_anchor.get("gridSpacingPx", 0.0)))
+                scores = red_anchor.get("scoresByCorner") if isinstance(red_anchor.get("scoresByCorner"), dict) else {}
+                pixels = red_anchor.get("redPixels") if isinstance(red_anchor.get("redPixels"), dict) else {}
+                red_anchor_scores_by_corner.append(np.asarray([float(scores.get(str(idx), 0.0)) for idx in red_corner_indices], dtype=np.float64))
+                red_anchor_red_pixels_by_corner.append(np.asarray([int(pixels.get(str(idx), 0)) for idx in red_corner_indices], dtype=np.int32))
                 appearance_anchor_ok.append(bool(appearance_anchor.get("ok")))
                 appearance_anchor_observed_indices.append(int(appearance_anchor.get("observedIndex", -1)))
                 appearance_anchor_target_indices.append(int(appearance_anchor.get("targetIndex", -1)))
@@ -677,7 +922,7 @@ def scan_video(record_dir: Path, side: str, metadata: dict[str, Any], out_dir: P
                 appearance_anchor_contrasts.append(float(appearance_anchor.get("contrast", 0.0)))
                 luminance = appearance_anchor.get("luminanceByCorner") if isinstance(appearance_anchor.get("luminanceByCorner"), dict) else {}
                 appearance_anchor_luminance_by_corner.append(
-                    np.asarray([float(luminance.get(str(idx), np.nan)) for idx in corner_indices], dtype=np.float64)
+                    np.asarray([float(luminance.get(str(idx), np.nan)) for idx in red_corner_indices], dtype=np.float64)
                 )
                 if best_payload is None or reproj < best_payload["reproj"]:
                     best_payload = {
@@ -687,6 +932,7 @@ def scan_video(record_dir: Path, side: str, metadata: dict[str, Any], out_dir: P
                         "rvec": rvec,
                         "tvec": tvec,
                         "reproj": reproj,
+                        "red_anchor": red_anchor,
                         "appearance_anchor": appearance_anchor,
                     }
         frame_index += 1
@@ -705,6 +951,18 @@ def scan_video(record_dir: Path, side: str, metadata: dict[str, Any], out_dir: P
         tvecs=np.asarray(tvecs, dtype=np.float64),
         reproj_errors=np.asarray(reproj_errors, dtype=np.float64),
         methods=np.asarray(methods),
+        red_anchor_corner_indices=np.asarray(red_corner_indices, dtype=np.int32),
+        red_anchor_ok=np.asarray(red_anchor_ok, dtype=np.bool_),
+        red_anchor_observed_indices=np.asarray(red_anchor_observed_indices, dtype=np.int32),
+        red_anchor_best_indices=np.asarray(red_anchor_best_indices, dtype=np.int32),
+        red_anchor_second_indices=np.asarray(red_anchor_second_indices, dtype=np.int32),
+        red_anchor_best_scores=np.asarray(red_anchor_best_scores, dtype=np.float64),
+        red_anchor_second_scores=np.asarray(red_anchor_second_scores, dtype=np.float64),
+        red_anchor_score_ratios=np.asarray(red_anchor_score_ratios, dtype=np.float64),
+        red_anchor_radius_px=np.asarray(red_anchor_radius_px, dtype=np.float64),
+        red_anchor_grid_spacing_px=np.asarray(red_anchor_grid_spacing_px, dtype=np.float64),
+        red_anchor_scores_by_corner=np.asarray(red_anchor_scores_by_corner, dtype=np.float64),
+        red_anchor_red_pixels_by_corner=np.asarray(red_anchor_red_pixels_by_corner, dtype=np.int32),
         appearance_anchor_ok=np.asarray(appearance_anchor_ok, dtype=np.bool_),
         appearance_anchor_observed_indices=np.asarray(appearance_anchor_observed_indices, dtype=np.int32),
         appearance_anchor_target_indices=np.asarray(appearance_anchor_target_indices, dtype=np.int32),
@@ -724,6 +982,7 @@ def scan_video(record_dir: Path, side: str, metadata: dict[str, Any], out_dir: P
             best_payload["tvec"],
             k,
             pattern,
+            best_payload.get("red_anchor"),
             best_payload.get("appearance_anchor"),
         )
         label = f"{record_dir.name} {side} 25mm frame {best_payload['frame_index']} err {best_payload['reproj']:.2f}px"
@@ -732,11 +991,17 @@ def scan_video(record_dir: Path, side: str, metadata: dict[str, Any], out_dir: P
         cv2.imwrite(str(overlay_path), overlay)
 
     reproj = np.asarray(reproj_errors, dtype=float)
+    anchor_ok_arr = np.asarray(red_anchor_ok, dtype=bool)
+    observed_arr = np.asarray(red_anchor_observed_indices, dtype=int)
     appearance_ok_arr = np.asarray(appearance_anchor_ok, dtype=bool)
     appearance_observed_arr = np.asarray(appearance_anchor_observed_indices, dtype=int)
+    anchor_counts = {
+        str(index): int(np.sum((observed_arr == int(index)) & anchor_ok_arr))
+        for index in red_corner_indices
+    }
     appearance_counts = {
         str(index): int(np.sum((appearance_observed_arr == int(index)) & appearance_ok_arr))
-        for index in corner_indices
+        for index in red_corner_indices
     }
     return {
         "record": record_dir.name,
@@ -749,17 +1014,41 @@ def scan_video(record_dir: Path, side: str, metadata: dict[str, Any], out_dir: P
         "last_detection_frame": int(frame_indices[-1]) if frame_indices else None,
         "reprojection_error_px": stats(reproj),
         "diverse_frame_selection": selection_summary,
+        "red_anchor": {
+            "enabled": not args.disable_red_anchor,
+            "ok_count": int(np.sum(anchor_ok_arr)),
+            "ok_ratio": float(np.mean(anchor_ok_arr)) if len(anchor_ok_arr) else 0.0,
+            "observed_index_counts": anchor_counts,
+            "corner_indices": [int(v) for v in red_corner_indices],
+        },
         "appearance_anchor": {
             "enabled": not args.disable_appearance_anchor,
             "ok_count": int(np.sum(appearance_ok_arr)),
             "ok_ratio": float(np.mean(appearance_ok_arr)) if len(appearance_ok_arr) else 0.0,
             "observed_index_counts": appearance_counts,
-            "corner_indices": [int(v) for v in corner_indices],
+            "corner_indices": [int(v) for v in red_corner_indices],
             "min_contrast": float(args.appearance_anchor_min_contrast),
         },
         "npz": display_path(npz_path),
         "best_overlay": display_path(overlay_path) if overlay_path else None,
     }
+
+
+def draw_red_anchor_overlay(out: np.ndarray, corners: np.ndarray, anchor: dict[str, Any] | None, cols: int, rows: int) -> None:
+    if not anchor:
+        return
+    points = np.asarray(corners, dtype=float).reshape(-1, 2)
+    radius = int(round(float(anchor.get("radiusPx") or 0.0)))
+    scores = anchor.get("scoresByCorner") if isinstance(anchor.get("scoresByCorner"), dict) else {}
+    observed = int(anchor.get("observedIndex", -1))
+    best = int(anchor.get("bestIndex", -1))
+    for index in checkerboard_corner_indices(cols, rows):
+        x, y = points[index]
+        color = (0, 0, 255) if index == observed else ((0, 180, 255) if index == best else (200, 200, 200))
+        if radius > 0:
+            cv2.circle(out, (int(round(x)), int(round(y))), radius, color, 2, cv2.LINE_AA)
+        label = f"{index}:{float(scores.get(str(index), 0.0)):.3f}"
+        cv2.putText(out, label, (int(round(x)) + 6, int(round(y)) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
 
 def draw_overlay(
@@ -769,10 +1058,12 @@ def draw_overlay(
     tvec: np.ndarray,
     k: np.ndarray,
     pattern: tuple[int, int],
+    red_anchor: dict[str, Any] | None = None,
     appearance_anchor: dict[str, Any] | None = None,
 ) -> np.ndarray:
     out = frame.copy()
     cv2.drawChessboardCorners(out, pattern, corners.reshape(-1, 1, 2).astype(np.float32), True)
+    draw_red_anchor_overlay(out, corners, red_anchor, pattern[0], pattern[1])
     draw_checkerboard_appearance_anchor_overlay(out, corners, appearance_anchor, pattern[0], pattern[1])
     axis = np.float32([[0, 0, 0], [0.20, 0, 0], [0, 0.15, 0], [0, 0, 0.15]])
     pts, _ = cv2.projectPoints(axis, rvec, tvec, k, np.zeros(5))
@@ -825,6 +1116,7 @@ def write_detection_summaries(rows: list[dict[str, Any]], output_root: Path) -> 
         "first_detection_frame",
         "last_detection_frame",
         "appearance_anchor",
+        "red_anchor",
         "npz",
         "best_overlay",
     ]
@@ -876,6 +1168,11 @@ def build_batches(
             if len(idx) == 0:
                 continue
             corners = np.asarray(det["corners"], dtype=float)[idx].copy()
+            anchor_observed: list[int] = []
+            anchor_best_scores: list[float] = []
+            anchor_score_ratios: list[float] = []
+            anchor_targets: list[int] = []
+            anchor_orders: list[str] = []
             appearance_observed: list[int] = []
             appearance_contrasts: list[float] = []
             appearance_targets: list[int] = []
@@ -887,6 +1184,11 @@ def build_batches(
                 order = corrected_orders.get(key) if corrected_orders is not None and key in corrected_orders else anchor_order
                 if order == "rot180":
                     corners[local_i] = corners[local_i, order_180, :]
+                anchor_observed.append(int(anchor_meta["red_observed"]))
+                anchor_best_scores.append(float(anchor_meta["red_best_score"]))
+                anchor_score_ratios.append(float(anchor_meta["red_score_ratio"]))
+                anchor_targets.append(int(anchor_meta["red_target"]))
+                anchor_orders.append(str(anchor_meta["red_order"]))
                 appearance_observed.append(int(anchor_meta["appearance_observed"]))
                 appearance_contrasts.append(float(anchor_meta["appearance_contrast"]))
                 appearance_targets.append(int(anchor_meta["appearance_target"]))
@@ -900,6 +1202,11 @@ def build_batches(
                     corners=corners,
                     camera_positions=cam_pos,
                     camera_rotations=cam_rot,
+                    red_anchor_observed_indices=np.asarray(anchor_observed, dtype=np.int32),
+                    red_anchor_best_scores=np.asarray(anchor_best_scores, dtype=np.float64),
+                    red_anchor_score_ratios=np.asarray(anchor_score_ratios, dtype=np.float64),
+                    red_anchor_target_indices=np.asarray(anchor_targets, dtype=np.int32),
+                    red_anchor_orders=np.asarray(anchor_orders, dtype=object),
                     appearance_anchor_observed_indices=np.asarray(appearance_observed, dtype=np.int32),
                     appearance_anchor_contrasts=np.asarray(appearance_contrasts, dtype=np.float64),
                     appearance_anchor_target_indices=np.asarray(appearance_targets, dtype=np.int32),
@@ -961,6 +1268,11 @@ def apply_diverse_batch_selection(batches: list[Batch], args: argparse.Namespace
                 corners=batch.corners[idx],
                 camera_positions=batch.camera_positions[idx],
                 camera_rotations=batch.camera_rotations[idx],
+                red_anchor_observed_indices=batch.red_anchor_observed_indices[idx],
+                red_anchor_best_scores=batch.red_anchor_best_scores[idx],
+                red_anchor_score_ratios=batch.red_anchor_score_ratios[idx],
+                red_anchor_target_indices=batch.red_anchor_target_indices[idx],
+                red_anchor_orders=batch.red_anchor_orders[idx],
                 appearance_anchor_observed_indices=batch.appearance_anchor_observed_indices[idx],
                 appearance_anchor_contrasts=batch.appearance_anchor_contrasts[idx],
                 appearance_anchor_target_indices=batch.appearance_anchor_target_indices[idx],
@@ -1591,13 +1903,25 @@ def _fit_per_record_fixed_y_axis(records: list[str], raw_root: Path, detections_
         "left_radial_k1k2": parsed["left_dist"].tolist(),
         "right_radial_k1k2": parsed["right_dist"].tolist(),
         "corner_order_policy": (
-            "per-frame prefer checker black/white appearance anchor, then lower median reprojection error "
-            "to resolve identity vs rot180; discard weak frames; refit"
+            "per-frame prefer checker black/white appearance anchor, then optional red-near-corner anchor, "
+            "then lower median reprojection error to resolve identity vs rot180; discard weak frames; refit"
         ),
         "appearance_anchor_policy": {
             "enabled": not getattr(args, "disable_appearance_anchor", False),
             "min_contrast": float(getattr(args, "appearance_anchor_min_contrast", APPEARANCE_ANCHOR_MIN_CONTRAST)),
             "frame_requirement": "optional per frame; samples the inner square near the four corner inner-corners and uses black/white appearance to orient the 180-degree pair",
+        },
+        "red_anchor_policy": {
+            "enabled": not getattr(args, "disable_red_anchor", False),
+            "target_index": getattr(args, "red_anchor_target_index", None),
+            "resolved_target_index": getattr(args, "resolved_red_anchor_target_index", None),
+            "auto_target": getattr(args, "red_anchor_target_index", None) is None,
+            "global_summary": getattr(args, "red_anchor_global_summary", None),
+            "frame_requirement": "optional; any reliable red anchor frame can orient the global 180-degree pair, and frames without red fall back to reprojection/trajectory matching",
+            "radius_grid_spacing": RED_ANCHOR_RADIUS_GRID_SPACING,
+            "min_pixels": RED_ANCHOR_MIN_PIXELS,
+            "min_ratio": RED_ANCHOR_MIN_RATIO,
+            "min_best_second_ratio": RED_ANCHOR_MIN_BEST_SECOND_RATIO,
         },
         "order_summary": final_order_summary,
         "diverse_frame_selection": {
@@ -1649,9 +1973,13 @@ def classify_frame_orders(
         for local_i, (frame_index, time_s, e_i, e_r) in enumerate(zip(batch.frame_indices, batch.times, med_identity, med_rot180)):
             reproj_order = "rot180" if e_r < e_i else "identity"
             appearance_order = str(batch.appearance_anchor_orders[local_i]) if local_i < len(batch.appearance_anchor_orders) else ""
+            anchor_order = str(batch.red_anchor_orders[local_i]) if local_i < len(batch.red_anchor_orders) else ""
             if appearance_order in ("identity", "rot180"):
                 order_source = "appearance_anchor"
                 order = appearance_order
+            elif anchor_order in ("identity", "rot180"):
+                order_source = "red_anchor"
+                order = anchor_order
             else:
                 order_source = "reprojection"
                 order = reproj_order
@@ -1671,6 +1999,10 @@ def classify_frame_orders(
                     "appearance_anchor_observed_index": int(batch.appearance_anchor_observed_indices[local_i]) if local_i < len(batch.appearance_anchor_observed_indices) else -1,
                     "appearance_anchor_target_index": int(batch.appearance_anchor_target_indices[local_i]) if local_i < len(batch.appearance_anchor_target_indices) else -1,
                     "appearance_anchor_contrast": float(batch.appearance_anchor_contrasts[local_i]) if local_i < len(batch.appearance_anchor_contrasts) else 0.0,
+                    "red_anchor_observed_index": int(batch.red_anchor_observed_indices[local_i]) if local_i < len(batch.red_anchor_observed_indices) else -1,
+                    "red_anchor_target_index": int(batch.red_anchor_target_indices[local_i]) if local_i < len(batch.red_anchor_target_indices) else -1,
+                    "red_anchor_best_score": float(batch.red_anchor_best_scores[local_i]) if local_i < len(batch.red_anchor_best_scores) else 0.0,
+                    "red_anchor_score_ratio": float(batch.red_anchor_score_ratios[local_i]) if local_i < len(batch.red_anchor_score_ratios) else 0.0,
                 }
             )
     return rows
@@ -1689,6 +2021,7 @@ def summarize_frame_orders(
         "identity_frames": 0,
         "discarded_frames": 0,
         "appearance_anchor_frames": 0,
+        "red_anchor_frames": 0,
         "reprojection_frames": 0,
     }
     for row in rows:
@@ -1701,6 +2034,8 @@ def summarize_frame_orders(
         summary["kept_frames"] += 1
         if row.get("order_source") == "appearance_anchor":
             summary["appearance_anchor_frames"] += 1
+        elif row.get("order_source") == "red_anchor":
+            summary["red_anchor_frames"] += 1
         else:
             summary["reprojection_frames"] += 1
         if row["best_order"] == "rot180":
@@ -1748,6 +2083,10 @@ def order_failure_diagnostics(
                     "appearance_anchor_observed_index": row.get("appearance_anchor_observed_index"),
                     "appearance_anchor_target_index": row.get("appearance_anchor_target_index"),
                     "appearance_anchor_contrast": row.get("appearance_anchor_contrast"),
+                    "red_anchor_observed_index": row.get("red_anchor_observed_index"),
+                    "red_anchor_target_index": row.get("red_anchor_target_index"),
+                    "red_anchor_best_score": row.get("red_anchor_best_score"),
+                    "red_anchor_score_ratio": row.get("red_anchor_score_ratio"),
                 }
                 for row in preview
             ]
@@ -1874,6 +2213,7 @@ def write_report(final: dict[str, Any], path: Path) -> None:
         f"Frames kept after corner-order check: {order['kept_frames']} / {order['input_frames']}",
         f"Rot180 corrected frames: {order['rot180_frames']}",
         f"Appearance-anchor ordered frames: {order.get('appearance_anchor_frames', 0)}",
+        f"Red-anchor ordered frames: {order.get('red_anchor_frames', 0)}",
         "",
         "## Reprojection",
         "",
@@ -1961,6 +2301,7 @@ def compact_result(final: dict[str, Any]) -> dict[str, Any]:
                 "identity_frames",
                 "discarded_frames",
                 "appearance_anchor_frames",
+                "red_anchor_frames",
                 "reprojection_frames",
             )
             if key in final["order_summary"]
