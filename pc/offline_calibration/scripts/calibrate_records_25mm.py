@@ -1966,8 +1966,15 @@ def classify_frame_orders(
         rel = p_world[None, :, :] - batch.camera_positions[:, None, :]
         p_camera = np.einsum("nij,nmj->nmi", r_c_w, rel)
         pred = project_points(p_camera, parsed[f"{batch.side}_intr"], parsed[f"{batch.side}_dist"], y_sign)
-        err_identity = np.linalg.norm(pred - batch.corners, axis=-1)
-        err_rot180 = np.linalg.norm(pred - batch.corners[:, order_180, :], axis=-1)
+        detector_corners = np.asarray(batch.corners, dtype=float).copy()
+        for local_i in range(len(detector_corners)):
+            appearance_order = str(batch.appearance_anchor_orders[local_i]) if local_i < len(batch.appearance_anchor_orders) else ""
+            red_order = str(batch.red_anchor_orders[local_i]) if local_i < len(batch.red_anchor_orders) else ""
+            applied_order = appearance_order if appearance_order in ("identity", "rot180") else red_order
+            if applied_order == "rot180":
+                detector_corners[local_i] = detector_corners[local_i, order_180, :]
+        err_identity = np.linalg.norm(pred - detector_corners, axis=-1)
+        err_rot180 = np.linalg.norm(pred - detector_corners[:, order_180, :], axis=-1)
         med_identity = np.median(err_identity, axis=1)
         med_rot180 = np.median(err_rot180, axis=1)
         for local_i, (frame_index, time_s, e_i, e_r) in enumerate(zip(batch.frame_indices, batch.times, med_identity, med_rot180)):

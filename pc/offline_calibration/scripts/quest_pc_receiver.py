@@ -5036,7 +5036,7 @@ def recording_replay_list(
         if raw_root != root:
             roots.append({"source": "raw", "root": raw_root, "label": "B calibration"})
 
-    sortable_records: list[tuple[tuple[int, int, int, float], dict[str, Any]]] = []
+    sortable_records: list[tuple[tuple[int, float, str, str], dict[str, Any]]] = []
     for root_info in roots:
         current_root = root_info["root"]
         if not isinstance(current_root, Path) or not current_root.exists():
@@ -5053,9 +5053,7 @@ def recording_replay_list(
                 continue
             if is_late_tail_record(record):
                 continue
-            sample_count = int(record["samples"]) if is_number(record.get("samples")) else 0
-            has_calibration = bool(record.get("hasCalibrationSnapshot"))
-            sortable_records.append(((1 if has_calibration else 0, sample_count, directory.stat().st_mtime), record))
+            sortable_records.append((recording_chronology_key(record), record))
     sortable_records.sort(key=lambda item: item[0], reverse=True)
     records = [record for _, record in sortable_records]
     return {
@@ -5064,6 +5062,33 @@ def recording_replay_list(
         "rawRoot": str(calibration_raw_root.resolve()) if calibration_raw_root is not None else None,
         "records": records,
     }
+
+
+def recording_chronology_key(record: dict[str, Any]) -> tuple[int, float, str, str]:
+    record_id = str(record.get("recordId") or "")
+    parts = record_id.split("_")
+    for index in range(len(parts) - 1):
+        date_part = parts[index]
+        time_part = parts[index + 1]
+        if len(date_part) != 8 or len(time_part) != 6 or not date_part.isdigit() or not time_part.isdigit():
+            continue
+        try:
+            parsed = datetime.strptime(date_part + time_part, "%Y%m%d%H%M%S")
+        except ValueError:
+            continue
+        return (2, parsed.timestamp(), record_id, str(record.get("source") or ""))
+
+    start_utc = record.get("startUtc")
+    if isinstance(start_utc, str) and start_utc.strip():
+        try:
+            parsed = datetime.fromisoformat(start_utc.strip().replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return (1, parsed.timestamp(), record_id, str(record.get("source") or ""))
+        except ValueError:
+            pass
+    mtime = float(record.get("mtime")) if is_number(record.get("mtime")) else 0.0
+    return (0, mtime, record_id, str(record.get("source") or ""))
 
 
 def recording_replay_list_record(
@@ -11571,9 +11596,11 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
   text-decoration: none;
   font-size: 12px;
 }
-.camera-strip img {
+.camera-strip img,
+.camera-strip video {
+  display: block;
   width: 100%;
-  max-height: 120px;
+  height: 120px;
   object-fit: contain;
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -11860,6 +11887,7 @@ async function loadRecord(recordId, source = null) {
   recordSub.textContent = 'loading...';
   state.playing = false;
   playBtn.textContent = 'Play';
+  clearCameraStrip();
   const params = new URLSearchParams({recordId});
   if (source) params.set('source', source);
   const response = await fetch('/recordings/replay?' + params.toString(), {cache: 'no-store'});
@@ -11875,7 +11903,6 @@ async function loadRecord(recordId, source = null) {
   state.t = state.data.samples?.[0]?.recordingTimestampSeconds || 0;
   state.lastRenderedIdx = -1;
   state.lastLabelIdx = -1;
-  state.cameraStripKey = '';
   buildTrails();
   prepareReplayIndexes();
   updateScrub();
@@ -12333,34 +12360,94 @@ function renderCameraStrip(robot) {
   const imageEntries = Object.entries(images).filter(([role, item]) => item?.url && !videos[role]?.url);
   const entries = [...videoEntries, ...imageEntries];
   if (!entries.length) {
-    if (state.cameraStripKey !== '') {
-      cameraStrip.innerHTML = '';
-      state.cameraStripKey = '';
-    }
+    clearCameraStrip();
     return;
   }
   const stripKey = entries.map(([role, item]) => {
     const url = String(item.url || '');
-    const frame = Number.isFinite(item.frameIndex) ? String(item.frameIndex) : '';
-    return `${role}:${url}:${frame}`;
+    const kind = url.toLowerCase().includes('.mp4') ? 'video' : 'image';
+    return `${role}:${kind}:${url}`;
   }).join('|');
-  if (stripKey === state.cameraStripKey) return;
-  state.cameraStripKey = stripKey;
-  cameraStrip.innerHTML = entries.map(([role, item]) => {
-    const label = `${role}${Number.isFinite(item.frameIndex) ? ` #${item.frameIndex}` : ''}`;
-    if (String(item.url || '').toLowerCase().includes('.mp4')) {
+  if (stripKey !== state.cameraStripKey) {
+    clearCameraStrip();
+    cameraStrip.innerHTML = entries.map(([role, item]) => {
+      const label = `${role}${Number.isFinite(item.frameIndex) ? ` #${item.frameIndex}` : ''}`;
+      if (String(item.url || '').toLowerCase().includes('.mp4')) {
+        return `
+          <a href="${escapeHtml(item.url)}" target="_blank" data-camera-role="${escapeHtml(role)}">
+            <video src="${escapeHtml(item.url)}" muted playsinline preload="auto"></video>
+            <span>${escapeHtml(label)}</span>
+          </a>`;
+      }
       return `
-        <a href="${escapeHtml(item.url)}" target="_blank">
-          <video src="${escapeHtml(item.url)}" controls preload="metadata"></video>
+        <a href="${escapeHtml(item.url)}" target="_blank" data-camera-role="${escapeHtml(role)}">
+          <img src="${escapeHtml(item.url)}" alt="${escapeHtml(role)} camera">
           <span>${escapeHtml(label)}</span>
         </a>`;
+    }).join('');
+    state.cameraStripKey = stripKey;
+  }
+  const fps = replayVideoFps();
+  const cameraItems = Array.from(cameraStrip.querySelectorAll('[data-camera-role]'));
+  for (const [role, item] of entries) {
+    const node = cameraItems.find(candidate => candidate.dataset.cameraRole === role);
+    if (!node) continue;
+    const label = node.querySelector('span');
+    if (label) label.textContent = `${role}${Number.isFinite(item.frameIndex) ? ` #${item.frameIndex}` : ''}`;
+    const video = node.querySelector('video');
+    if (video) syncReplayVideo(video, item, fps);
+  }
+}
+
+function clearCameraStrip() {
+  for (const video of cameraStrip.querySelectorAll('video')) video.pause();
+  cameraStrip.innerHTML = '';
+  state.cameraStripKey = '';
+}
+
+function replayVideoFps() {
+  const fps = Number(state.data?.robotRealSense?.config?.fps);
+  return Number.isFinite(fps) && fps > 0 ? fps : 30;
+}
+
+function syncReplayVideo(video, item, fps) {
+  const frameIndex = Number(item?.frameIndex);
+  if (!Number.isFinite(frameIndex)) return;
+  video.dataset.replayTargetTime = String(Math.max(0, frameIndex / fps));
+  if (video.readyState < 1) {
+    if (video.dataset.replayMetadataPending !== '1') {
+      video.dataset.replayMetadataPending = '1';
+      video.addEventListener('loadedmetadata', () => {
+        video.dataset.replayMetadataPending = '0';
+        applyReplayVideoState(video, fps, true);
+      }, {once: true});
     }
-    return `
-      <a href="${escapeHtml(item.url)}" target="_blank">
-        <img src="${escapeHtml(item.url)}" alt="${escapeHtml(role)} camera">
-        <span>${escapeHtml(label)}</span>
-      </a>`;
-  }).join('');
+    return;
+  }
+  applyReplayVideoState(video, fps, false);
+}
+
+function applyReplayVideoState(video, fps, forceSeek) {
+  const requested = Number(video.dataset.replayTargetTime);
+  if (!Number.isFinite(requested)) return;
+  const duration = Number(video.duration);
+  const target = Number.isFinite(duration) && duration > 0
+    ? Math.min(requested, Math.max(0, duration - 0.001))
+    : requested;
+  const tolerance = state.playing ? 0.15 : Math.max(0.02, 0.5 / fps);
+  if (forceSeek || Math.abs(video.currentTime - target) > tolerance) video.currentTime = target;
+  if (state.playing) {
+    if (video.paused) video.play().catch(() => {});
+  } else if (!video.paused) {
+    video.pause();
+  }
+}
+
+function syncVisibleReplayVideos(forceSeek = false) {
+  const fps = replayVideoFps();
+  for (const video of cameraStrip.querySelectorAll('video')) {
+    applyReplayVideoState(video, fps, forceSeek);
+  }
 }
 
 function robotControllerInputText(controller) {
@@ -12955,6 +13042,7 @@ canvas.addEventListener('wheel', event => {
 playBtn.onclick = () => {
   state.playing = !state.playing;
   playBtn.textContent = state.playing ? 'Pause' : 'Play';
+  syncVisibleReplayVideos(true);
 };
 resetBtn.onclick = () => {
   resetView();
@@ -12971,7 +13059,7 @@ scrub.oninput = () => {
   const samples = state.data?.samples || [];
   state.idx = Math.max(0, Math.min(samples.length - 1, Number(scrub.value) || 0));
   state.t = samples[state.idx]?.recordingTimestampSeconds || 0;
-  updateLabels();
+  updateLabels(true);
   markReplayDirty();
 };
 window.addEventListener('resize', () => {
@@ -13042,6 +13130,7 @@ function tick(now) {
       state.idx = samples.length - 1;
       state.playing = false;
       playBtn.textContent = 'Play';
+      syncVisibleReplayVideos(false);
     }
     while (state.idx < samples.length - 1 && samples[state.idx + 1].recordingTimestampSeconds <= state.t) state.idx++;
     while (state.idx > 0 && samples[state.idx].recordingTimestampSeconds > state.t) state.idx--;

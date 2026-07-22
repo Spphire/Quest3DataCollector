@@ -34,6 +34,7 @@ from quest_pc_receiver import (
     decode_quest_udp_datagram,
     note_quest_udp_wire_datagram,
     quest_udp_transport_summary,
+    recording_chronology_key,
     robot_realsense_performance_summary,
 )
 
@@ -56,6 +57,24 @@ class FakeProcess:
 
 
 class RecordingPerformanceTests(unittest.TestCase):
+    def test_recording_chronology_uses_record_id_instead_of_mtime_or_sample_count(self) -> None:
+        records = [
+            {"recordId": "record_20260722_190001", "source": "pc", "mtime": 300.0, "samples": 9000},
+            {"recordId": "record_pc_calib_20260722_203000", "source": "raw", "mtime": 100.0, "samples": 10},
+            {"recordId": "record_bounded_v3_20260722_200000", "source": "pc", "mtime": 200.0, "samples": 100},
+        ]
+
+        ordered = sorted(records, key=recording_chronology_key, reverse=True)
+
+        self.assertEqual(
+            [record["recordId"] for record in ordered],
+            [
+                "record_pc_calib_20260722_203000",
+                "record_bounded_v3_20260722_200000",
+                "record_20260722_190001",
+            ],
+        )
+
     def test_delayed_redundancy_sends_old_packets_before_current(self) -> None:
         class FakeSocket:
             def __init__(self) -> None:
