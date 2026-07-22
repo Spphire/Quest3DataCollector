@@ -34,6 +34,7 @@ from quest_pc_receiver import (
     RECORDINGS_REPLAY_HTML,
     build_performance_audit,
     decode_quest_udp_datagram,
+    delete_recording_replay_record,
     note_quest_udp_wire_datagram,
     quest_udp_transport_summary,
     recording_chronology_key,
@@ -71,6 +72,100 @@ class RecordingPerformanceTests(unittest.TestCase):
         self.assertIn("robotMediaTimedRowsByRole", RECORDINGS_REPLAY_HTML)
         self.assertNotIn("position: absolute;\n  right: 14px;\n  bottom: 14px;", RECORDINGS_REPLAY_HTML)
         self.assertIn(".replay-pane.details-open .replay-primary { display: none; }", RECORDINGS_REPLAY_HTML)
+
+    def test_replay_layout_has_confirmed_recording_delete_controls(self) -> None:
+        self.assertIn("fetch('/recordings/delete'", RECORDINGS_REPLAY_HTML)
+        self.assertIn('id="deleteDialog"', RECORDINGS_REPLAY_HTML)
+        self.assertIn('id="deleteConfirmBtn"', RECORDINGS_REPLAY_HTML)
+        self.assertIn("deleteConfirmBtn.onclick = confirmDeleteRecording;", RECORDINGS_REPLAY_HTML)
+
+    def test_delete_pc_recording_removes_only_pc_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            recording_root = root / "pc_recordings"
+            raw_root = root / "raw"
+            output_root = root / "outputs"
+            record_id = "record_20260723_120000"
+            pc_record = recording_root / record_id
+            raw_record = raw_root / record_id
+            output_record = output_root / record_id
+            self._write_replay_fixture(pc_record, "pc")
+            self._write_replay_fixture(raw_record, "raw")
+            output_record.mkdir(parents=True)
+            (output_record / "result.json").write_text("{}", encoding="utf-8")
+
+            result = delete_recording_replay_record(
+                recording_root,
+                record_id,
+                source="pc",
+                calibration_raw_root=raw_root,
+                calibration_output_root=output_root,
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertFalse(pc_record.exists())
+            self.assertTrue(raw_record.exists())
+            self.assertTrue(output_record.exists())
+
+    def test_delete_raw_recording_removes_raw_and_matching_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            recording_root = root / "pc_recordings"
+            raw_root = root / "raw"
+            output_root = root / "outputs"
+            recording_root.mkdir()
+            record_id = "record_pc_calib_20260723_120100"
+            raw_record = raw_root / record_id
+            output_record = output_root / record_id
+            self._write_replay_fixture(raw_record, "raw")
+            output_record.mkdir(parents=True)
+            (output_record / "result.json").write_text("{}", encoding="utf-8")
+
+            result = delete_recording_replay_record(
+                recording_root,
+                record_id,
+                source="raw",
+                calibration_raw_root=raw_root,
+                calibration_output_root=output_root,
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertFalse(raw_record.exists())
+            self.assertFalse(output_record.exists())
+
+    def test_delete_recording_rejects_path_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            recording_root = root / "pc_recordings"
+            recording_root.mkdir()
+            outside = root / "outside"
+            self._write_replay_fixture(outside, "pc")
+
+            with self.assertRaisesRegex(ValueError, "invalid recordId"):
+                delete_recording_replay_record(recording_root, "../outside", source="pc")
+
+            self.assertTrue(outside.exists())
+
+    def test_delete_recording_rejects_unsupported_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recording_root = Path(temp_dir) / "pc_recordings"
+            recording_root.mkdir()
+
+            with self.assertRaisesRegex(ValueError, "unsupported recording source"):
+                delete_recording_replay_record(recording_root, "record_20260723_120200", source="other")
+
+    @staticmethod
+    def _write_replay_fixture(directory: Path, source: str) -> None:
+        directory.mkdir(parents=True)
+        if source == "pc":
+            (directory / "pc_samples.jsonl").write_text("{}\n", encoding="utf-8")
+            (directory / "pc_session_summary.json").write_text('{"samples": 1}', encoding="utf-8")
+            return
+        (directory / "trajectory.jsonl").write_text("{}\n", encoding="utf-8")
+        (directory / "pc_calibration_session_summary.json").write_text(
+            '{"trajectorySampleCount": 1}',
+            encoding="utf-8",
+        )
 
     def test_recording_chronology_uses_record_id_instead_of_mtime_or_sample_count(self) -> None:
         records = [

@@ -1834,6 +1834,7 @@ class LiveTelemetryVisualizer:
         self.history: list[dict[str, Any]] = []
         self.clients: list[queue.Queue[str | None]] = []
         self.lock = threading.Lock()
+        self.recording_delete_lock = threading.Lock()
         self.calibration_state_cleared = False
         self.capture_state: dict[str, Any] = {
             "phase": "live",
@@ -1986,6 +1987,44 @@ class LiveTelemetryVisualizer:
         )
         self.publish_event({"type": "calibration_cleared", **result})
         self.publish_event({"type": "robot_calibration_cleared", **result})
+        return result
+
+    def delete_recording_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        record_id = str(payload.get("recordId") or "")
+        source = str(payload.get("source") or "")
+        capture_state = self.capture_state_payload()
+        robot_status = self.robot_status_payload(lightweight=True)
+        if capture_state.get("phase") in ("recording", "saving") or robot_status.get("activeSession"):
+            return {
+                "ok": False,
+                "error": "capture_busy",
+                "message": "Cannot delete recordings while Collector is recording or saving.",
+                "captureState": capture_state,
+            }
+        try:
+            with self.recording_delete_lock:
+                capture_state = self.capture_state_payload()
+                if capture_state.get("phase") in ("recording", "saving"):
+                    raise RuntimeError("capture_busy")
+                result = delete_recording_replay_record(
+                    self.recording_root,
+                    record_id,
+                    source=source,
+                    calibration_raw_root=self.calibration_raw_root,
+                    calibration_output_root=self.calibration_output_root,
+                )
+        except RuntimeError as exc:
+            if str(exc) == "capture_busy":
+                return {
+                    "ok": False,
+                    "error": "capture_busy",
+                    "message": "Cannot delete recordings while Collector is recording or saving.",
+                    "captureState": capture_state,
+                }
+            return {"ok": False, "error": "delete_failed", "message": str(exc)}
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            return {"ok": False, "error": "delete_failed", "message": str(exc)}
+        self.publish_event({"type": "recording_deleted", **result})
         return result
 
     def camera_list_payload(
@@ -2349,6 +2388,9 @@ class LiveTelemetryVisualizer:
                         return
                     if parsed.path == "/calibration/clear":
                         self._send_json(visualizer.clear_calibration_payload())
+                        return
+                    if parsed.path == "/recordings/delete":
+                        self._send_json(visualizer.delete_recording_payload(payload))
                         return
                     self.send_error(404)
                 except Exception as exc:
@@ -5061,6 +5103,76 @@ def recording_replay_list(
         "root": str(root),
         "rawRoot": str(calibration_raw_root.resolve()) if calibration_raw_root is not None else None,
         "records": records,
+    }
+
+
+def delete_recording_replay_record(
+    recording_root: Path,
+    record_id: str,
+    *,
+    source: str,
+    calibration_raw_root: Path | None = None,
+    calibration_output_root: Path | None = None,
+) -> dict[str, Any]:
+    safe_id = sanitize_name(record_id)
+    if safe_id != record_id or not record_id:
+        raise ValueError("invalid recordId")
+    if source not in ("pc", "raw"):
+        raise ValueError(f"unsupported recording source: {source}")
+
+    listing = recording_replay_list(
+        recording_root,
+        calibration_raw_root=calibration_raw_root,
+        calibration_output_root=calibration_output_root,
+    )
+    record = next(
+        (
+            item
+            for item in listing.get("records", [])
+            if item.get("recordId") == safe_id and item.get("source") == source
+        ),
+        None,
+    )
+    if record is None:
+        raise FileNotFoundError(f"recording not found: {safe_id} ({source})")
+
+    allowed_root = recording_root.resolve() if source == "pc" else (
+        calibration_raw_root.resolve() if calibration_raw_root is not None else None
+    )
+    if allowed_root is None:
+        raise ValueError("calibration raw root is unavailable")
+    session_dir = Path(str(record.get("path") or "")).resolve()
+    try:
+        session_dir.relative_to(allowed_root)
+    except ValueError as exc:
+        raise ValueError("recording is outside its configured root") from exc
+    if session_dir.parent != allowed_root:
+        raise ValueError("recording must be a direct child of its configured root")
+
+    delete_paths = [session_dir]
+    if source == "raw" and calibration_output_root is not None:
+        output_root = calibration_output_root.resolve()
+        output_dir = (output_root / safe_id).resolve()
+        try:
+            output_dir.relative_to(output_root)
+        except ValueError as exc:
+            raise ValueError("calibration output is outside its configured root") from exc
+        if output_dir.parent != output_root:
+            raise ValueError("calibration output must be a direct child of its configured root")
+        if output_dir.exists():
+            if not output_dir.is_dir():
+                raise ValueError("calibration output is not a directory")
+            delete_paths.append(output_dir)
+
+    deleted_paths: list[str] = []
+    for path in delete_paths:
+        shutil.rmtree(path)
+        deleted_paths.append(str(path))
+    return {
+        "ok": True,
+        "recordId": safe_id,
+        "source": source,
+        "deletedPaths": deleted_paths,
     }
 
 
@@ -11572,6 +11684,12 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
   margin: 8px 0;
 }
 .record-list { display: grid; gap: 7px; }
+.record-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: start;
+}
 .record-item {
   width: 100%;
   text-align: left;
@@ -11583,8 +11701,50 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
   padding: 8px;
 }
 .record-item.active { border-color: #82adff; background: #172338; }
+.record-delete {
+  color: #ffb0b7;
+  border-color: #66343b;
+  background: #281519;
+}
+.record-delete:hover { background: #3b1c22; }
 .record-title { font-weight: 700; overflow-wrap: anywhere; }
 .record-meta { color: var(--muted); font-size: 12px; }
+.confirm-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(0, 0, 0, 0.72);
+}
+.confirm-backdrop[hidden] { display: none; }
+.confirm-panel {
+  width: min(420px, 100%);
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
+}
+.confirm-panel h2 { margin: 0 0 8px; font-size: 17px; }
+.confirm-record {
+  margin: 12px 0;
+  padding: 9px;
+  overflow-wrap: anywhere;
+  white-space: pre-line;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0d131a;
+}
+.confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+.danger-button {
+  color: #fff;
+  border-color: #a73d48;
+  background: #7f2630;
+}
+.danger-button:hover { background: #9a303b; }
+.delete-error { min-height: 18px; margin-top: 8px; color: #ff9da6; }
 .pill {
   display: inline-flex;
   align-items: center;
@@ -11761,6 +11921,18 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
     <button id="detailsBtn" class="details-toggle" type="button" aria-controls="replayDetails" aria-expanded="false">Show details</button>
   </aside>
 </div>
+<div id="deleteDialog" class="confirm-backdrop" role="dialog" aria-modal="true" aria-labelledby="deleteDialogTitle" hidden>
+  <div class="confirm-panel">
+    <h2 id="deleteDialogTitle">Delete recording?</h2>
+    <div class="sub">This permanently removes the selected recording and cannot be undone.</div>
+    <div id="deleteRecordLabel" class="confirm-record"></div>
+    <div id="deleteError" class="delete-error" role="alert"></div>
+    <div class="confirm-actions">
+      <button id="deleteCancelBtn" type="button">Cancel</button>
+      <button id="deleteConfirmBtn" class="danger-button" type="button">Delete recording</button>
+    </div>
+  </div>
+</div>
 <script>
 const canvas = document.getElementById('view');
 const ctx = canvas.getContext('2d');
@@ -11770,6 +11942,11 @@ const replayPane = document.getElementById('replayPane');
 const replayDetails = document.getElementById('replayDetails');
 const detailsBtn = document.getElementById('detailsBtn');
 const recordList = document.getElementById('recordList');
+const deleteDialog = document.getElementById('deleteDialog');
+const deleteRecordLabel = document.getElementById('deleteRecordLabel');
+const deleteError = document.getElementById('deleteError');
+const deleteCancelBtn = document.getElementById('deleteCancelBtn');
+const deleteConfirmBtn = document.getElementById('deleteConfirmBtn');
 const rootLabel = document.getElementById('rootLabel');
 const search = document.getElementById('search');
 const liveBtn = document.getElementById('liveBtn');
@@ -11820,7 +11997,8 @@ const state = {
   robotPoseTimedRows: [],
   robotMediaTimedRows: [],
   robotMediaTimedRowsByRole: {},
-  gripperTimedRows: []
+  gripperTimedRows: [],
+  pendingDelete: null
 };
 
 const REPLAY_RENDER_INTERVAL_MS = 33;
@@ -11867,7 +12045,10 @@ function renderRecordList() {
   recordList.innerHTML = '';
   for (const record of state.records) {
     if (needle && !record.recordId.toLowerCase().includes(needle)) continue;
+    const row = document.createElement('div');
+    row.className = 'record-row';
     const button = document.createElement('button');
+    button.type = 'button';
     button.className = 'record-item' + (record.recordId === state.selected && record.source === state.selectedSource ? ' active' : '');
     const samples = record.samples ?? 'n/a';
     const calib = calibrationRecordSummaryText(record);
@@ -11875,7 +12056,97 @@ function renderRecordList() {
     const source = record.sourceLabel || record.source || 'record';
     button.innerHTML = `<span class="record-title">${escapeHtml(record.recordId)}</span><span class="record-meta">${escapeHtml(source)} | ${samples} samples | ${escapeHtml(calib)}</span><span class="record-meta">${escapeHtml(robot)}</span><span class="record-meta">${escapeHtml(record.closedReason || '')}</span>`;
     button.onclick = () => loadRecord(record.recordId, record.source);
-    recordList.appendChild(button);
+    const deleteButton = document.createElement('button');
+    deleteButton.type = 'button';
+    deleteButton.className = 'record-delete';
+    deleteButton.textContent = 'Delete';
+    deleteButton.setAttribute('aria-label', `Delete record ${record.recordId}`);
+    deleteButton.onclick = () => openDeleteDialog(record, deleteButton);
+    row.append(button, deleteButton);
+    recordList.appendChild(row);
+  }
+}
+
+function openDeleteDialog(record, trigger) {
+  state.pendingDelete = {
+    recordId: String(record.recordId || ''),
+    source: String(record.source || ''),
+    sourceLabel: String(record.sourceLabel || record.source || 'record'),
+    trigger
+  };
+  deleteRecordLabel.textContent = `${state.pendingDelete.recordId}\n${state.pendingDelete.sourceLabel}`;
+  deleteError.textContent = '';
+  deleteCancelBtn.disabled = false;
+  deleteConfirmBtn.disabled = false;
+  deleteConfirmBtn.textContent = 'Delete recording';
+  deleteDialog.hidden = false;
+  deleteCancelBtn.focus();
+}
+
+function closeDeleteDialog() {
+  if (deleteConfirmBtn.disabled) return;
+  const trigger = state.pendingDelete?.trigger;
+  deleteDialog.hidden = true;
+  state.pendingDelete = null;
+  deleteError.textContent = '';
+  if (trigger?.isConnected) trigger.focus();
+}
+
+function clearSelectedReplay() {
+  state.loadSeq += 1;
+  state.selected = null;
+  state.selectedSource = null;
+  state.data = null;
+  state.playing = false;
+  state.t = 0;
+  state.idx = 0;
+  state.lastRenderedIdx = -1;
+  state.lastLabelIdx = -1;
+  state.robotPoseTimedRows = [];
+  state.robotMediaTimedRows = [];
+  state.robotMediaTimedRowsByRole = {};
+  state.gripperTimedRows = [];
+  state.trails = {head: [], left: [], right: [], gaze: [], gazeFiltered: [], gazeBoardPlane: [], hit: [], robot: []};
+  playBtn.textContent = 'Play';
+  clearCameraStrip();
+  recordTitle.textContent = 'Select a record';
+  recordSub.textContent = '';
+  timeLabel.textContent = '0.000s';
+  sampleLabel.textContent = 'sample 0';
+  recordingLabel.textContent = '';
+  scrub.max = 0;
+  scrub.value = 0;
+  for (const element of [snapKv, artifactList, depthKv, robotKv, latencyKv, sampleKv]) element.innerHTML = '';
+  const latencyContext = latencyChart.getContext('2d');
+  if (latencyContext) latencyContext.clearRect(0, 0, latencyChart.width, latencyChart.height);
+  markReplayDirty();
+}
+
+async function confirmDeleteRecording() {
+  const pending = state.pendingDelete;
+  if (!pending || deleteConfirmBtn.disabled) return;
+  deleteError.textContent = '';
+  deleteCancelBtn.disabled = true;
+  deleteConfirmBtn.disabled = true;
+  deleteConfirmBtn.textContent = 'Deleting...';
+  try {
+    const response = await fetch('/recordings/delete', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({recordId: pending.recordId, source: pending.source})
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) throw new Error(payload.message || payload.error || 'Delete failed');
+    if (state.selected === pending.recordId && state.selectedSource === pending.source) clearSelectedReplay();
+    deleteDialog.hidden = true;
+    state.pendingDelete = null;
+    await loadRecords();
+  } catch (error) {
+    deleteError.textContent = error instanceof Error ? error.message : String(error);
+  } finally {
+    deleteCancelBtn.disabled = false;
+    deleteConfirmBtn.disabled = false;
+    deleteConfirmBtn.textContent = 'Delete recording';
   }
 }
 
@@ -13144,6 +13415,14 @@ playBtn.onclick = () => {
 detailsBtn.onclick = () => {
   setReplayDetailsExpanded(!replayPane.classList.contains('details-open'));
 };
+deleteCancelBtn.onclick = closeDeleteDialog;
+deleteConfirmBtn.onclick = confirmDeleteRecording;
+deleteDialog.onclick = event => {
+  if (event.target === deleteDialog) closeDeleteDialog();
+};
+window.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && !deleteDialog.hidden) closeDeleteDialog();
+});
 
 function setReplayDetailsExpanded(expanded) {
   replayPane.classList.toggle('details-open', Boolean(expanded));
