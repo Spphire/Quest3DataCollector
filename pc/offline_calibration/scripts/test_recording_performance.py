@@ -37,6 +37,7 @@ from quest_pc_receiver import (
     quest_udp_transport_summary,
     recording_chronology_key,
     recording_path_chronology_key,
+    robot_calibration_chronology_key,
     robot_realsense_performance_summary,
 )
 
@@ -93,6 +94,18 @@ class RecordingPerformanceTests(unittest.TestCase):
             selected = max((earlier, later), key=recording_path_chronology_key)
 
             self.assertEqual(selected, later)
+
+    def test_robot_calibration_chronology_uses_source_calibration_id(self) -> None:
+        formal_copy = Path("record_20260722_202818/robot_realsense/robot_hand_eye_result.json")
+        fresh_calibration = Path("record_pc_calib_20260722_202659/robot_realsense/robot_hand_eye_result.json")
+        candidates = [
+            ({"record_id": "record_pc_calib_20260717_184211"}, formal_copy),
+            ({"record_id": "record_pc_calib_20260722_202659"}, fresh_calibration),
+        ]
+
+        selected = max(candidates, key=lambda item: robot_calibration_chronology_key(item[0], item[1]))
+
+        self.assertEqual(selected[1], fresh_calibration)
 
     def test_delayed_redundancy_sends_old_packets_before_current(self) -> None:
         class FakeSocket:

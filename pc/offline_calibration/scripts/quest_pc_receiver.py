@@ -5106,6 +5106,15 @@ def recording_path_chronology_key(path: Path) -> tuple[int, float, str]:
     return (0, path.stat().st_mtime if path.exists() else 0.0, str(path))
 
 
+def robot_calibration_chronology_key(payload: dict[str, Any], path: Path) -> tuple[int, float, str]:
+    record_id = str(payload.get("record_id") or payload.get("recordId") or "")
+    value = recording_id_chronology_value(record_id)
+    if value is not None:
+        return (2, value, str(path))
+    path_key = recording_path_chronology_key(path)
+    return (path_key[0], path_key[1], str(path))
+
+
 def recording_replay_list_record(
     directory: Path,
     source: str,
@@ -7684,7 +7693,7 @@ def latest_robot_hand_eye_result(
             continue
         candidates.extend(resolved.glob("record_pc_calib*/robot_realsense/robot_hand_eye_result.json"))
         candidates.extend(resolved.glob("record*/robot_realsense/robot_hand_eye_result.json"))
-    valid: list[Path] = []
+    valid: list[tuple[tuple[int, float, str], Path, dict[str, Any]]] = []
     for path in candidates:
         if not path.exists() or path.stat().st_size <= 0:
             continue
@@ -7694,11 +7703,10 @@ def latest_robot_hand_eye_result(
         alignment = payload.get("questAlignment")
         if not isinstance(alignment, dict) or not alignment.get("ok"):
             continue
-        valid.append(path)
+        valid.append((robot_calibration_chronology_key(payload, path), path, payload))
     if not valid:
         return None
-    latest = max(valid, key=recording_path_chronology_key)
-    payload = read_json_if_exists(latest)
+    _, latest, payload = max(valid, key=lambda item: item[0])
     if isinstance(payload, dict):
         payload.setdefault("sourcePath", str(latest))
         return payload
