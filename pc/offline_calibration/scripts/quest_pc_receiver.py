@@ -5066,17 +5066,9 @@ def recording_replay_list(
 
 def recording_chronology_key(record: dict[str, Any]) -> tuple[int, float, str, str]:
     record_id = str(record.get("recordId") or "")
-    parts = record_id.split("_")
-    for index in range(len(parts) - 1):
-        date_part = parts[index]
-        time_part = parts[index + 1]
-        if len(date_part) != 8 or len(time_part) != 6 or not date_part.isdigit() or not time_part.isdigit():
-            continue
-        try:
-            parsed = datetime.strptime(date_part + time_part, "%Y%m%d%H%M%S")
-        except ValueError:
-            continue
-        return (2, parsed.timestamp(), record_id, str(record.get("source") or ""))
+    record_id_time = recording_id_chronology_value(record_id)
+    if record_id_time is not None:
+        return (2, record_id_time, record_id, str(record.get("source") or ""))
 
     start_utc = record.get("startUtc")
     if isinstance(start_utc, str) and start_utc.strip():
@@ -5089,6 +5081,29 @@ def recording_chronology_key(record: dict[str, Any]) -> tuple[int, float, str, s
             pass
     mtime = float(record.get("mtime")) if is_number(record.get("mtime")) else 0.0
     return (0, mtime, record_id, str(record.get("source") or ""))
+
+
+def recording_id_chronology_value(record_id: str) -> float | None:
+    parts = record_id.split("_")
+    for index in range(len(parts) - 1):
+        date_part = parts[index]
+        time_part = parts[index + 1]
+        if len(date_part) != 8 or len(time_part) != 6 or not date_part.isdigit() or not time_part.isdigit():
+            continue
+        try:
+            datetime.strptime(date_part + time_part, "%Y%m%d%H%M%S")
+        except ValueError:
+            continue
+        return float(date_part + time_part)
+    return None
+
+
+def recording_path_chronology_key(path: Path) -> tuple[int, float, str]:
+    for candidate in (path, *path.parents):
+        value = recording_id_chronology_value(candidate.name)
+        if value is not None:
+            return (1, value, str(path))
+    return (0, path.stat().st_mtime if path.exists() else 0.0, str(path))
 
 
 def recording_replay_list_record(
@@ -7682,7 +7697,7 @@ def latest_robot_hand_eye_result(
         valid.append(path)
     if not valid:
         return None
-    latest = max(valid, key=lambda path: path.stat().st_mtime)
+    latest = max(valid, key=recording_path_chronology_key)
     payload = read_json_if_exists(latest)
     if isinstance(payload, dict):
         payload.setdefault("sourcePath", str(latest))
@@ -7753,15 +7768,6 @@ def latest_calibration_snapshot(output_root: Path) -> dict[str, Any]:
     if not candidates:
         return {"ok": False, "reason": "no_calibration_records", "outputRoot": str(output_root)}
 
-    def candidate_stamp(path: Path) -> float:
-        result_path = path / "calibration_result_25mm.json"
-        if result_path.exists():
-            return result_path.stat().st_mtime
-        failure_path = path / "calibration_failure_25mm.json"
-        if failure_path.exists():
-            return failure_path.stat().st_mtime
-        return path.stat().st_mtime
-
     def failure_payload(path: Path) -> dict[str, Any]:
         log_path = path / "calibration_run.log"
         return {
@@ -7770,10 +7776,10 @@ def latest_calibration_snapshot(output_root: Path) -> dict[str, Any]:
             "event": calibration_failure_event(path.name, path, log_path, None),
         }
 
-    latest_any = max(candidates, key=candidate_stamp)
+    latest_any = max(candidates, key=recording_path_chronology_key)
     latest_success = max(
         (path for path in candidates if (path / "calibration_result_25mm.json").exists()),
-        key=lambda path: (path / "calibration_result_25mm.json").stat().st_mtime,
+        key=recording_path_chronology_key,
         default=None,
     )
     if latest_success is None:

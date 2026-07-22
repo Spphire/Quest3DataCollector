@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import gzip
 import json
+import os
 import threading
 import tempfile
 import time
@@ -35,6 +36,7 @@ from quest_pc_receiver import (
     note_quest_udp_wire_datagram,
     quest_udp_transport_summary,
     recording_chronology_key,
+    recording_path_chronology_key,
     robot_realsense_performance_summary,
 )
 
@@ -74,6 +76,23 @@ class RecordingPerformanceTests(unittest.TestCase):
                 "record_20260722_190001",
             ],
         )
+
+    def test_recording_path_chronology_ignores_reprocessing_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            earlier = root / "record_pc_calib_20260722_202410" / "calibration_result_25mm.json"
+            later = root / "record_pc_calib_20260722_202659" / "calibration_result_25mm.json"
+            earlier.parent.mkdir()
+            later.parent.mkdir()
+            earlier.write_text("{}", encoding="utf-8")
+            later.write_text("{}", encoding="utf-8")
+            now = time.time()
+            os.utime(earlier, (now + 100.0, now + 100.0))
+            os.utime(later, (now, now))
+
+            selected = max((earlier, later), key=recording_path_chronology_key)
+
+            self.assertEqual(selected, later)
 
     def test_delayed_redundancy_sends_old_packets_before_current(self) -> None:
         class FakeSocket:
