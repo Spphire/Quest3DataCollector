@@ -9,3 +9,12 @@ outputs/
 *.log
 *.mp4
 *.jsonl
+
+# Deployment-local environments, backups, and diagnostic captures.
+.codex_deploy_backups/
+.conda_py312/
+backups/
+pc/offline_calibration/board_checks/
+pc/offline_calibration/quest_native_recordings/
+pc/offline_calibration/scripts/_backup_*/
+pc/offline_calibration/scripts/*.before_*
