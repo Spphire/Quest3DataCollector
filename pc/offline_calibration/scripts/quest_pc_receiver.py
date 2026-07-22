@@ -11676,6 +11676,8 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
   nav { max-height: 24vh; border: 0; border-bottom: 1px solid var(--line); }
   aside { height: 58vh; border: 0; border-bottom: 1px solid var(--line); }
   aside { border-top: 1px solid var(--line); }
+  .replay-pane.details-open .replay-primary { display: none; }
+  .replay-pane.details-open .replay-details { margin-top: 0; }
 }
 </style>
 </head>

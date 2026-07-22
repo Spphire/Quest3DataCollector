@@ -70,6 +70,7 @@ class RecordingPerformanceTests(unittest.TestCase):
         self.assertIn("setReplayDetailsExpanded(false);", RECORDINGS_REPLAY_HTML)
         self.assertIn("robotMediaTimedRowsByRole", RECORDINGS_REPLAY_HTML)
         self.assertNotIn("position: absolute;\n  right: 14px;\n  bottom: 14px;", RECORDINGS_REPLAY_HTML)
+        self.assertIn(".replay-pane.details-open .replay-primary { display: none; }", RECORDINGS_REPLAY_HTML)
 
     def test_recording_chronology_uses_record_id_instead_of_mtime_or_sample_count(self) -> None:
         records = [
