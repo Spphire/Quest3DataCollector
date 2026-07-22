@@ -11508,7 +11508,6 @@ nav { border-right: 1px solid var(--line); }
   min-height: 0;
   flex-direction: column;
   overflow: hidden;
-  padding-bottom: 58px;
 }
 .replay-primary { flex: 0 0 auto; }
 .replay-details {
@@ -11524,10 +11523,9 @@ nav { border-right: 1px solid var(--line); }
   flex: 1 1 auto;
 }
 .details-toggle {
-  position: absolute;
-  right: 14px;
-  bottom: 14px;
-  z-index: 4;
+  flex: 0 0 auto;
+  align-self: flex-end;
+  margin-top: 10px;
   min-width: 92px;
   box-shadow: 0 2px 10px rgba(0,0,0,0.35);
 }
@@ -11676,7 +11674,7 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
   #app { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr) auto; }
   .detail-resizer { display: none; }
   nav { max-height: 24vh; border: 0; border-bottom: 1px solid var(--line); }
-  aside { height: 46vh; border: 0; border-bottom: 1px solid var(--line); }
+  aside { height: 58vh; border: 0; border-bottom: 1px solid var(--line); }
   aside { border-top: 1px solid var(--line); }
 }
 </style>
@@ -11819,6 +11817,7 @@ const state = {
   trails: {head: [], left: [], right: [], gaze: [], gazeFiltered: [], gazeBoardPlane: [], hit: [], robot: []},
   robotPoseTimedRows: [],
   robotMediaTimedRows: [],
+  robotMediaTimedRowsByRole: {},
   gripperTimedRows: []
 };
 
@@ -12002,8 +12001,23 @@ function buildTrails() {
 function prepareReplayIndexes() {
   state.robotPoseTimedRows = timedRows(robotPoseRows());
   state.robotMediaTimedRows = timedRows(robotMediaRows());
+  state.robotMediaTimedRowsByRole = mediaTimedRowsByRole(state.robotMediaTimedRows);
   const gripperRows = state.data?.robotRealSense?.gripper || [];
   state.gripperTimedRows = timedRows(Array.isArray(gripperRows) ? gripperRows : []);
+}
+
+function mediaTimedRowsByRole(timedMediaRows) {
+  const byRole = {};
+  for (const timed of timedMediaRows || []) {
+    for (const kind of ['videos', 'images']) {
+      for (const [role, item] of Object.entries(timed.row?.[kind] || {})) {
+        if (!item?.url) continue;
+        const roleRows = byRole[role] || (byRole[role] = {videos: [], images: []});
+        roleRows[kind].push({row: item, t: timed.t});
+      }
+    }
+  }
+  return byRole;
 }
 
 function timedRows(rows) {
@@ -12906,8 +12920,14 @@ function nearestRobotSample(t) {
 }
 
 function nearestRobotMediaSample(t) {
-  const rows = robotMediaRows();
-  return nearestTimedRow(state.robotMediaTimedRows, rows, t);
+  const result = {videos: {}, images: {}};
+  for (const [role, roleRows] of Object.entries(state.robotMediaTimedRowsByRole || {})) {
+    const video = nearestTimedRow(roleRows.videos, [], t);
+    const image = nearestTimedRow(roleRows.images, [], t);
+    if (video?.url) result.videos[role] = video;
+    if (image?.url) result.images[role] = image;
+  }
+  return Object.keys(result.videos).length || Object.keys(result.images).length ? result : null;
 }
 
 function drawPoint(p, color, radius, label) {
