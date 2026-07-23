@@ -4430,7 +4430,46 @@ class FlexivRealSenseManager:
                 )
             return session
 
-    def stop_session(self, session: RobotRealsenseSession | None) -> dict[str, Any] | None:
+    def fail_safe_stop_session_control(
+        self,
+        session: RobotRealsenseSession | None,
+        reason: str,
+    ) -> dict[str, Any]:
+        if session is None:
+            return {"ok": True, "stopped": False, "reason": "no_session"}
+        with self.lock:
+            if self.active_session is not session:
+                return {"ok": True, "stopped": False, "reason": "session_not_active"}
+            session.reset_controller_motion_anchor()
+            session.config.controller_motion_enabled = False
+            self.config.controller_motion_enabled = False
+            control_mode = getattr(session, "control_mode", ROBOT_SESSION_CONTROL_TELEOP)
+            if not self.motion_commands_allowed:
+                return {
+                    "ok": True,
+                    "stopped": True,
+                    "reason": reason,
+                    "controlMode": control_mode,
+                    "motionCommandsAllowed": False,
+                }
+            if control_mode == ROBOT_SESSION_CONTROL_FREEDRIVE:
+                self.robot.disable_freedrive()
+            else:
+                self.robot.disarm_motion()
+            return {
+                "ok": True,
+                "stopped": True,
+                "reason": reason,
+                "controlMode": control_mode,
+                "motionCommandsAllowed": True,
+            }
+
+    def stop_session(
+        self,
+        session: RobotRealsenseSession | None,
+        *,
+        restore_motion: bool = True,
+    ) -> dict[str, Any] | None:
         if session is None:
             return None
         close_errors: list[dict[str, str]] = []
@@ -4461,13 +4500,19 @@ class FlexivRealSenseManager:
                     self.robot.disable_freedrive()
                 except Exception as exc:  # pragma: no cover - hardware path
                     note_close_error("disable_freedrive", exc)
-            if self.motion_commands_allowed:
+            if self.motion_commands_allowed and restore_motion:
                 try:
                     self.robot.arm_motion()
                     self.config.controller_motion_enabled = True
                 except Exception as exc:  # pragma: no cover - hardware path
                     note_close_error("robot_mode_restore", exc)
                     self.config.controller_motion_enabled = False
+            elif self.motion_commands_allowed:
+                try:
+                    self.robot.disarm_motion()
+                except Exception as exc:  # pragma: no cover - hardware path
+                    note_close_error("robot_fail_safe_disarm", exc)
+                self.config.controller_motion_enabled = False
             else:
                 self.config.controller_motion_enabled = False
             with self.lock:

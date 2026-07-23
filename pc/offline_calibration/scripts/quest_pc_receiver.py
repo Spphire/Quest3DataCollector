@@ -139,6 +139,13 @@ DEFAULT_SAMPLE_LOG_INTERVAL_SECONDS = 1.0
 DEFAULT_UDP_RECEIVE_BUFFER_BYTES = 4 * 1024 * 1024
 GZIP_UDP_DATAGRAM_PREFIX = b"QGZ1"
 DEFAULT_RECORDING_IDLE_TIMEOUT_SECONDS = 2.0
+FAIL_SAFE_SESSION_CLOSE_REASONS = frozenset(
+    {
+        "recording_idle_timeout",
+        "timeout",
+        "keyboard_interrupt",
+    }
+)
 SESSION_WRITE_QUEUE_MAX = 2048
 SESSION_WRITE_QUEUE_CLOSE_DRAIN_SECONDS = 2.0
 FORMAL_ALIGNED_SAMPLE_HZ = ASYNC_QUEST_ALIGNED_SAMPLE_HZ
@@ -189,6 +196,45 @@ def note_quest_udp_wire_datagram(
         for key in stale:
             recent.pop(key, None)
     return False
+
+
+class RecordingLease:
+    def __init__(self, timeout_seconds: float) -> None:
+        self.timeout_seconds = max(0.0, float(timeout_seconds))
+        self.record_id: str | None = None
+        self.last_recording_datagram_perf_counter_seconds: float | None = None
+
+    def start(self, record_id: str, received_perf_counter_seconds: float) -> None:
+        self.record_id = str(record_id)
+        self.last_recording_datagram_perf_counter_seconds = float(received_perf_counter_seconds)
+
+    def renew(self, record_id: str, received_perf_counter_seconds: float) -> bool:
+        if self.record_id is None or str(record_id) != self.record_id:
+            return False
+        self.last_recording_datagram_perf_counter_seconds = float(received_perf_counter_seconds)
+        return True
+
+    def clear(self) -> None:
+        self.record_id = None
+        self.last_recording_datagram_perf_counter_seconds = None
+
+    def expiration(self, now_perf_counter_seconds: float) -> dict[str, Any] | None:
+        last_received = self.last_recording_datagram_perf_counter_seconds
+        if self.record_id is None or last_received is None or self.timeout_seconds <= 0.0:
+            return None
+        now_perf = float(now_perf_counter_seconds)
+        idle_seconds = max(0.0, now_perf - last_received)
+        if idle_seconds < self.timeout_seconds:
+            return None
+        return {
+            "terminationSource": "quest_recording_telemetry_lease",
+            "questTelemetryLost": True,
+            "recordId": self.record_id,
+            "idleTimeoutSeconds": self.timeout_seconds,
+            "idleSecondsAtDetection": idle_seconds,
+            "lastRecordingDatagramPerfCounterSeconds": last_received,
+            "detectedPerfCounterSeconds": now_perf,
+        }
 
 
 def main() -> int:
@@ -1079,6 +1125,8 @@ class SessionWriter:
         self.controller_csv_rows_written = 0
         self.controller_csv_sample_skips = 0
         self.last_close_metrics: dict[str, Any] | None = None
+        self.close_reason: str | None = None
+        self.close_details: dict[str, Any] | None = None
         self.close_errors: list[dict[str, Any]] = []
         self.control_thread: threading.Thread | None = None
         self.control_stop_event = threading.Event()
@@ -1514,11 +1562,36 @@ class SessionWriter:
         self.controllers_file.flush()
         self.last_flush_perf = time.perf_counter()
 
-    def close(self, reason: str) -> dict[str, Any]:
+    def begin_close(self, reason: str, close_details: dict[str, Any] | None = None) -> bool:
         with self.lock:
             if self.closed:
-                return self.summary(reason)
+                return False
+            first_request = not self.closing
             self.closing = True
+            if self.close_reason is None:
+                self.close_reason = str(reason)
+            if isinstance(close_details, dict):
+                self.close_details = dict(close_details)
+        self.control_stop_event.set()
+        with self.control_condition:
+            self.control_condition.notify_all()
+        if (
+            first_request
+            and reason in FAIL_SAFE_SESSION_CLOSE_REASONS
+            and self.robot_manager is not None
+            and self.robot_session is not None
+        ):
+            try:
+                self.robot_manager.fail_safe_stop_session_control(self.robot_session, reason)
+            except Exception as exc:  # pragma: no cover - hardware safety path
+                self._note_close_error("fail_safe_control_stop", exc)
+        return first_request
+
+    def close(self, reason: str, close_details: dict[str, Any] | None = None) -> dict[str, Any]:
+        self.begin_close(reason, close_details)
+        with self.lock:
+            if self.closed:
+                return self.summary(self.close_reason or reason)
 
         close_started_perf = time.perf_counter()
         unfinished_before_drop = 0
@@ -1581,7 +1654,10 @@ class SessionWriter:
             if robot_session is not None:
                 self.robot_realsense_directory = robot_session.directory
             try:
-                robot_summary = self.robot_manager.stop_session(robot_session)
+                robot_summary = self.robot_manager.stop_session(
+                    robot_session,
+                    restore_motion=reason not in FAIL_SAFE_SESSION_CLOSE_REASONS,
+                )
             except Exception as exc:  # pragma: no cover - hardware/close path
                 self._note_close_error("robot_session_stop", exc)
         robot_stopped_perf = time.perf_counter()
@@ -1706,6 +1782,8 @@ class SessionWriter:
             summary["closeErrors"] = list(self.close_errors)
         if self.last_close_metrics is not None:
             summary["closeMetrics"] = dict(self.last_close_metrics)
+        if self.close_details is not None:
+            summary["closeDetails"] = dict(self.close_details)
         if self.calibration_snapshot_start is not None:
             summary["calibrationSnapshotAtStart"] = self.calibration_snapshot_start
         if self.calibration_snapshot_end is not None:
@@ -3412,7 +3490,7 @@ def receive(args: argparse.Namespace) -> int:
     duplicate_datagrams_ignored = 0
     recent_udp_datagrams: dict[tuple[Any, ...], float] = {}
     last_datagram_perf = time.perf_counter()
-    last_active_recording_perf: float | None = None
+    recording_lease = RecordingLease(args.recording_idle_timeout_seconds or 0.0)
     last_sample_log_perf = float("-inf")
 
     def remember_recently_closed(record_id: str, payload: dict[str, Any]) -> None:
@@ -3439,17 +3517,25 @@ def receive(args: argparse.Namespace) -> int:
         saving_detail: str,
         closed_perf_counter: float | None = None,
         async_close: bool | None = None,
+        close_details: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         nonlocal saving_record_id
         closed_record_id = session.record_id
         saving_record_id = closed_record_id
+        session.begin_close(reason, close_details)
         if visualizer is not None:
-            visualizer.set_capture_state("saving", closed_record_id, saving_detail)
+            visualizer.set_capture_state(
+                "saving",
+                closed_record_id,
+                saving_detail,
+                closeReason=reason,
+                closeDetails=dict(close_details) if isinstance(close_details, dict) else None,
+            )
 
         def close_work() -> dict[str, Any]:
             nonlocal saving_record_id
             try:
-                summary = session.close(reason)
+                summary = session.close(reason, close_details)
                 print_session_summary(summary, stream=sys.stderr)
                 handle_post_recording(summary, args)
                 remember_recently_closed(
@@ -3516,28 +3602,30 @@ def receive(args: argparse.Namespace) -> int:
             "savingAsync": True,
         }
 
+    def expire_active_recording(now_perf: float) -> bool:
+        nonlocal active
+        close_details = recording_lease.expiration(now_perf)
+        if active is None or close_details is None:
+            return False
+        session = active
+        active = None
+        recording_lease.clear()
+        finalize_session(
+            session,
+            "recording_idle_timeout",
+            saving_detail="Quest telemetry lost; finalizing PC recording",
+            closed_perf_counter=now_perf,
+            close_details=close_details,
+        )
+        return True
+
     try:
         while True:
             try:
                 data, remote = sock.recvfrom(65535)
             except TimeoutError:
                 now_perf = time.perf_counter()
-                idle_timeout = max(0.0, float(args.recording_idle_timeout_seconds or 0.0))
-                if (
-                    active is not None
-                    and idle_timeout > 0
-                    and last_active_recording_perf is not None
-                    and now_perf - last_active_recording_perf >= idle_timeout
-                ):
-                    closed_record_id = active.record_id
-                    summary = finalize_session(
-                        active,
-                        "recording_idle_timeout",
-                        saving_detail="Saving PC recording after idle timeout",
-                        closed_perf_counter=now_perf,
-                    )
-                    active = None
-                    last_active_recording_perf = None
+                if expire_active_recording(now_perf):
                     if args.single_session:
                         return 0
                     continue
@@ -3551,7 +3639,7 @@ def receive(args: argparse.Namespace) -> int:
                             closed_perf_counter=time.perf_counter(),
                         )
                         active = None
-                        last_active_recording_perf = None
+                        recording_lease.clear()
                     if total_messages == 0:
                         print(f"Timed out with no UDP telemetry after {args.timeout:.3f}s.", file=sys.stderr)
                         return 2
@@ -3560,6 +3648,8 @@ def receive(args: argparse.Namespace) -> int:
 
             pc_receive_unix_seconds = time.time()
             pc_receive_perf_counter_seconds = time.perf_counter()
+            if expire_active_recording(pc_receive_perf_counter_seconds) and args.single_session:
+                return 0
             last_datagram_perf = pc_receive_perf_counter_seconds
 
             if not data or data.isspace():
@@ -3635,7 +3725,7 @@ def receive(args: argparse.Namespace) -> int:
                         closed_perf_counter=time.perf_counter(),
                     )
                     active = None
-                    last_active_recording_perf = None
+                    recording_lease.clear()
                 elif visualizer is not None:
                     visualizer.publish_event(
                         {
@@ -3712,7 +3802,7 @@ def receive(args: argparse.Namespace) -> int:
                     visualizer,
                     args.formal_control_mode,
                 )
-                last_active_recording_perf = pc_receive_perf_counter_seconds
+                recording_lease.start(active.record_id, pc_receive_perf_counter_seconds)
                 print(f"Started PC session: {active.directory}", flush=True)
                 if visualizer is not None:
                     visualizer.set_capture_state("recording", record_id, "PC formal recording")
@@ -3720,7 +3810,7 @@ def receive(args: argparse.Namespace) -> int:
             if active is not None and record_id == active.record_id and (
                 msg_type == "recording_start" or (is_sample and is_recording_sample)
             ):
-                last_active_recording_perf = pc_receive_perf_counter_seconds
+                recording_lease.renew(record_id, pc_receive_perf_counter_seconds)
 
             if should_write and active is not None:
                 try:

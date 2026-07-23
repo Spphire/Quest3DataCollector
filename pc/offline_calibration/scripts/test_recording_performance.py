@@ -24,6 +24,7 @@ from flexiv_realsense_bridge import (
     OnlineNumericStats,
     OnlineTimeSeriesStats,
     ROBOT_SESSION_CONTROL_RECORD_ONLY,
+    ROBOT_SESSION_CONTROL_TELEOP,
     RobotRealsenseSession,
     ee_pose_diversity,
     ffmpeg_encoder_command_prefix,
@@ -31,6 +32,7 @@ from flexiv_realsense_bridge import (
 from bounded_teleop_probe import DelayedRedundantUdpSender
 from quest_pc_receiver import (
     FixedRateLatestSampler,
+    RecordingLease,
     RECORDINGS_REPLAY_HTML,
     build_performance_audit,
     decode_quest_udp_datagram,
@@ -343,6 +345,34 @@ class RecordingPerformanceTests(unittest.TestCase):
         self.assertTrue(note_quest_udp_wire_datagram(datagram, "10.0.0.2", 100.033, recent))
         self.assertFalse(note_quest_udp_wire_datagram(datagram + b"x", "10.0.0.2", 100.034, recent))
 
+    def test_recording_lease_expires_without_quest_stop_message(self) -> None:
+        lease = RecordingLease(2.0)
+        lease.start("record_power_loss", 100.0)
+
+        self.assertIsNone(lease.expiration(101.999))
+        expiration = lease.expiration(102.0)
+
+        self.assertIsNotNone(expiration)
+        self.assertTrue(expiration["questTelemetryLost"])
+        self.assertEqual(expiration["recordId"], "record_power_loss")
+        self.assertAlmostEqual(expiration["idleSecondsAtDetection"], 2.0)
+
+    def test_unrelated_udp_traffic_does_not_renew_recording_lease(self) -> None:
+        lease = RecordingLease(2.0)
+        lease.start("record_power_loss", 100.0)
+
+        self.assertFalse(lease.renew("live_preview_from_other_session", 101.9))
+
+        self.assertIsNotNone(lease.expiration(102.0))
+
+    def test_active_recording_datagram_renews_recording_lease(self) -> None:
+        lease = RecordingLease(2.0)
+        lease.start("record_active", 100.0)
+
+        self.assertTrue(lease.renew("record_active", 101.9))
+
+        self.assertIsNone(lease.expiration(102.0))
+
     def test_pose_diversity_bounds_pairwise_work_for_long_records(self) -> None:
         poses = []
         for index in range(600):
@@ -422,6 +452,43 @@ class RecordingPerformanceTests(unittest.TestCase):
         self.assertTrue(summary["ok"])
         self.assertEqual(fake_robot.arm_calls, 0)
         self.assertFalse(manager.config.controller_motion_enabled)
+
+    def test_recording_lease_failure_disarms_without_restoring_motion(self) -> None:
+        class FakeRobot:
+            def __init__(self) -> None:
+                self.arm_calls = 0
+                self.disarm_calls = 0
+
+            def arm_motion(self, _backend: str) -> dict[str, object]:
+                self.arm_calls += 1
+                return {}
+
+            def disarm_motion(self) -> dict[str, object]:
+                self.disarm_calls += 1
+                return {}
+
+        fake_robot = FakeRobot()
+        manager = FlexivRealSenseManager()
+        manager.robot = fake_robot
+        manager.config.controller_motion_enabled = True
+        session = SimpleNamespace(
+            control_mode=ROBOT_SESSION_CONTROL_TELEOP,
+            config=SimpleNamespace(controller_motion_enabled=True),
+            reset_controller_motion_anchor=lambda: None,
+            close=lambda: {"ok": True, "closedReason": "recording_idle_timeout"},
+        )
+        manager.active_session = session
+
+        stopped = manager.fail_safe_stop_session_control(session, "recording_idle_timeout")
+        summary = manager.stop_session(session, restore_motion=False)
+
+        self.assertTrue(stopped["ok"])
+        self.assertTrue(summary["ok"])
+        self.assertEqual(fake_robot.arm_calls, 0)
+        self.assertGreaterEqual(fake_robot.disarm_calls, 1)
+        self.assertFalse(session.config.controller_motion_enabled)
+        self.assertFalse(manager.config.controller_motion_enabled)
+        self.assertIsNone(manager.active_session)
 
     def test_fixed_rate_latest_sampler_targets_30_hz(self) -> None:
         ticks: list[dict[str, object]] = []
