@@ -183,6 +183,7 @@ Useful options:
 - `--controller-motion-scale 1.0` scales right-controller displacement into TCP displacement.
 - `--controller-motion-max-step 0.04` limits each target position update step. Teleop does not clamp cumulative TCP offset from the hand anchor.
 - `--controller-motion-max-rotation-step 4` limits each target orientation update step. Teleop does not clamp cumulative TCP rotation from the hand anchor.
+- `--cartesian-max-linear-velocity 1.0`, `--cartesian-max-angular-velocity 1.0`, `--cartesian-max-linear-acceleration 2.0`, and `--cartesian-max-angular-acceleration 2.0` configure the limits passed to Flexiv `SendCartesianMotionForce`; the lab launcher uses these values by default and records them in `capture_config.json`.
 - `--controller-motion-max-offset` and `--controller-motion-max-rotation` are accepted as legacy no-op arguments for old launch scripts.
 - `--controller-joint-limit-buffer 0.04` stops controller TCP commands when any joint is within the buffer around the URDF soft joint limits.
 - `--disable-controller-joint-limit-guard` disables that teleop joint-limit guard for debugging only.

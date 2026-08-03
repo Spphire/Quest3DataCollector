@@ -59,6 +59,10 @@ from flexiv_realsense_bridge import (
     DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG,
     DEFAULT_CONTROLLER_TARGET_UPDATE_HZ,
     DEFAULT_CONTROLLER_TRANSLATION_SCALE,
+    DEFAULT_FREEDRIVE_MAX_ANGULAR_ACC,
+    DEFAULT_FREEDRIVE_MAX_ANGULAR_VEL,
+    DEFAULT_FREEDRIVE_MAX_LINEAR_ACC,
+    DEFAULT_FREEDRIVE_MAX_LINEAR_VEL,
     ROBOT_SESSION_RECORD_ASYNC,
     ROBOT_SESSION_CONTROL_FREEDRIVE,
     ROBOT_SESSION_CONTROL_RECORD_ONLY,
@@ -638,6 +642,42 @@ def main() -> int:
         help=(
             "Maximum rate for updating the robot TCP target from the right controller. "
             f"Default: {DEFAULT_CONTROLLER_TARGET_UPDATE_HZ:g}"
+        ),
+    )
+    receive_parser.add_argument(
+        "--cartesian-max-linear-velocity",
+        type=float,
+        default=DEFAULT_FREEDRIVE_MAX_LINEAR_VEL,
+        help=(
+            "Maximum Cartesian linear velocity passed to Flexiv SendCartesianMotionForce, in m/s. "
+            f"Default: {DEFAULT_FREEDRIVE_MAX_LINEAR_VEL:g}"
+        ),
+    )
+    receive_parser.add_argument(
+        "--cartesian-max-angular-velocity",
+        type=float,
+        default=DEFAULT_FREEDRIVE_MAX_ANGULAR_VEL,
+        help=(
+            "Maximum Cartesian angular velocity passed to Flexiv SendCartesianMotionForce, in rad/s. "
+            f"Default: {DEFAULT_FREEDRIVE_MAX_ANGULAR_VEL:g}"
+        ),
+    )
+    receive_parser.add_argument(
+        "--cartesian-max-linear-acceleration",
+        type=float,
+        default=DEFAULT_FREEDRIVE_MAX_LINEAR_ACC,
+        help=(
+            "Maximum Cartesian linear acceleration passed to Flexiv SendCartesianMotionForce, in m/s^2. "
+            f"Default: {DEFAULT_FREEDRIVE_MAX_LINEAR_ACC:g}"
+        ),
+    )
+    receive_parser.add_argument(
+        "--cartesian-max-angular-acceleration",
+        type=float,
+        default=DEFAULT_FREEDRIVE_MAX_ANGULAR_ACC,
+        help=(
+            "Maximum Cartesian angular acceleration passed to Flexiv SendCartesianMotionForce, in rad/s^2. "
+            f"Default: {DEFAULT_FREEDRIVE_MAX_ANGULAR_ACC:g}"
         ),
     )
     receive_parser.add_argument(
@@ -3426,6 +3466,10 @@ def receive(args: argparse.Namespace) -> int:
                 controller_max_step_m=args.controller_motion_max_step,
                 controller_max_rotation_step_deg=args.controller_motion_max_rotation_step,
                 controller_target_update_hz=max(1.0, float(args.controller_target_update_hz)),
+                cartesian_max_linear_velocity_mps=args.cartesian_max_linear_velocity,
+                cartesian_max_angular_velocity_radps=args.cartesian_max_angular_velocity,
+                cartesian_max_linear_acceleration_mps2=args.cartesian_max_linear_acceleration,
+                cartesian_max_angular_acceleration_radps2=args.cartesian_max_angular_acceleration,
                 controller_joint_limit_buffer_rad=args.controller_joint_limit_buffer,
                 controller_joint_limit_guard_enabled=not args.disable_controller_joint_limit_guard,
                 gripper_enabled=args.enable_gripper,

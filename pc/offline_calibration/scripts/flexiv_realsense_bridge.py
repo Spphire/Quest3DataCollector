@@ -152,6 +152,16 @@ POSE_DIVERSITY_MAX_PAIRWISE_SAMPLES = 512
 FREEDRIVE_FLOATING_CARTESIAN_PRIMITIVE = "FloatingCartesian()"
 
 
+def positive_cartesian_limit(value: Any, name: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite positive number") from exc
+    if not math.isfinite(number) or number <= 0.0:
+        raise ValueError(f"{name} must be a finite positive number")
+    return number
+
+
 class RobotHandEyeCalibrationError(RuntimeError):
     def __init__(
         self,
@@ -320,6 +330,10 @@ class FlexivRealSenseConfig:
     controller_max_step_m: float = DEFAULT_CONTROLLER_MAX_STEP_M
     controller_max_rotation_step_deg: float = DEFAULT_CONTROLLER_MAX_ROTATION_STEP_DEG
     controller_target_update_hz: float = DEFAULT_CONTROLLER_TARGET_UPDATE_HZ
+    cartesian_max_linear_velocity_mps: float = DEFAULT_FREEDRIVE_MAX_LINEAR_VEL
+    cartesian_max_angular_velocity_radps: float = DEFAULT_FREEDRIVE_MAX_ANGULAR_VEL
+    cartesian_max_linear_acceleration_mps2: float = DEFAULT_FREEDRIVE_MAX_LINEAR_ACC
+    cartesian_max_angular_acceleration_radps2: float = DEFAULT_FREEDRIVE_MAX_ANGULAR_ACC
     controller_joint_limit_buffer_rad: float = DEFAULT_CONTROLLER_JOINT_LIMIT_BUFFER_RAD
     controller_joint_limit_guard_enabled: bool = True
     gripper_enabled: bool = False
@@ -332,9 +346,34 @@ class FlexivRealSenseConfig:
     gripper_trigger_open_threshold: float = DEFAULT_GRIPPER_TRIGGER_OPEN_THRESHOLD
     gripper_init_on_enable: bool = DEFAULT_GRIPPER_INIT_ON_ENABLE
 
+    def __post_init__(self) -> None:
+        self.cartesian_max_linear_velocity_mps = positive_cartesian_limit(
+            self.cartesian_max_linear_velocity_mps,
+            "cartesian max linear velocity",
+        )
+        self.cartesian_max_angular_velocity_radps = positive_cartesian_limit(
+            self.cartesian_max_angular_velocity_radps,
+            "cartesian max angular velocity",
+        )
+        self.cartesian_max_linear_acceleration_mps2 = positive_cartesian_limit(
+            self.cartesian_max_linear_acceleration_mps2,
+            "cartesian max linear acceleration",
+        )
+        self.cartesian_max_angular_acceleration_radps2 = positive_cartesian_limit(
+            self.cartesian_max_angular_acceleration_radps2,
+            "cartesian max angular acceleration",
+        )
+
 
 class FlexivRobotClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        cartesian_max_linear_velocity_mps: float = DEFAULT_FREEDRIVE_MAX_LINEAR_VEL,
+        cartesian_max_angular_velocity_radps: float = DEFAULT_FREEDRIVE_MAX_ANGULAR_VEL,
+        cartesian_max_linear_acceleration_mps2: float = DEFAULT_FREEDRIVE_MAX_LINEAR_ACC,
+        cartesian_max_angular_acceleration_radps2: float = DEFAULT_FREEDRIVE_MAX_ANGULAR_ACC,
+    ) -> None:
         self.robot: Any | None = None
         self.robot_sn: str | None = None
         self.pose_field = "flange_pose"
@@ -363,6 +402,22 @@ class FlexivRobotClient:
         self.device_list_cache: dict[str, bool] | None = None
         self.device_list_last_error: str | None = None
         self.joint_limits = default_rizon4_joint_limits()
+        self.cartesian_max_linear_velocity_mps = positive_cartesian_limit(
+            cartesian_max_linear_velocity_mps,
+            "cartesian max linear velocity",
+        )
+        self.cartesian_max_angular_velocity_radps = positive_cartesian_limit(
+            cartesian_max_angular_velocity_radps,
+            "cartesian max angular velocity",
+        )
+        self.cartesian_max_linear_acceleration_mps2 = positive_cartesian_limit(
+            cartesian_max_linear_acceleration_mps2,
+            "cartesian max linear acceleration",
+        )
+        self.cartesian_max_angular_acceleration_radps2 = positive_cartesian_limit(
+            cartesian_max_angular_acceleration_radps2,
+            "cartesian max angular acceleration",
+        )
 
     def connect(
         self,
@@ -448,6 +503,7 @@ class FlexivRobotClient:
                 "freeDragLastError": self.freedrive_last_error,
                 "freedriveControlHz": DEFAULT_FREEDRIVE_CONTROL_HZ,
                 "freeDragControlHz": DEFAULT_FREEDRIVE_CONTROL_HZ,
+                "cartesianMotionLimits": self.cartesian_motion_limits_locked(),
                 "cartesianSendSignature": self.freedrive_send_signature,
                 "cartesianSend": self.cartesian_send_status_locked(),
                 "gripper": self.gripper_status_locked(
@@ -748,6 +804,7 @@ class FlexivRobotClient:
             "freeDragLastError": self.freedrive_last_error,
             "freedriveControlHz": DEFAULT_FREEDRIVE_CONTROL_HZ,
             "freeDragControlHz": DEFAULT_FREEDRIVE_CONTROL_HZ,
+            "cartesianMotionLimits": self.cartesian_motion_limits_locked(),
             "cartesianSendSignature": self.freedrive_send_signature,
             "cartesianSend": self.cartesian_send_status_locked(),
             "gripper": self.gripper_status_locked(),
@@ -958,6 +1015,47 @@ class FlexivRobotClient:
         except TypeError:
             self.robot.SetCartesianImpedance(list(stiffness))
 
+    def configure_cartesian_motion_limits(
+        self,
+        *,
+        max_linear_velocity_mps: float,
+        max_angular_velocity_radps: float,
+        max_linear_acceleration_mps2: float,
+        max_angular_acceleration_radps2: float,
+    ) -> dict[str, float]:
+        values = {
+            "maxLinearVelocityMps": positive_cartesian_limit(
+                max_linear_velocity_mps,
+                "cartesian max linear velocity",
+            ),
+            "maxAngularVelocityRadps": positive_cartesian_limit(
+                max_angular_velocity_radps,
+                "cartesian max angular velocity",
+            ),
+            "maxLinearAccelerationMps2": positive_cartesian_limit(
+                max_linear_acceleration_mps2,
+                "cartesian max linear acceleration",
+            ),
+            "maxAngularAccelerationRadps2": positive_cartesian_limit(
+                max_angular_acceleration_radps2,
+                "cartesian max angular acceleration",
+            ),
+        }
+        with self.lock:
+            self.cartesian_max_linear_velocity_mps = values["maxLinearVelocityMps"]
+            self.cartesian_max_angular_velocity_radps = values["maxAngularVelocityRadps"]
+            self.cartesian_max_linear_acceleration_mps2 = values["maxLinearAccelerationMps2"]
+            self.cartesian_max_angular_acceleration_radps2 = values["maxAngularAccelerationRadps2"]
+            return self.cartesian_motion_limits_locked()
+
+    def cartesian_motion_limits_locked(self) -> dict[str, float]:
+        return {
+            "maxLinearVelocityMps": float(self.cartesian_max_linear_velocity_mps),
+            "maxAngularVelocityRadps": float(self.cartesian_max_angular_velocity_radps),
+            "maxLinearAccelerationMps2": float(self.cartesian_max_linear_acceleration_mps2),
+            "maxAngularAccelerationRadps2": float(self.cartesian_max_angular_acceleration_radps2),
+        }
+
     def cartesian_send_status_locked(self) -> dict[str, Any]:
         return {
             "count": self.cartesian_send_count,
@@ -979,6 +1077,8 @@ class FlexivRobotClient:
     def send_cartesian_motion_force_compat(self, robot: Any, pose: list[float]) -> None:
         target = [float(v) for v in pose[:7]]
         zero6 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        with self.lock:
+            limits = self.cartesian_motion_limits_locked()
         started = time.perf_counter()
         signature: str | None = None
         error: Exception | None = None
@@ -987,10 +1087,10 @@ class FlexivRobotClient:
             robot.SendCartesianMotionForce(
                 target,
                 zero6,
-                DEFAULT_FREEDRIVE_MAX_LINEAR_VEL,
-                DEFAULT_FREEDRIVE_MAX_ANGULAR_VEL,
-                DEFAULT_FREEDRIVE_MAX_LINEAR_ACC,
-                DEFAULT_FREEDRIVE_MAX_ANGULAR_ACC,
+                limits["maxLinearVelocityMps"],
+                limits["maxAngularVelocityRadps"],
+                limits["maxLinearAccelerationMps2"],
+                limits["maxAngularAccelerationRadps2"],
             )
             signature = "pose+wrench+limits"
         except TypeError as exc:
@@ -1025,6 +1125,7 @@ class FlexivRobotClient:
                 "signature": signature or self.freedrive_send_signature,
                 "error": str(error) if error is not None else None,
                 "fallbackErrors": fallback_errors[-3:],
+                "limits": limits,
                 "targetPoseWxyz": target,
                 "unixSeconds": time.time(),
             }
@@ -3850,7 +3951,12 @@ class FlexivRealSenseManager:
         self.motion_commands_allowed = self.formal_control_mode != ROBOT_SESSION_CONTROL_RECORD_ONLY
         if not self.motion_commands_allowed:
             self.config.controller_motion_enabled = False
-        self.robot = FlexivRobotClient()
+        self.robot = FlexivRobotClient(
+            cartesian_max_linear_velocity_mps=self.config.cartesian_max_linear_velocity_mps,
+            cartesian_max_angular_velocity_radps=self.config.cartesian_max_angular_velocity_radps,
+            cartesian_max_linear_acceleration_mps2=self.config.cartesian_max_linear_acceleration_mps2,
+            cartesian_max_angular_acceleration_radps2=self.config.cartesian_max_angular_acceleration_radps2,
+        )
         self.lock = threading.RLock()
         self.stream_hub = RealSenseStreamHub()
         self.active_session: RobotRealsenseSession | None = None
@@ -6318,6 +6424,10 @@ def config_from_json(payload: Any, fallback: FlexivRealSenseConfig | None = None
         ("controllerMaxStepM", "controller_max_step_m"),
         ("controllerMaxRotationStepDeg", "controller_max_rotation_step_deg"),
         ("controllerTargetUpdateHz", "controller_target_update_hz"),
+        ("cartesianMaxLinearVelocityMps", "cartesian_max_linear_velocity_mps"),
+        ("cartesianMaxAngularVelocityRadps", "cartesian_max_angular_velocity_radps"),
+        ("cartesianMaxLinearAccelerationMps2", "cartesian_max_linear_acceleration_mps2"),
+        ("cartesianMaxAngularAccelerationRadps2", "cartesian_max_angular_acceleration_radps2"),
         ("controllerJointLimitBufferRad", "controller_joint_limit_buffer_rad"),
         ("gripperOpenWidthM", "gripper_open_width_m"),
         ("gripperCloseWidthM", "gripper_close_width_m"),
@@ -6359,6 +6469,22 @@ def config_from_json(payload: Any, fallback: FlexivRealSenseConfig | None = None
         config.pattern_rows = int(pattern[1])
     if config.third_camera_serial and config.third_camera_serial == config.camera_serial:
         config.third_camera_serial = ""
+    config.cartesian_max_linear_velocity_mps = positive_cartesian_limit(
+        config.cartesian_max_linear_velocity_mps,
+        "cartesian max linear velocity",
+    )
+    config.cartesian_max_angular_velocity_radps = positive_cartesian_limit(
+        config.cartesian_max_angular_velocity_radps,
+        "cartesian max angular velocity",
+    )
+    config.cartesian_max_linear_acceleration_mps2 = positive_cartesian_limit(
+        config.cartesian_max_linear_acceleration_mps2,
+        "cartesian max linear acceleration",
+    )
+    config.cartesian_max_angular_acceleration_radps2 = positive_cartesian_limit(
+        config.cartesian_max_angular_acceleration_radps2,
+        "cartesian max angular acceleration",
+    )
     return config
 
 
@@ -6402,6 +6528,10 @@ def config_to_json(config: FlexivRealSenseConfig) -> dict[str, Any]:
         "controllerMaxRotationDeg": None,
         "controllerMaxRotationStepDeg": config.controller_max_rotation_step_deg,
         "controllerTargetUpdateHz": config.controller_target_update_hz,
+        "cartesianMaxLinearVelocityMps": config.cartesian_max_linear_velocity_mps,
+        "cartesianMaxAngularVelocityRadps": config.cartesian_max_angular_velocity_radps,
+        "cartesianMaxLinearAccelerationMps2": config.cartesian_max_linear_acceleration_mps2,
+        "cartesianMaxAngularAccelerationRadps2": config.cartesian_max_angular_acceleration_radps2,
         "controllerJointLimitBufferRad": config.controller_joint_limit_buffer_rad,
         "controllerJointLimitGuardEnabled": config.controller_joint_limit_guard_enabled,
         "gripperEnabled": config.gripper_enabled,

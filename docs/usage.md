@@ -40,7 +40,8 @@ The script stops only existing `quest_pc_receiver.py receive` processes, starts
 the receiver under `nohup`, writes logs to `receiver.log`, and uses the current
 lab defaults: UDP `9100`, viewer `8765`, Flexiv interface `192.168.2.108`,
 end RealSense `244222073667`, third RealSense `750612070265`, robot state
-`90 Hz`, and depth every `3` RGB frames.
+`90 Hz`, Cartesian limits `1.0 m/s`, `1.0 rad/s`, `2.0 m/s^2`, and
+`2.0 rad/s^2`, and depth every `3` RGB frames.
 
 With `--enable-gripper`, the default gripper device is `auto`: the receiver
 asks the connected Flexiv robot for the Elements device list, prefers online
@@ -80,6 +81,7 @@ Useful receiver options:
 - `--udp-receive-buffer-bytes <N>` requests a larger UDP receive buffer for Quest telemetry bursts. The effective value may still be capped by the remote OS socket limits.
 - `--recording-idle-timeout-seconds <T>` closes an active PC recording if its own recording datagrams stop arriving for too long, which helps recover when a `recording_stop` packet is lost.
 - `--formal-control-mode record_only` keeps A-button formal recording in a no-arm-motion mode for safe performance benchmarks. Robot state, cameras, Quest data, and optional gripper handling remain available.
+- `--cartesian-max-linear-velocity`, `--cartesian-max-angular-velocity`, `--cartesian-max-linear-acceleration`, and `--cartesian-max-angular-acceleration` set the four limits passed to Flexiv `SendCartesianMotionForce`. Every formal record stores the effective values in `robot_realsense/capture_config.json`.
 
 Formal A-button recording rates:
 

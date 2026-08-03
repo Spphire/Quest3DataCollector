@@ -26,6 +26,8 @@ from flexiv_realsense_bridge import (
     ROBOT_SESSION_CONTROL_RECORD_ONLY,
     ROBOT_SESSION_CONTROL_TELEOP,
     RobotRealsenseSession,
+    config_from_json,
+    config_to_json,
     ee_pose_diversity,
     ffmpeg_encoder_command_prefix,
 )
@@ -272,6 +274,55 @@ class RecordingPerformanceTests(unittest.TestCase):
         self.assertEqual(client.motion_last_target_pose, second)
         self.assertTrue(second_result["commandSent"])
         self.assertEqual(sent_targets, [second])
+
+    def test_cartesian_motion_limits_are_sent_reported_and_serialized(self) -> None:
+        class FakeRobot:
+            def __init__(self) -> None:
+                self.calls: list[tuple[object, ...]] = []
+
+            def SendCartesianMotionForce(self, *args: object) -> None:
+                self.calls.append(args)
+
+        limits = {
+            "cartesian_max_linear_velocity_mps": 1.0,
+            "cartesian_max_angular_velocity_radps": 1.0,
+            "cartesian_max_linear_acceleration_mps2": 2.0,
+            "cartesian_max_angular_acceleration_radps2": 2.0,
+        }
+        client = FlexivRobotClient(**limits)
+        robot = FakeRobot()
+        pose = [0.4, -0.1, 0.5, 1.0, 0.0, 0.0, 0.0]
+
+        client.send_cartesian_motion_force_compat(robot, pose)
+
+        self.assertEqual(len(robot.calls), 1)
+        self.assertEqual(robot.calls[0][2:], (1.0, 1.0, 2.0, 2.0))
+        expected = {
+            "maxLinearVelocityMps": 1.0,
+            "maxAngularVelocityRadps": 1.0,
+            "maxLinearAccelerationMps2": 2.0,
+            "maxAngularAccelerationRadps2": 2.0,
+        }
+        self.assertEqual(client.status(include_state=False, include_devices=False)["cartesianMotionLimits"], expected)
+        self.assertEqual(client.cartesian_last_send["limits"], expected)
+
+        payload = config_to_json(FlexivRealSenseConfig(**limits))
+        restored = config_from_json(payload)
+        self.assertEqual(payload["cartesianMaxLinearVelocityMps"], 1.0)
+        self.assertEqual(payload["cartesianMaxAngularVelocityRadps"], 1.0)
+        self.assertEqual(payload["cartesianMaxLinearAccelerationMps2"], 2.0)
+        self.assertEqual(payload["cartesianMaxAngularAccelerationRadps2"], 2.0)
+        self.assertEqual(restored.cartesian_max_linear_velocity_mps, 1.0)
+        self.assertEqual(restored.cartesian_max_angular_velocity_radps, 1.0)
+        self.assertEqual(restored.cartesian_max_linear_acceleration_mps2, 2.0)
+        self.assertEqual(restored.cartesian_max_angular_acceleration_radps2, 2.0)
+
+        manager = FlexivRealSenseManager(FlexivRealSenseConfig(**limits))
+        self.assertEqual(manager.robot.cartesian_motion_limits_locked(), expected)
+
+    def test_cartesian_motion_limits_reject_nonpositive_values(self) -> None:
+        with self.assertRaisesRegex(ValueError, "finite positive"):
+            FlexivRealSenseConfig(cartesian_max_linear_velocity_mps=0.0)
 
     def test_ffmpeg_encoder_runs_at_lower_priority_on_linux(self) -> None:
         with (
