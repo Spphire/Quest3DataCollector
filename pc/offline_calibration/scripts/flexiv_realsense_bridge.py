@@ -106,8 +106,12 @@ DEFAULT_GRIPPER_TRIGGER_CLOSE_THRESHOLD = 0.65
 DEFAULT_GRIPPER_TRIGGER_OPEN_THRESHOLD = 0.25
 DEFAULT_GRIPPER_INIT_ON_ENABLE = False
 MAX_HAND_EYE_CAMERA_OFFSET_M = 0.50
-MAX_HAND_EYE_TRANSLATION_MEDIAN_RESIDUAL_MM = 15.0
-MAX_HAND_EYE_TRANSLATION_P95_RESIDUAL_MM = 35.0
+MAX_HAND_EYE_TRANSLATION_MEDIAN_RESIDUAL_MM = 5.0
+MAX_HAND_EYE_TRANSLATION_P90_RESIDUAL_MM = 10.0
+MAX_HAND_EYE_TRANSLATION_MAX_RESIDUAL_MM = 15.0
+MAX_HAND_EYE_ROTATION_MEDIAN_RESIDUAL_DEG = 1.5
+MAX_HAND_EYE_ROTATION_P90_RESIDUAL_DEG = 2.0
+MAX_HAND_EYE_ROTATION_MAX_RESIDUAL_DEG = 3.0
 APPEARANCE_ANCHOR_MIN_CONTRAST = 18.0
 QUEST_TO_ROBOT_UNALIGNED_ROTATION = np.array(
     [
@@ -4673,15 +4677,18 @@ class FlexivRealSenseManager:
             diversity = exc.diversity if isinstance(exc, RobotHandEyeCalibrationError) else None
             observations = exc.observations if isinstance(exc, RobotHandEyeCalibrationError) else None
             diagnostics = exc.diagnostics if isinstance(exc, RobotHandEyeCalibrationError) else None
+            record_id = session_dir.parent.name if session_dir.parent != session_dir else None
             failure = {
                 "type": "robot_calibration_failure",
                 "ok": False,
+                "recordId": record_id,
                 "runDir": str(session_dir),
                 "error": str(exc),
                 "createdAtUtc": datetime.now(timezone.utc).isoformat(),
                 "counts": counts,
                 "diversity": diversity,
                 "diagnostics": diagnostics,
+                "quality": diagnostics.get("quality") if isinstance(diagnostics, dict) else None,
                 "observations": observations_to_json(observations) if observations is not None else None,
             }
             write_json(failure, session_dir / "robot_hand_eye_failure.json")
@@ -4946,7 +4953,7 @@ def calibrate_robot_realsense_run(
             observations=observations,
         ) from exc
     solution = solve_end_hand_eye(observations)
-    validate_hand_eye_solution(solution, counts, diversity, observations)
+    quality = validate_hand_eye_solution(solution, counts, diversity, observations)
     result = {
         "ok": True,
         "record_id": samples[0].get("record_id") if samples else None,
@@ -4962,6 +4969,7 @@ def calibrate_robot_realsense_run(
             "appearance_anchor_rot180": int(sum((obs.get("appearance_anchor") or {}).get("order") == "rot180" for obs in observations)),
         },
         "diversity": diversity,
+        "quality": quality,
         "end_camera": {
             "T_ee_realsense": transform_to_json(solution["T_ee_camera"]),
             "T_realsense_ee": transform_to_json(invert_transform(solution["T_ee_camera"])),
@@ -5143,41 +5151,84 @@ def transform_distance_to_set(
     return distances
 
 
+def hand_eye_solution_quality(solution: dict[str, Any]) -> dict[str, Any]:
+    """Return acceptance diagnostics for a hand-eye solution."""
+    t_ee_camera = np.asarray(solution.get("T_ee_camera"), dtype=float)
+    offset_m = float(np.linalg.norm(t_ee_camera[:3, 3])) if t_ee_camera.shape == (4, 4) else float("nan")
+    residual = solution.get("residual_summary") if isinstance(solution, dict) else {}
+    translation = residual.get("translation_mm") if isinstance(residual, dict) else {}
+    rotation = residual.get("rotation_deg") if isinstance(residual, dict) else {}
+
+    def finite_stat(stats: Any, key: str) -> float | None:
+        if not isinstance(stats, dict):
+            return None
+        try:
+            value = float(stats.get(key))
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    metrics = {
+        "cameraOffsetM": offset_m if math.isfinite(offset_m) else None,
+        "translationResidualMedianMm": finite_stat(translation, "median"),
+        "translationResidualP90Mm": finite_stat(translation, "p90"),
+        "translationResidualMaxMm": finite_stat(translation, "max"),
+        "rotationResidualMedianDeg": finite_stat(rotation, "median"),
+        "rotationResidualP90Deg": finite_stat(rotation, "p90"),
+        "rotationResidualMaxDeg": finite_stat(rotation, "max"),
+    }
+    thresholds = {
+        "maxCameraOffsetM": MAX_HAND_EYE_CAMERA_OFFSET_M,
+        "maxTranslationResidualMedianMm": MAX_HAND_EYE_TRANSLATION_MEDIAN_RESIDUAL_MM,
+        "maxTranslationResidualP90Mm": MAX_HAND_EYE_TRANSLATION_P90_RESIDUAL_MM,
+        "maxTranslationResidualMm": MAX_HAND_EYE_TRANSLATION_MAX_RESIDUAL_MM,
+        "maxRotationResidualMedianDeg": MAX_HAND_EYE_ROTATION_MEDIAN_RESIDUAL_DEG,
+        "maxRotationResidualP90Deg": MAX_HAND_EYE_ROTATION_P90_RESIDUAL_DEG,
+        "maxRotationResidualDeg": MAX_HAND_EYE_ROTATION_MAX_RESIDUAL_DEG,
+    }
+    reasons: list[str] = []
+
+    def check(metric: str, threshold: str, label: str, unit: str, precision: str) -> None:
+        value = metrics[metric]
+        limit = thresholds[threshold]
+        if value is None:
+            reasons.append(f"{label} is missing or non-finite")
+        elif value > limit:
+            reasons.append(f"{label} {value:{precision}}{unit} > {limit:{precision}}{unit}")
+
+    check("cameraOffsetM", "maxCameraOffsetM", "end-camera extrinsic offset", "m", ".3f")
+    check("translationResidualMedianMm", "maxTranslationResidualMedianMm", "translation residual median", "mm", ".1f")
+    check("translationResidualP90Mm", "maxTranslationResidualP90Mm", "translation residual p90", "mm", ".1f")
+    check("translationResidualMaxMm", "maxTranslationResidualMm", "translation residual max", "mm", ".1f")
+    check("rotationResidualMedianDeg", "maxRotationResidualMedianDeg", "rotation residual median", "deg", ".2f")
+    check("rotationResidualP90Deg", "maxRotationResidualP90Deg", "rotation residual p90", "deg", ".2f")
+    check("rotationResidualMaxDeg", "maxRotationResidualDeg", "rotation residual max", "deg", ".2f")
+    return {
+        "ok": not reasons,
+        "accepted": not reasons,
+        "metrics": metrics,
+        "thresholds": thresholds,
+        "reasons": reasons,
+    }
+
+
 def validate_hand_eye_solution(
     solution: dict[str, Any],
     counts: dict[str, Any],
     diversity: dict[str, Any],
     observations: list[dict[str, Any]],
-) -> None:
-    t_ee_camera = np.asarray(solution["T_ee_camera"], dtype=float)
-    offset_m = float(np.linalg.norm(t_ee_camera[:3, 3]))
-    residual = solution.get("residual_summary") if isinstance(solution, dict) else {}
-    translation = residual.get("translation_mm") if isinstance(residual, dict) else {}
-    median_mm = float(translation.get("median") or 0.0) if isinstance(translation, dict) else 0.0
-    p95_mm = float(translation.get("p95") or 0.0) if isinstance(translation, dict) else 0.0
+) -> dict[str, Any]:
+    quality = hand_eye_solution_quality(solution)
     diagnostics = {
-        "cameraOffsetM": offset_m,
-        "maxCameraOffsetM": MAX_HAND_EYE_CAMERA_OFFSET_M,
-        "translationResidualMedianMm": median_mm,
-        "maxTranslationResidualMedianMm": MAX_HAND_EYE_TRANSLATION_MEDIAN_RESIDUAL_MM,
-        "translationResidualP95Mm": p95_mm,
-        "maxTranslationResidualP95Mm": MAX_HAND_EYE_TRANSLATION_P95_RESIDUAL_MM,
+        **quality["metrics"],
+        **quality["thresholds"],
+        "quality": quality,
         "hint": (
             "Check that the end camera serial is the camera mounted on the robot end-effector, "
             "and that the end-camera checkerboard view is not coming from the third/static camera."
         ),
     }
-    reasons = []
-    if offset_m > MAX_HAND_EYE_CAMERA_OFFSET_M:
-        reasons.append(f"end-camera extrinsic offset {offset_m:.3f}m > {MAX_HAND_EYE_CAMERA_OFFSET_M:.3f}m")
-    if median_mm > MAX_HAND_EYE_TRANSLATION_MEDIAN_RESIDUAL_MM:
-        reasons.append(
-            f"translation residual median {median_mm:.1f}mm > {MAX_HAND_EYE_TRANSLATION_MEDIAN_RESIDUAL_MM:.1f}mm"
-        )
-    if p95_mm > MAX_HAND_EYE_TRANSLATION_P95_RESIDUAL_MM:
-        reasons.append(
-            f"translation residual p95 {p95_mm:.1f}mm > {MAX_HAND_EYE_TRANSLATION_P95_RESIDUAL_MM:.1f}mm"
-        )
+    reasons = quality["reasons"]
     if reasons:
         raise RobotHandEyeCalibrationError(
             "Implausible Flexiv/RealSense hand-eye result: " + "; ".join(reasons),
@@ -5186,6 +5237,7 @@ def validate_hand_eye_solution(
             observations=observations,
             diagnostics=diagnostics,
         )
+    return quality
 
 
 def detect_end_observation(
@@ -5531,6 +5583,7 @@ def compact_robot_result(result: dict[str, Any]) -> dict[str, Any]:
         "recordId": result.get("record_id"),
         "counts": result.get("counts"),
         "diversity": result.get("diversity"),
+        "quality": result.get("quality"),
         "endCamera": result.get("end_camera"),
         "board": result.get("board"),
         "questAlignment": result.get("questAlignment"),

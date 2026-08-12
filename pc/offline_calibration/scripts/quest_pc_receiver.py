@@ -75,6 +75,7 @@ from flexiv_realsense_bridge import (
     compact_robot_result,
     ee_pose_diversity,
     flexiv_pose_payload_to_transform,
+    hand_eye_solution_quality,
     invert_transform,
     robot_row_tool_transform,
     robot_state_pose_transform,
@@ -837,7 +838,7 @@ def main() -> int:
         "--max-udp-sequence-loss-ratio",
         type=float,
         default=0.001,
-        help="Maximum missing Quest UDP sequence ratio. Default: 0.001 (0.1%).",
+        help="Maximum missing Quest UDP sequence ratio. Default: 0.001 (0.1%%).",
     )
     perf_parser.add_argument(
         "--max-udp-datagram-bytes",
@@ -2066,7 +2067,11 @@ class LiveTelemetryVisualizer:
             return dict(self.capture_state)
 
     def publish_event(self, event: dict[str, Any]) -> None:
-        if event.get("type") in ("calibration_result", "robot_calibration_result"):
+        if event.get("type") in (
+            "calibration_result",
+            "robot_calibration_result",
+            "robot_calibration_failure",
+        ):
             self.calibration_state_cleared = False
         payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         with self.lock:
@@ -7925,36 +7930,81 @@ def recording_calibration_snapshot(output_root: Path | None) -> dict[str, Any] |
     return compact
 
 
-def latest_robot_hand_eye_result(
+def _robot_calibration_artifacts(
     calibration_raw_root: Path | None,
     calibration_output_root: Path | None,
     recording_root: Path | None = None,
-) -> dict[str, Any] | None:
-    candidates: list[Path] = []
+) -> list[tuple[float, str, Path, dict[str, Any]]]:
+    """Return robot calibration artifacts newest first.
+
+    A failed hand-eye run is an explicit state and must take precedence over
+    an older successful result after a server restart.
+    """
+    candidates: list[tuple[float, str, Path, dict[str, Any]]] = []
+    seen: set[str] = set()
     for root in (calibration_raw_root, calibration_output_root, recording_root):
         if root is None:
             continue
         resolved = root.resolve()
         if not resolved.exists():
             continue
-        candidates.extend(resolved.glob("record_pc_calib*/robot_realsense/robot_hand_eye_result.json"))
-        candidates.extend(resolved.glob("record*/robot_realsense/robot_hand_eye_result.json"))
-    valid: list[tuple[tuple[int, float, str], Path, dict[str, Any]]] = []
-    for path in candidates:
-        if not path.exists() or path.stat().st_size <= 0:
-            continue
-        payload = read_json_if_exists(path)
-        if not isinstance(payload, dict) or not payload.get("ok"):
+        for filename, kind in (
+            ("robot_hand_eye_result.json", "result"),
+            ("robot_hand_eye_failure.json", "failure"),
+        ):
+            paths = list(resolved.glob(f"record_pc_calib*/robot_realsense/{filename}"))
+            paths.extend(resolved.glob(f"record*/robot_realsense/{filename}"))
+            for path in paths:
+                try:
+                    key = str(path.resolve())
+                    stat = path.stat()
+                except OSError:
+                    continue
+                if key in seen or stat.st_size <= 0:
+                    continue
+                payload = read_json_if_exists(path)
+                if not isinstance(payload, dict):
+                    continue
+                artifact_kind = kind
+                if kind == "result":
+                    end_camera = payload.get("end_camera") if isinstance(payload.get("end_camera"), dict) else {}
+                    quality = hand_eye_solution_quality(
+                        {
+                            "T_ee_camera": transform_from_json(end_camera.get("T_ee_realsense")),
+                            "residual_summary": end_camera.get("residuals"),
+                        }
+                    )
+                    payload = dict(payload)
+                    payload["quality"] = quality
+                    if not quality.get("ok"):
+                        payload["type"] = "robot_calibration_failure"
+                        payload["ok"] = False
+                        payload["error"] = payload.get("error") or (
+                            "Stored hand-eye result rejected by quality gate: "
+                            + "; ".join(quality.get("reasons") or ["quality check failed"])
+                        )
+                        artifact_kind = "failure"
+                seen.add(key)
+                candidates.append((float(stat.st_mtime), artifact_kind, path, payload))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates
+
+
+def latest_robot_hand_eye_result(
+    calibration_raw_root: Path | None,
+    calibration_output_root: Path | None,
+    recording_root: Path | None = None,
+) -> dict[str, Any] | None:
+    artifacts = _robot_calibration_artifacts(calibration_raw_root, calibration_output_root, recording_root)
+    if not artifacts or artifacts[0][1] == "failure":
+        return None
+    for _mtime, kind, path, payload in artifacts:
+        if kind != "result" or not payload.get("ok"):
             continue
         alignment = payload.get("questAlignment")
         if not isinstance(alignment, dict) or not alignment.get("ok"):
             continue
-        valid.append((robot_calibration_chronology_key(payload, path), path, payload))
-    if not valid:
-        return None
-    _, latest, payload = max(valid, key=lambda item: item[0])
-    if isinstance(payload, dict):
-        payload.setdefault("sourcePath", str(latest))
+        payload.setdefault("sourcePath", str(path))
         return payload
     return None
 
@@ -7964,20 +8014,40 @@ def latest_robot_calibration_event(
     calibration_output_root: Path | None,
     recording_root: Path | None = None,
 ) -> dict[str, Any] | None:
-    payload = latest_robot_hand_eye_result(calibration_raw_root, calibration_output_root, recording_root)
-    if not isinstance(payload, dict):
+    artifacts = _robot_calibration_artifacts(calibration_raw_root, calibration_output_root, recording_root)
+    if not artifacts:
         return None
-    alignment = payload.get("questAlignment") if isinstance(payload.get("questAlignment"), dict) else {}
-    event = {
-        "type": "robot_calibration_result",
-        "recordId": payload.get("record_id"),
-        "runDir": str(Path(str(payload.get("sourcePath"))).parent) if payload.get("sourcePath") else None,
-        "result": compact_robot_result(payload),
-        "T_world_base": alignment.get("T_world_base"),
-        "sourcePath": payload.get("sourcePath"),
-        "restored": True,
-    }
-    return event
+    _mtime, kind, path, payload = artifacts[0]
+    if kind == "failure":
+        record_id = payload.get("recordId") or payload.get("record_id") or path.parent.parent.name
+        failure_event = dict(payload)
+        failure_event.update(
+            {
+                "type": "robot_calibration_failure",
+                "recordId": record_id,
+                "runDir": payload.get("runDir") or str(path.parent),
+                "sourcePath": str(path),
+                "restored": True,
+            }
+        )
+        return failure_event
+    for _mtime, artifact_kind, artifact_path, artifact_payload in artifacts:
+        if artifact_kind != "result" or not artifact_payload.get("ok"):
+            continue
+        alignment = artifact_payload.get("questAlignment")
+        if not isinstance(alignment, dict) or not alignment.get("ok"):
+            continue
+        artifact_payload.setdefault("sourcePath", str(artifact_path))
+        return {
+            "type": "robot_calibration_result",
+            "recordId": artifact_payload.get("recordId") or artifact_payload.get("record_id"),
+            "runDir": str(Path(str(artifact_payload.get("sourcePath"))).parent),
+            "result": compact_robot_result(artifact_payload),
+            "T_world_base": alignment.get("T_world_base"),
+            "sourcePath": artifact_payload.get("sourcePath") or str(artifact_path),
+            "restored": True,
+        }
+    return None
 
 
 def is_successful_calibration_snapshot(snapshot: dict[str, Any] | None) -> bool:
@@ -10301,6 +10371,7 @@ function updateRobotCalibration(event) {
   if (event.T_world_base?.matrix_4x4) state.robotWorldBase = event.T_world_base.matrix_4x4;
   if (changed && hasDrawableRobot()) requestViewFit();
   renderRobotStatus(state.robot);
+  if (state.calibration?.result) renderCalibrationResult(state.calibration.result);
   markRenderDirty();
 }
 
@@ -10309,6 +10380,7 @@ function applyRobotCalibrationCleared(event) {
   state.robotCalibrationKey = null;
   state.robotWorldBase = null;
   renderRobotStatus(state.robot);
+  if (state.calibration?.result) renderCalibrationResult(state.calibration.result);
   markRenderDirty();
 }
 
@@ -10494,7 +10566,13 @@ function renderRobotStatus(payload) {
     lines.push(`gripper: ${robotGripperSummaryText(state.robotGripper)}`);
   }
   if (state.robotCalibration) {
-    lines.push(state.robotCalibration.type === 'robot_calibration_result' ? 'hand-eye: done' : `hand-eye: failed ${state.robotCalibration.error || ''}`);
+    const handEyeState = calibrationHandEyeState(state.robotCalibration);
+    lines.push(`hand-eye: ${handEyeState}${handEyeState === 'failed' ? ` ${handEyeFailureReason(state.robotCalibration)}` : ''}`);
+    const handEyeQuality = handEyeQualityPayload(state.robotCalibration);
+    const handEyeMetrics = handEyeQuality?.metrics || {};
+    if (Number.isFinite(handEyeMetrics.translationResidualMaxMm) || Number.isFinite(handEyeMetrics.rotationResidualMaxDeg)) {
+      lines.push(`hand-eye residual max: ${Number.isFinite(handEyeMetrics.translationResidualMaxMm) ? `${Number(handEyeMetrics.translationResidualMaxMm).toFixed(1)}mm` : 'n/a'} / ${Number.isFinite(handEyeMetrics.rotationResidualMaxDeg) ? `${Number(handEyeMetrics.rotationResidualMaxDeg).toFixed(2)}deg` : 'n/a'}`);
+    }
     const resultDiversity = state.robotCalibration.result?.diversity;
     if (resultDiversity) lines.push(`hand-eye result motion: ${poseDiversityText(resultDiversity)}`);
   }
@@ -10831,8 +10909,6 @@ function updateCalibrationResult(event) {
     ...(state.calibration || {}),
     result: event
   };
-  const median = Number.isFinite(event.medianReprojectionPx) ? `${event.medianReprojectionPx.toFixed(2)}px` : 'n/a';
-  mCalibration.textContent = `done ${median}`;
   mCalibrationFill.style.width = '100%';
   if (event.T_world_board?.translation_m) {
     state.origin = event.T_world_board.translation_m.slice();
@@ -10914,8 +10990,44 @@ function renderCalibrationResult(event) {
   const normalAngle = Number.isFinite(event.boardNormalAbsAngleToWorldZDeg)
     ? `${event.boardNormalAbsAngleToWorldZDeg.toFixed(1)} deg`
     : 'n/a';
+  const handEye = state.robotCalibration;
+  const handEyeQuality = handEyeQualityPayload(handEye);
+  const handEyeState = calibrationHandEyeState(handEye);
+  const handEyeRequired = handEyeExpectedForCalibration();
+  let statusClass = 'calibration-ok';
+  let statusText = handEyeRequired ? 'Quest calibration succeeded; hand-eye validation pending' : 'Quest calibration succeeded';
+  if (handEyeState === 'failed') {
+    statusClass = 'calibration-alert';
+    statusText = `Calibration failed: ${handEyeFailureReason(handEye)}`;
+  } else if (handEyeState === 'pending') {
+    statusClass = 'calibration-alert';
+    statusText = 'Quest calibration succeeded; waiting for hand-eye calibration';
+  } else if (handEyeState === 'unknown') {
+    statusClass = 'calibration-alert';
+    statusText = 'Quest calibration succeeded; hand-eye quality is unavailable';
+  } else if (handEyeState === 'ok') {
+    statusText = 'Calibration succeeded';
+  } else if (!handEyeRequired) {
+    statusText = 'Quest calibration succeeded (hand-eye not run)';
+  }
+  const handEyeMetrics = handEyeQuality?.metrics || {};
+  const translationMax = Number.isFinite(handEyeMetrics.translationResidualMaxMm)
+    ? `${Number(handEyeMetrics.translationResidualMaxMm).toFixed(1)} mm`
+    : 'n/a';
+  const rotationMax = Number.isFinite(handEyeMetrics.rotationResidualMaxDeg)
+    ? `${Number(handEyeMetrics.rotationResidualMaxDeg).toFixed(2)} deg`
+    : 'n/a';
+  const handEyeRows = handEye
+    ? `<span>hand-eye</span><span>${escapeHtml(handEyeState)}${handEyeState === 'failed' ? `: ${escapeHtml(handEyeFailureReason(handEye))}` : ''}</span>
+      <span>hand-eye residual max</span><span>${translationMax} / ${rotationMax}</span>`
+    : '';
+  if (handEyeState === 'failed' || handEyeState === 'pending' || handEyeState === 'unknown') {
+    mCalibration.textContent = handEyeState === 'failed' ? 'failed hand-eye' : `Quest done; hand-eye ${handEyeState}`;
+  } else {
+    mCalibration.textContent = `${handEyeState === 'ok' ? 'done' : 'Quest done'} ${median}`;
+  }
   calibrationDetails.innerHTML = `
-    <div class="calibration-ok">Calibration succeeded</div>
+    <div class="${statusClass}">${escapeHtml(statusText)}</div>
     <div class="calibration-kv">
       <span>record</span><span>${escapeHtml(event.rawRecordName || event.recordId || 'n/a')}</span>
       <span>image y</span><span>${escapeHtml(event.imageYAxis || 'n/a')}</span>
@@ -10925,7 +11037,38 @@ function renderCalibrationResult(event) {
       <span>rot180</span><span>${event.rot180Frames ?? 'n/a'}</span>
       <span>median / p90</span><span>${median} / ${p90}</span>
       <span>board Z vs world Z</span><span>${normalAngle}</span>
+      ${handEyeRows}
     </div>`;
+}
+
+function handEyeExpectedForCalibration() {
+  if (state.robot?.enabled === false) return false;
+  if (typeof state.robot?.config?.runHandEye === 'boolean') return state.robot.config.runHandEye;
+  return true;
+}
+
+function handEyeQualityPayload(event) {
+  if (!event) return null;
+  if (event.result?.quality && typeof event.result.quality === 'object') return event.result.quality;
+  if (event.quality && typeof event.quality === 'object') return event.quality;
+  if (event.diagnostics?.quality && typeof event.diagnostics.quality === 'object') return event.diagnostics.quality;
+  return null;
+}
+
+function calibrationHandEyeState(event) {
+  if (!event) return handEyeExpectedForCalibration() ? 'pending' : 'not_run';
+  if (event.type === 'robot_calibration_failure') return 'failed';
+  if (event.type !== 'robot_calibration_result') return 'unknown';
+  const quality = handEyeQualityPayload(event);
+  if (!quality || typeof quality.ok !== 'boolean') return 'unknown';
+  return quality.ok ? 'ok' : 'failed';
+}
+
+function handEyeFailureReason(event) {
+  if (!event) return 'unknown hand-eye error';
+  const quality = handEyeQualityPayload(event);
+  const reasons = Array.isArray(quality?.reasons) ? quality.reasons.filter(Boolean) : [];
+  return event.error || reasons.join('; ') || event.reason || 'hand-eye residual exceeds the acceptance threshold';
 }
 
 function renderCalibrationDiagnostics(event) {
