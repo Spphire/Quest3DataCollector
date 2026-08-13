@@ -1,0 +1,4 @@
+interface:
+  display_name: "Collector To Gaze-WAM Zarr"
+  short_description: "Filter and convert Collector recordings to canonical robot Zarr"
+  default_prompt: "Use $convert-pc-recordings-to-gaze-wam-zarr to select stable Collector records, convert them, and validate the resulting robot Zarr."
