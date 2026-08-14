@@ -11999,7 +11999,7 @@ label { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap
 <body>
 <div id="app">
   <div id="toolbar">
-    <a href="/recordings">? Recordings</a>
+    <a href="/recordings">&larr; Recordings</a>
     <span id="title"></span>
     <label>Gaze
       <select id="gazeMode">
