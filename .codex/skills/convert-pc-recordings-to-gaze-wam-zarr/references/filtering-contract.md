@@ -1,85 +1,86 @@
-# Filtering And Conversion Contract
+# Reusable Filtering And Conversion Contract
 
-## Repository Boundary
+## Ownership
 
-`Quest3DataCollector` owns `pc_recordings`, performance audit semantics, RealSense roles, calibration references, and Collector-to-canonical-Zarr conversion. `gaze-dp` owns the canonical schema validator, dataset reader, and training behavior.
+`Quest3DataCollector` owns batch selection, recording integrity, stream alignment, camera calibration, gaze reprojection, and Collector-to-Zarr conversion. `gaze-dp` owns canonical schema validation, dataset loading, and training behavior.
 
-The offline converter uses the self-contained pinned packages in `pc/offline_calibration/requirements-zarr.txt`. Keep this environment separate from the live Collector receiver and its hardware SDKs.
+Use the isolated environment from `pc/offline_calibration/requirements-zarr.txt`. Do not install conversion dependencies into the live Collector environment and do not restart the receiver for offline conversion.
 
-## 2026-08-13 Selection
+## Batch Boundary
 
-- Source: records whose IDs are at or after `record_20260813_162120`.
-- Candidate count: 62.
-- Selected count: 50.
-- Excluded count: 12.
-- Calibration: `record_pc_calib_20260813_161447`.
-- Calibration quality: `quality.ok=true`, `quality.accepted=true`.
-- Policy/end camera serial: `244222073667`.
-- Third camera serial: `750612070265`.
+A batch is an immutable, sorted, newline-separated list of recording directory names. Resolve it from one of:
 
-Qualify only these stability metrics:
+- Every `record_*` directory under a specified source directory.
+- An explicit user-provided record-ID list.
+- Inclusive `record_YYYYMMDD_HHMMSS` start/end boundaries.
 
-- `robot_state_rate` effective rate / 90 Hz must be at least 0.95.
-- `aligned_sample_rate` effective rate / 30 Hz must be at least 0.95.
-- `camera_end_rate` effective rate / 30 Hz must be at least 0.95.
-- `camera_third_rate` effective rate / 30 Hz must be at least 0.95.
-- `alignedReusedSourceSamples / alignedSamples.count` must be no more than 0.10.
+Require every listed directory. Never silently process a partial batch. Historical manifests are provenance artifacts, not defaults for a future batch.
 
-Do not exclude a record merely because the strict all-check audit reports isolated sampler missed ticks when all five dataset-stability metrics above pass. The committed allowlist and exclusion TSV are the reproducible result of this narrower dataset filter.
+## Default Episode Filter
 
-Gaze temporarily leaving the end-camera image is also not a record-level exclusion. The point-gaze-supervised canonical Zarr omits those individual rows and splits episode boundaries around resulting temporal gaps. A future no-gaze training mode must use an explicit presence-mask/config contract instead of fabricated image-bound gaze labels.
+Apply these rules to each physical recording independently:
 
-## Audit Command
+- Require aligned samples, robot states, both required videos, and end-camera intrinsics.
+- Require every retained aligned row to be valid and linked to a robot state.
+- Require contiguous camera frame indexes and monotonically increasing aligned/capture timelines.
+- Require image alignment age and internal sample/camera gaps to be at most 60 ms.
+- Search only for a common continuous window obtainable by trimming at most 1.0 second from each start/end of each aligned or camera stream.
+- Keep the retained window as one episode. Never extract an internal good segment around a bad middle interval.
+- Reject the entire physical recording when no valid common window exists or an internal discontinuity remains.
+- Require at least two retained samples and readable TCP pose/video paths.
 
-```bash
-.venv312/bin/python \
-  pc/offline_calibration/scripts/quest_pc_receiver.py \
-  audit-performance \
-  --pc-session pc/offline_calibration/pc_recordings/record_YYYYMMDD_HHMMSS \
-  --output-json /tmp/gaze_record_audit_20260813_162120/record_YYYYMMDD_HHMMSS.json
-```
+The converter writes `<output>.selection.json` even during `--dry-run` and even when every candidate is rejected. Its `candidate_count`, `accepted_count`, and `excluded_count` must reconcile, and every exclusion must include stable reason codes and details.
 
-## Transfer From Collector To H200-5041
+## Gaze Policy
 
-PowerShell/OpenSSH requires legacy SCP mode for this remote-to-remote path:
+- Treat gaze leaving the end-camera image as valid behavior, not a recording-level failure.
+- Apply a causal median filter of window 7 to Quest gaze-ray depth.
+- Linearly interpolate internal missing 3D gaze in PC world coordinates.
+- Do not extrapolate missing gaze at episode edges.
+- Reproject with each row's `T_world_end_camera` and that recording's end-camera intrinsics.
+- Preserve all action rows. Encode gaze availability with `has_gaze_label` and projection status instead of deleting action frames.
 
-```powershell
-scp -O -3 -r `
-  lvjun@10.128.1.95:/ssd1/shenyibo/Quest3DataCollector/pc/offline_calibration/pc_recordings/record_YYYYMMDD_HHMMSS `
-  H200-5041:/mnt/workspace/zhengkai/gaze_wam_robot_20260813/pc_recordings/
-```
+## Image Geometry
 
-Transfers are restartable per record. Verify all allowlisted directory names before conversion.
+Use the full end-camera frame. For a 1280x720 source and 256x256 output, resize proportionally to 256x144 and add 56 black pixels above and below. Apply the exact same letterbox transform to normalized `gaze_xy`.
 
-## Gaze-DP Validation
+Do not stretch or crop unless the user explicitly selects another geometry and the validator/training config uses the same setting.
 
-From the gaze-dp repository:
+## Action Contract
 
-```bash
-PYTHONPATH=$PWD python scripts/validate_gaze_wam_zarr.py \
-  --dataset-path /path/to/gaze_wam_robot.zarr \
-  --dataset-type robot \
-  --camera-key camera0_rgb \
-  --gaze-key gaze_xy \
-  --heatmap-key none \
-  --action-abs-key action_abs_tcp \
-  --tcp-pose-key tcp_pose_abs \
-  --gripper-key gripper_width \
-  --n-obs-steps 2 \
-  --action-horizon 16 \
-  --image-size 256 256 \
-  --image-resize-mode stretch \
-  --heatmap-token-grid 16 16 \
-  --heatmap-dim 16 \
-  --action-dim 10 \
-  --timestamp-key timestamp \
-  --image-timestamp-key image_timestamp \
-  --robot-state-timestamp-key robot_state_timestamp \
-  --action-timestamp-key action_timestamp \
-  --gaze-timestamp-key gaze_timestamp \
-  --require-timestamps \
-  --timestamp-max-delta 0.060 \
-  --timestamp-max-step 0.200
-```
+Write the current aligned executed TCP pose plus gripper width to `action_abs_tcp`. Do not shift action rows in the converter. Gaze-dp constructs each future action chunk relative to the observation time and episode boundary.
 
-The validator must compute timestamp intervals within `meta/episode_ends`; physical recordings and gap-split segments may have discontinuous absolute timestamps at episode boundaries.
+Required canonical keys include:
+
+- `data/camera0_rgb`
+- `data/gaze_xy`
+- `data/has_gaze_label`
+- `data/gaze_world_pc`
+- `data/gaze_3d_source`
+- `data/gaze_projection_status`
+- `data/action_abs_tcp`
+- `data/tcp_pose_abs`
+- `data/gripper_width`
+- aligned timestamp arrays
+- `meta/episode_ends`
+
+## Optional Audit Prefilter
+
+Do not apply the historical rate/reuse filter by default. When explicitly requested, require:
+
+- Flexiv robot-state effective rate / 90 Hz at least 0.95.
+- Aligned sample effective rate / 30 Hz at least 0.95.
+- End and third camera effective rates / 30 Hz at least 0.95.
+- `alignedReusedSourceSamples / alignedSamples.count` at most 0.10.
+
+Generate audit reports and prefilter manifests only from the current batch so unrelated recordings cannot enter by timestamp ordering.
+
+## Acceptance
+
+A batch is complete only when:
+
+1. The immutable candidate manifest exists.
+2. Selection counts reconcile and all exclusions are explained.
+3. Zarr conversion completes without trailing-frame substitution.
+4. The gaze-dp validator returns `"valid": true` with timestamps required.
+5. `GazeWAMDataset` successfully loads a sample using the intended training config.

@@ -804,12 +804,27 @@ def build_plans(
     max_gaze_age_seconds: Optional[float],
     max_sample_gap_seconds: Optional[float],
     max_endpoint_trim_seconds: float,
+    selection_report: Optional[dict] = None,
 ) -> List[EpisodePlan]:
     plans = []
     total = 0
     record_dirs = find_record_dirs(input_dir, record_ids=record_ids)
     if limit_records is not None:
         record_dirs = record_dirs[:limit_records]
+    if selection_report is not None:
+        selection_report["candidate_record_ids"] = [path.name for path in record_dirs]
+        selection_report["accepted"] = []
+        selection_report["excluded"] = []
+
+    def reject(record_id: str, reasons: List[str], details: Optional[dict] = None) -> None:
+        if selection_report is not None:
+            selection_report["excluded"].append(
+                {
+                    "record_id": record_id,
+                    "reasons": list(reasons),
+                    "details": dict(details or {}),
+                }
+            )
 
     for record_dir in record_dirs:
         episode_dir = record_dir / "robot_realsense"
@@ -819,14 +834,28 @@ def build_plans(
         cameras_path = episode_dir / "cameras.json"
         if not samples_path.exists() or not robot_states_path.exists():
             logger.warning(f"Skip {record_dir.name}: missing samples.jsonl or robot_states.jsonl")
+            reject(
+                record_dir.name,
+                ["missing_core_telemetry"],
+                {
+                    "missing_samples_jsonl": not samples_path.exists(),
+                    "missing_robot_states_jsonl": not robot_states_path.exists(),
+                },
+            )
             continue
         if require_camera_intrinsics and not cameras_path.exists():
             logger.warning(f"Skip {record_dir.name}: missing cameras.json")
+            reject(record_dir.name, ["missing_camera_intrinsics_file"])
             continue
         cameras = json.loads(cameras_path.read_text(encoding="utf-8")) if cameras_path.exists() else {}
         camera = cameras.get(wrist_role)
         if require_camera_intrinsics and not isinstance(camera, dict):
             logger.warning(f"Skip {record_dir.name}: missing {wrist_role} camera intrinsics")
+            reject(
+                record_dir.name,
+                ["missing_camera_intrinsics"],
+                {"camera_role": wrist_role},
+            )
             continue
 
         robot_states = load_robot_states(robot_states_path)
@@ -851,10 +880,29 @@ def build_plans(
                 max_gap_seconds=max_sample_gap_seconds,
             )
             if invalid_rows > 0 or missing_robot_state > 0 or video_reasons or discontinuities:
+                reasons = []
+                if invalid_rows > 0:
+                    reasons.append("invalid_aligned_rows")
+                if missing_robot_state > 0:
+                    reasons.append("missing_robot_state")
+                reasons.extend(video_reasons)
+                if discontinuities:
+                    reasons.append("timeline_discontinuity")
                 logger.warning(
                     f"Skip {record_dir.name}: strict episode integrity failed "
                     f"(invalid_rows={invalid_rows}, missing_robot_state={missing_robot_state}, "
                     f"video_reasons={video_reasons}, timeline_discontinuities={len(discontinuities)})"
+                )
+                reject(
+                    record_dir.name,
+                    reasons,
+                    {
+                        "invalid_rows": invalid_rows,
+                        "missing_robot_state_rows": missing_robot_state,
+                        "video_reasons": video_reasons,
+                        "timeline_discontinuities": discontinuities,
+                        "video_alignment": video_metrics,
+                    },
                 )
                 continue
         else:
@@ -868,6 +916,11 @@ def build_plans(
         segment_end_offsets = [len(valid_samples)] if valid_samples else []
         if len(valid_samples) < 2:
             logger.warning(f"Skip {record_dir.name}: only {len(valid_samples)} valid samples")
+            reject(
+                record_dir.name,
+                ["too_few_valid_samples"],
+                {"valid_samples": len(valid_samples)},
+            )
             continue
 
         try:
@@ -875,12 +928,28 @@ def build_plans(
             pose_row_to_9d(first_state, pose_frame)
         except Exception as exc:
             logger.warning(f"Skip {record_dir.name}: cannot read {pose_frame}: {exc}")
+            reject(
+                record_dir.name,
+                ["invalid_tcp_pose"],
+                {"pose_frame": pose_frame, "error": str(exc)},
+            )
             continue
 
         wrist_video = resolve_video_path(episode_dir, wrist_role, valid_samples)
         eye_video = resolve_video_path(episode_dir, eye_role, valid_samples)
         if wrist_video is None or eye_video is None:
             logger.warning(f"Skip {record_dir.name}: missing required videos")
+            reject(
+                record_dir.name,
+                ["missing_required_video"],
+                {
+                    "missing_roles": [
+                        role
+                        for role, video in ((wrist_role, wrist_video), (eye_role, eye_video))
+                        if video is None
+                    ]
+                },
+            )
             continue
 
         gripper_times, gripper_widths = load_gripper_timeline(gripper_path, default_gripper_width)
@@ -920,14 +989,20 @@ def build_plans(
             segment_end_offsets=segment_end_offsets,
             gaze_stats=gaze_stats,
         ))
+        if selection_report is not None:
+            selection_report["accepted"].append(
+                {
+                    "record_id": record_dir.name,
+                    "frames": len(valid_samples),
+                    "video_alignment": video_metrics,
+                }
+            )
         logger.info(
             f"{record_dir.name}: {len(valid_samples)} action/image samples in "
             f"one intact episode "
             f"(gaze={gaze_stats})"
         )
 
-    if not plans:
-        raise RuntimeError(f"No valid record_* episodes found under {input_dir}")
     return plans
 
 
@@ -1289,7 +1364,19 @@ def write_images(
         )
 
 
-def write_summary(output_path: Path, plans: List[EpisodePlan], args):
+def write_selection_report(path: Path, report: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+
+
+def write_summary(
+    output_path: Path,
+    plans: List[EpisodePlan],
+    args,
+    selection_report: dict,
+    selection_report_path: Path,
+):
     summary = {
         "input_dir": str(Path(args.input_dir).resolve()),
         "output_zarr": str(output_path.resolve()),
@@ -1300,6 +1387,10 @@ def write_summary(output_path: Path, plans: List[EpisodePlan], args):
         "image_resize_mode": args.image_resize_mode,
         "output_format": args.output_format,
         "record_ids_file": str(Path(args.record_ids_file).resolve()) if args.record_ids_file else None,
+        "selection_report": str(selection_report_path.resolve()),
+        "candidate_recordings": selection_report["candidate_count"],
+        "accepted_recordings": selection_report["accepted_count"],
+        "excluded_recordings": selection_report["excluded_count"],
         "action_semantics": (
             "absolute executed TCP pose plus gripper at the current aligned row"
             if args.output_format == "gaze-wam"
@@ -1349,6 +1440,28 @@ def convert_pc_recordings_to_zarr(args):
             "calibrated end camera; use --wrist-role end."
         )
     record_ids = load_record_ids(Path(args.record_ids_file).resolve()) if args.record_ids_file else None
+    selection_report_path = (
+        Path(args.selection_report).resolve()
+        if getattr(args, "selection_report", None)
+        else output_path.with_suffix(".selection.json")
+    )
+    selection_report = {
+        "schema_version": "collector_gaze_wam_batch_selection_v1",
+        "input_dir": str(input_dir),
+        "output_zarr": str(output_path),
+        "record_ids_file": str(Path(args.record_ids_file).resolve()) if args.record_ids_file else None,
+        "policy": {
+            "selection_unit": "whole_physical_recording",
+            "allow_internal_segment_extraction": False,
+            "max_endpoint_trim_seconds_per_stream_end": float(args.max_endpoint_trim_seconds),
+            "max_image_age_seconds": args.max_image_age_seconds,
+            "max_gaze_age_seconds": args.max_gaze_age_seconds,
+            "max_sample_gap_seconds": args.max_sample_gap_seconds,
+            "missing_gaze_excludes_recording": False,
+            "gaze_median_window": int(args.gaze_median_window),
+            "image_resize_mode": args.image_resize_mode,
+        },
+    }
     plans = build_plans(
         input_dir=input_dir,
         wrist_role=args.wrist_role,
@@ -1364,7 +1477,15 @@ def convert_pc_recordings_to_zarr(args):
         max_gaze_age_seconds=args.max_gaze_age_seconds,
         max_sample_gap_seconds=args.max_sample_gap_seconds,
         max_endpoint_trim_seconds=args.max_endpoint_trim_seconds,
+        selection_report=selection_report,
     )
+    selection_report["candidate_count"] = len(selection_report["candidate_record_ids"])
+    selection_report["accepted_count"] = len(selection_report["accepted"])
+    selection_report["excluded_count"] = len(selection_report["excluded"])
+    write_selection_report(selection_report_path, selection_report)
+    logger.info(f"Selection report: {selection_report_path}")
+    if not plans:
+        raise RuntimeError(f"No valid record_* episodes found under {input_dir}")
     total_frames = plans[-1].end_output_index
     logger.info(f"Total episodes: {len(plans)}")
     logger.info(f"Total frames: {total_frames}")
@@ -1449,7 +1570,7 @@ def convert_pc_recordings_to_zarr(args):
             },
             "presence_mask_keys": ["has_gaze_label", "has_heatmap_image"],
         })
-    write_summary(output_path, plans, args)
+    write_summary(output_path, plans, args, selection_report, selection_report_path)
     logger.info(f"Saved zarr: {output_path}")
     logger.info(f"Summary: {output_path.parent / 'pc_recordings_to_zarr_summary.json'}")
     return output_path
@@ -1472,6 +1593,14 @@ def main():
         "--record-ids-file",
         default=None,
         help="Optional newline-separated record allowlist. Missing allowlisted directories fail.",
+    )
+    parser.add_argument(
+        "--selection-report",
+        default=None,
+        help=(
+            "Write structured candidate/accepted/excluded results here. Defaults to "
+            "<output>.selection.json and is written for dry runs too."
+        ),
     )
     parser.add_argument(
         "--output",

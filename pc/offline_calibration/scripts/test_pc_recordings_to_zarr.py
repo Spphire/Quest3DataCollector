@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -25,6 +26,79 @@ class _MetaGroup:
 
 
 class PcRecordingsToZarrTest(unittest.TestCase):
+    def test_batch_selection_report_records_exclusion_reasons(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "record_20260813_162120").mkdir()
+            report = {}
+
+            plans = MODULE.build_plans(
+                input_dir=root,
+                wrist_role="end",
+                eye_role="third",
+                pose_frame="T_base_tool_tcp",
+                default_gripper_width=0.08,
+                max_image_age_seconds=0.060,
+                limit_records=None,
+                record_ids=None,
+                require_camera_intrinsics=True,
+                prepare_gaze=True,
+                gaze_median_window=7,
+                max_gaze_age_seconds=0.060,
+                max_sample_gap_seconds=0.060,
+                max_endpoint_trim_seconds=1.0,
+                selection_report=report,
+            )
+
+            self.assertEqual(plans, [])
+            self.assertEqual(report["candidate_record_ids"], ["record_20260813_162120"])
+            self.assertEqual(report["accepted"], [])
+            self.assertEqual(
+                report["excluded"][0]["reasons"],
+                ["missing_core_telemetry"],
+            )
+
+    def test_failed_batch_still_writes_structured_selection_report(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "record_missing_streams").mkdir()
+            output = root / "batch.zarr"
+            args = SimpleNamespace(
+                input_dir=str(root),
+                output=str(output),
+                output_format="gaze-wam",
+                record_ids_file=None,
+                selection_report=None,
+                wrist_role="end",
+                eye_role="third",
+                pose_frame="T_base_tool_tcp",
+                image_size=(256, 256),
+                image_resize_mode=None,
+                default_gripper_width=0.08,
+                max_image_age_seconds=0.060,
+                max_gaze_age_seconds=0.060,
+                gaze_median_window=7,
+                max_sample_gap_seconds=0.060,
+                max_endpoint_trim_seconds=1.0,
+                limit_records=None,
+                dry_run=True,
+                no_overwrite=False,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "No valid record"):
+                MODULE.convert_pc_recordings_to_zarr(args)
+
+            report = json.loads(
+                output.with_suffix(".selection.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(report["candidate_count"], 1)
+            self.assertEqual(report["accepted_count"], 0)
+            self.assertEqual(report["excluded_count"], 1)
+            self.assertEqual(
+                report["excluded"][0]["record_id"],
+                "record_missing_streams",
+            )
+
     def test_flush_frame_batch_writes_contiguous_runs_in_bulk(self):
         target = np.zeros((7, 2, 2, 3), dtype=np.uint8)
         first = np.full((2, 2, 3), 11, dtype=np.uint8)
