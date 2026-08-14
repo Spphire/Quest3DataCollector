@@ -30,6 +30,7 @@ The ``gaze-wam`` output writes the canonical robot contract:
   data/gripper_width              [N]
   data/{timestamp,image_timestamp,robot_state_timestamp,gaze_timestamp}
   data/{has_gaze_label,has_heatmap_image}
+  data/{gaze_world_pc,gaze_3d_source,gaze_projection_status}
   meta/episode_ends
 """
 
@@ -72,9 +73,32 @@ class EpisodePlan:
     end_output_index: int
     camera: Optional[dict]
     segment_end_offsets: Optional[List[int]] = None
-    dropped_stale_gaze: int = 0
-    dropped_invalid_gaze_projection: int = 0
-    dropped_short_segment_samples: int = 0
+    gaze_stats: Optional[Dict[str, object]] = None
+
+
+GAZE_3D_SOURCE_MISSING = 0
+GAZE_3D_SOURCE_MEDIAN_FILTERED = 1
+GAZE_3D_SOURCE_INTERPOLATED = 2
+
+GAZE_PROJECTION_MISSING_3D = 0
+GAZE_PROJECTION_VALID = 1
+GAZE_PROJECTION_BEHIND_CAMERA = 2
+GAZE_PROJECTION_OUT_OF_FRAME = 3
+GAZE_PROJECTION_INVALID = 4
+
+GAZE_3D_SOURCE_NAMES = {
+    GAZE_3D_SOURCE_MISSING: "missing",
+    GAZE_3D_SOURCE_MEDIAN_FILTERED: "causal_median_ray_depth",
+    GAZE_3D_SOURCE_INTERPOLATED: "linear_interpolation_pc_world",
+}
+
+GAZE_PROJECTION_STATUS_NAMES = {
+    GAZE_PROJECTION_MISSING_3D: "missing_3d",
+    GAZE_PROJECTION_VALID: "valid",
+    GAZE_PROJECTION_BEHIND_CAMERA: "behind_camera",
+    GAZE_PROJECTION_OUT_OF_FRAME: "out_of_frame",
+    GAZE_PROJECTION_INVALID: "invalid",
+}
 
 
 def iter_jsonl(path: Path) -> Iterable[dict]:
@@ -192,27 +216,208 @@ def pose_payload_to_matrix(value: dict) -> np.ndarray:
     return matrix
 
 
-def project_world_point(point_world: object, world_camera_pose: object, camera: dict) -> Optional[np.ndarray]:
+def project_world_point_with_status(
+    point_world: object,
+    world_camera_pose: object,
+    camera: dict,
+) -> Tuple[Optional[np.ndarray], int]:
     try:
         point = np.asarray(point_world, dtype=np.float64)
         if point.shape != (3,) or not np.all(np.isfinite(point)):
-            return None
+            return None, GAZE_PROJECTION_MISSING_3D
         world_camera = pose_payload_to_matrix(world_camera_pose)
         point_camera = np.linalg.inv(world_camera) @ np.asarray([*point, 1.0], dtype=np.float64)
         x, y, z = point_camera[:3]
-        if not np.all(np.isfinite(point_camera)) or z <= 1e-9:
-            return None
+        if not np.all(np.isfinite(point_camera)):
+            return None, GAZE_PROJECTION_INVALID
+        if z <= 1e-9:
+            return None, GAZE_PROJECTION_BEHIND_CAMERA
         u = float(camera["fx"]) * float(x) / float(z) + float(camera["cx"])
         v = float(camera["fy"]) * float(y) / float(z) + float(camera["cy"])
         width = float(camera["width"])
         height = float(camera["height"])
         if not all(math.isfinite(value) for value in (u, v, width, height)):
-            return None
-        if width <= 0 or height <= 0 or not (0.0 <= u < width and 0.0 <= v < height):
-            return None
-        return np.asarray([u / width, v / height], dtype=np.float32)
+            return None, GAZE_PROJECTION_INVALID
+        if width <= 0 or height <= 0:
+            return None, GAZE_PROJECTION_INVALID
+        projection = np.asarray([u / width, v / height], dtype=np.float32)
+        if not (0.0 <= u < width and 0.0 <= v < height):
+            return projection, GAZE_PROJECTION_OUT_OF_FRAME
+        return projection, GAZE_PROJECTION_VALID
     except (KeyError, TypeError, ValueError, np.linalg.LinAlgError):
+        return None, GAZE_PROJECTION_INVALID
+
+
+def project_world_point(point_world: object, world_camera_pose: object, camera: dict) -> Optional[np.ndarray]:
+    projection, status = project_world_point_with_status(point_world, world_camera_pose, camera)
+    return projection if status == GAZE_PROJECTION_VALID else None
+
+
+def normalize_vector(value: object) -> Optional[np.ndarray]:
+    try:
+        vector = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError):
         return None
+    if vector.shape != (3,) or not np.all(np.isfinite(vector)):
+        return None
+    norm = float(np.linalg.norm(vector))
+    if norm <= 1e-9:
+        return None
+    return vector / norm
+
+
+def load_quest_gaze_rays(record_dir: Path, median_window: int) -> Dict[int, dict]:
+    path = record_dir / "pc_samples.jsonl"
+    if not path.exists():
+        return {}
+    rays = {}
+    recent_depths: List[float] = []
+    for row in iter_jsonl(path):
+        sample_index = row.get("sampleIndex")
+        pc_world = row.get("pcWorld") if isinstance(row.get("pcWorld"), dict) else {}
+        origin = pc_world.get("gazeRayOrigin")
+        direction = normalize_vector(pc_world.get("gazeRayDirection"))
+        point = pc_world.get("gazePoint3DWorld")
+        if sample_index is None or direction is None:
+            continue
+        try:
+            origin_array = np.asarray(origin, dtype=np.float64)
+            point_array = np.asarray(point, dtype=np.float64)
+        except (TypeError, ValueError):
+            continue
+        if (
+            origin_array.shape != (3,)
+            or point_array.shape != (3,)
+            or not np.all(np.isfinite(origin_array))
+            or not np.all(np.isfinite(point_array))
+        ):
+            continue
+        depth = float(np.dot(point_array - origin_array, direction))
+        if not math.isfinite(depth) or depth <= 0.0:
+            continue
+        recent_depths.append(depth)
+        if len(recent_depths) > median_window:
+            recent_depths = recent_depths[-median_window:]
+        filtered_depth = float(np.median(np.asarray(recent_depths, dtype=np.float64)))
+        rays[int(sample_index)] = {
+            "origin": origin_array,
+            "direction": direction,
+            "depth": depth,
+            "filtered_point": origin_array + direction * filtered_depth,
+        }
+    return rays
+
+
+def sample_time(sample: dict, fallback_index: int) -> float:
+    for key in (
+        "aligned_target_perf_counter_seconds",
+        "pc_perf_counter_seconds",
+        "quest_pc_receive_perf_counter_seconds",
+    ):
+        value = sample.get(key)
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return float(value)
+    return float(fallback_index) / 30.0
+
+
+def build_smoothed_interpolated_gaze(
+    samples: List[dict],
+    quest_rays_by_index: Dict[int, dict],
+    *,
+    median_window: int,
+    segment_end_offsets: List[int],
+    max_gaze_age_seconds: Optional[float],
+) -> Dict[str, int]:
+    if median_window < 1:
+        raise ValueError("gaze median window must be at least 1")
+
+    fallback_xyz_count = 0
+    allow_xyz_fallback = not quest_rays_by_index
+    recent_xyz: List[np.ndarray] = []
+    for sample in samples:
+        aligned_time = sample.get("pc_perf_counter_seconds")
+        gaze_time = sample.get("quest_pc_receive_perf_counter_seconds")
+        gaze_is_stale = (
+            max_gaze_age_seconds is not None
+            and isinstance(aligned_time, (int, float))
+            and isinstance(gaze_time, (int, float))
+            and float(aligned_time) - float(gaze_time) > max_gaze_age_seconds
+        )
+        source_index = sample.get("quest_sample_index")
+        ray = (
+            quest_rays_by_index.get(int(source_index))
+            if source_index is not None and not gaze_is_stale
+            else None
+        )
+        point = None
+        if ray is not None:
+            point = np.asarray(ray["filtered_point"], dtype=np.float64)
+        else:
+            try:
+                raw_point = np.asarray(sample.get("quest_gaze3d_pc_world"), dtype=np.float64)
+            except (TypeError, ValueError):
+                raw_point = np.empty((0,), dtype=np.float64)
+            if (
+                allow_xyz_fallback
+                and not gaze_is_stale
+                and raw_point.shape == (3,)
+                and np.all(np.isfinite(raw_point))
+            ):
+                recent_xyz.append(raw_point)
+                if len(recent_xyz) > median_window:
+                    recent_xyz = recent_xyz[-median_window:]
+                point = np.median(np.stack(recent_xyz, axis=0), axis=0)
+                fallback_xyz_count += 1
+
+        sample["_gaze_world_pc"] = point
+        sample["_gaze_was_stale"] = gaze_is_stale
+        sample["_gaze_3d_source"] = (
+            GAZE_3D_SOURCE_MEDIAN_FILTERED if point is not None else GAZE_3D_SOURCE_MISSING
+        )
+
+    interpolated_count = 0
+    segment_start = 0
+    for segment_end in segment_end_offsets:
+        segment = samples[segment_start:segment_end]
+        valid_indices = [
+            index for index, sample in enumerate(segment)
+            if sample.get("_gaze_world_pc") is not None
+        ]
+        for left_index, right_index in zip(valid_indices, valid_indices[1:]):
+            if right_index <= left_index + 1:
+                continue
+            left = segment[left_index]
+            right = segment[right_index]
+            left_time = sample_time(left, segment_start + left_index)
+            right_time = sample_time(right, segment_start + right_index)
+            if right_time <= left_time:
+                continue
+            left_point = np.asarray(left["_gaze_world_pc"], dtype=np.float64)
+            right_point = np.asarray(right["_gaze_world_pc"], dtype=np.float64)
+            for index in range(left_index + 1, right_index):
+                target = segment[index]
+                if target.get("_gaze_world_pc") is not None:
+                    continue
+                target_time = sample_time(target, segment_start + index)
+                alpha = float(np.clip((target_time - left_time) / (right_time - left_time), 0.0, 1.0))
+                target["_gaze_world_pc"] = (1.0 - alpha) * left_point + alpha * right_point
+                target["_gaze_3d_source"] = GAZE_3D_SOURCE_INTERPOLATED
+                interpolated_count += 1
+        segment_start = segment_end
+
+    return {
+        "median_filtered_3d": sum(
+            1 for sample in samples
+            if sample.get("_gaze_3d_source") == GAZE_3D_SOURCE_MEDIAN_FILTERED
+        ),
+        "interpolated_3d": interpolated_count,
+        "missing_3d": sum(
+            1 for sample in samples
+            if sample.get("_gaze_3d_source") == GAZE_3D_SOURCE_MISSING
+        ),
+        "fallback_xyz_median": fallback_xyz_count,
+        "stale_input_3d": sum(1 for sample in samples if sample.get("_gaze_was_stale")),
+    }
 
 
 def pose_7d_to_pose_9d(pose_7d: np.ndarray) -> np.ndarray:
@@ -251,17 +456,28 @@ def collect_valid_samples(
     robot_states_by_index: Dict[int, dict],
     required_roles: Tuple[str, str],
     max_image_age_seconds: Optional[float],
-) -> List[dict]:
+) -> Tuple[List[dict], Dict[str, int]]:
     valid = []
+    stats = {
+        "total_rows": 0,
+        "invalid_rows": 0,
+        "missing_robot_state": 0,
+        "missing_video_mapping": 0,
+        "stale_image": 0,
+    }
     for sample in iter_jsonl(samples_path):
+        stats["total_rows"] += 1
         if not sample.get("ok", False):
+            stats["invalid_rows"] += 1
             continue
         robot_state_index = sample.get("robot_state_sample_index")
         if robot_state_index is None or int(robot_state_index) not in robot_states_by_index:
+            stats["missing_robot_state"] += 1
             continue
         videos = sample.get("videos", {})
         video_frames = sample.get("videoFrames", {})
         if any(role not in videos or videos[role].get("frameIndex") is None for role in required_roles):
+            stats["missing_video_mapping"] += 1
             continue
         if max_image_age_seconds is not None:
             too_old = False
@@ -271,47 +487,232 @@ def collect_valid_samples(
                     too_old = True
                     break
             if too_old:
+                stats["stale_image"] += 1
                 continue
         valid.append(sample)
-    return valid
+    return valid, stats
 
 
-def split_samples_at_time_gaps(
+def load_video_frame_timelines(
+    episode_dir: Path,
+    roles: Tuple[str, ...],
+) -> Dict[str, List[dict]]:
+    path = episode_dir / "video_frames.jsonl"
+    timelines = {role: [] for role in roles}
+    if not path.exists():
+        return timelines
+    for row in iter_jsonl(path):
+        role = row.get("role")
+        if role in timelines:
+            timelines[role].append(row)
+    for role in roles:
+        timelines[role].sort(key=lambda row: int(row.get("frame_index", -1)))
+    return timelines
+
+
+def _finite_time_array(values: Iterable[object]) -> Optional[np.ndarray]:
+    try:
+        result = np.asarray(list(values), dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+    if result.ndim != 1 or not np.all(np.isfinite(result)):
+        return None
+    return result
+
+
+def _best_video_window(
+    sample_times: np.ndarray,
+    frames: List[dict],
+    *,
+    max_trim_frames: int,
+    max_alignment_delta_seconds: Optional[float],
+    max_stream_gap_seconds: Optional[float],
+) -> Optional[dict]:
+    retained_frames = int(sample_times.shape[0])
+    if retained_frames < 2 or len(frames) < retained_frames:
+        return None
+    capture_times = _finite_time_array(
+        frame.get("frame_captured_perf_counter_seconds") for frame in frames
+    )
+    if capture_times is None:
+        return None
+
+    candidates = []
+    max_frame_start = min(max_trim_frames, len(frames) - retained_frames)
+    for frame_start in range(max_frame_start + 1):
+        frame_end = frame_start + retained_frames
+        trim_end = len(frames) - frame_end
+        if trim_end > max_trim_frames:
+            continue
+        selected_times = capture_times[frame_start:frame_end]
+        deltas = np.abs(selected_times - sample_times)
+        capture_gaps = np.diff(selected_times)
+        if max_alignment_delta_seconds is not None and float(np.max(deltas)) > max_alignment_delta_seconds:
+            continue
+        if capture_gaps.size and (
+            np.any(capture_gaps <= 0.0)
+            or (
+                max_stream_gap_seconds is not None
+                and float(np.max(capture_gaps)) > max_stream_gap_seconds
+            )
+        ):
+            continue
+        candidates.append(
+            {
+                "frame_start": frame_start,
+                "frame_end": frame_end,
+                "trim_start_frames": frame_start,
+                "trim_end_frames": trim_end,
+                "max_alignment_delta_seconds": float(np.max(deltas)),
+                "mean_alignment_delta_seconds": float(np.mean(deltas)),
+                "p95_alignment_delta_seconds": float(np.percentile(deltas, 95)),
+                "max_capture_gap_seconds": float(np.max(capture_gaps)) if capture_gaps.size else 0.0,
+            }
+        )
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda item: (
+            item["trim_start_frames"] + item["trim_end_frames"],
+            item["max_alignment_delta_seconds"],
+            item["mean_alignment_delta_seconds"],
+        ),
+    )
+
+
+def trim_and_attach_video_timelines(
+    samples: List[dict],
+    timelines: Dict[str, List[dict]],
+    *,
+    roles: Tuple[str, ...],
+    max_image_age_seconds: Optional[float],
+    max_sample_gap_seconds: Optional[float],
+    max_endpoint_trim_seconds: float,
+    sample_hz: float = 30.0,
+) -> Tuple[List[dict], List[str], dict]:
+    if max_endpoint_trim_seconds < 0.0:
+        raise ValueError("max_endpoint_trim_seconds must be non-negative")
+    if sample_hz <= 0.0:
+        raise ValueError("sample_hz must be positive")
+    max_trim_frames = int(math.floor(max_endpoint_trim_seconds * sample_hz + 1e-9))
+    metrics = {
+        "original_aligned_rows": len(samples),
+        "max_endpoint_trim_seconds": float(max_endpoint_trim_seconds),
+        "max_endpoint_trim_frames": max_trim_frames,
+        "roles": {},
+    }
+
+    for role in roles:
+        frames = timelines.get(role, [])
+        metrics["roles"][role] = {"original_video_frames": len(frames)}
+        indices = [int(row.get("frame_index", -1)) for row in frames]
+        if indices != list(range(len(frames))):
+            return [], [f"{role}_frame_index_not_contiguous"], metrics
+
+    candidates = []
+    max_sample_start = min(max_trim_frames, max(0, len(samples) - 2))
+    for sample_start in range(max_sample_start + 1):
+        max_sample_end_trim = min(max_trim_frames, len(samples) - sample_start - 2)
+        for sample_end_trim in range(max_sample_end_trim + 1):
+            sample_end = len(samples) - sample_end_trim
+            retained = samples[sample_start:sample_end]
+            sample_times = _finite_time_array(
+                sample_time(sample, sample_start + index)
+                for index, sample in enumerate(retained)
+            )
+            if sample_times is None or sample_times.shape[0] < 2:
+                continue
+            sample_gaps = np.diff(sample_times)
+            if np.any(sample_gaps <= 0.0) or (
+                max_sample_gap_seconds is not None
+                and float(np.max(sample_gaps)) > max_sample_gap_seconds
+            ):
+                continue
+
+            role_windows = {}
+            for role in roles:
+                window = _best_video_window(
+                    sample_times,
+                    timelines[role],
+                    max_trim_frames=max_trim_frames,
+                    max_alignment_delta_seconds=max_image_age_seconds,
+                    max_stream_gap_seconds=max_sample_gap_seconds,
+                )
+                if window is None:
+                    break
+                role_windows[role] = window
+            if len(role_windows) != len(roles):
+                continue
+            total_trim = sample_start + sample_end_trim + sum(
+                window["trim_start_frames"] + window["trim_end_frames"]
+                for window in role_windows.values()
+            )
+            candidates.append(
+                {
+                    "sample_start": sample_start,
+                    "sample_end": sample_end,
+                    "sample_end_trim": sample_end_trim,
+                    "sample_max_gap_seconds": float(np.max(sample_gaps)),
+                    "role_windows": role_windows,
+                    "score": (
+                        total_trim,
+                        max(window["max_alignment_delta_seconds"] for window in role_windows.values()),
+                        sum(window["mean_alignment_delta_seconds"] for window in role_windows.values()),
+                    ),
+                }
+            )
+
+    if not candidates:
+        return [], [
+            "no_continuous_common_window_within_endpoint_trim_and_timing_limits"
+        ], metrics
+
+    best = min(candidates, key=lambda item: item["score"])
+    retained_samples = samples[best["sample_start"]:best["sample_end"]]
+    metrics.update({
+        "retained_aligned_rows": len(retained_samples),
+        "aligned_trim_start_frames": best["sample_start"],
+        "aligned_trim_end_frames": best["sample_end_trim"],
+        "aligned_max_gap_seconds": best["sample_max_gap_seconds"],
+    })
+    for role in roles:
+        window = best["role_windows"][role]
+        metrics["roles"][role].update(window)
+        selected_frames = timelines[role][window["frame_start"]:window["frame_end"]]
+        for sample, frame in zip(retained_samples, selected_frames):
+            sample.setdefault("videos", {})[role] = {
+                "path": frame.get("video"),
+                "frameIndex": int(frame["frame_index"]),
+                "serial": frame.get("serial"),
+            }
+            sample.setdefault("videoFrames", {})[role] = {
+                "capturedPerfCounterSeconds": float(
+                    frame["frame_captured_perf_counter_seconds"]
+                ),
+                "capturedAtUtc": frame.get("frame_captured_at_utc"),
+                "streamSequence": frame.get("stream_sequence"),
+            }
+    return retained_samples, [], metrics
+
+
+def find_sample_timeline_discontinuities(
     samples: List[dict],
     max_gap_seconds: Optional[float],
-    min_segment_frames: int,
-) -> Tuple[List[dict], List[int], int]:
-    if not samples:
-        return [], [], 0
-    if min_segment_frames < 1:
-        raise ValueError("min_segment_frames must be at least 1")
-
-    segments = []
-    segment_start = 0
+) -> List[dict]:
+    discontinuities = []
     if max_gap_seconds is not None:
         if max_gap_seconds <= 0:
             raise ValueError("max_gap_seconds must be positive")
         for index in range(1, len(samples)):
             previous_sample = samples[index - 1]
             current_sample = samples[index]
-            timestamp_pairs = (
-                (
-                    previous_sample.get("pc_perf_counter_seconds"),
-                    current_sample.get("pc_perf_counter_seconds"),
-                ),
-                (
-                    previous_sample.get("videoFrames", {}).get("end", {}).get("capturedPerfCounterSeconds"),
-                    current_sample.get("videoFrames", {}).get("end", {}).get("capturedPerfCounterSeconds"),
-                ),
-                (
-                    previous_sample.get("robot_state_pc_perf_counter_seconds"),
-                    current_sample.get("robot_state_pc_perf_counter_seconds"),
-                ),
-                (
-                    previous_sample.get("quest_pc_receive_perf_counter_seconds"),
-                    current_sample.get("quest_pc_receive_perf_counter_seconds"),
-                ),
-            )
+            previous_aligned = previous_sample.get("aligned_target_perf_counter_seconds")
+            current_aligned = current_sample.get("aligned_target_perf_counter_seconds")
+            if previous_aligned is None or current_aligned is None:
+                previous_aligned = previous_sample.get("pc_perf_counter_seconds")
+                current_aligned = current_sample.get("pc_perf_counter_seconds")
+            timestamp_pairs = ((previous_aligned, current_aligned),)
             has_discontinuity = any(
                 previous is not None
                 and current is not None
@@ -322,20 +723,15 @@ def split_samples_at_time_gaps(
                 for previous, current in timestamp_pairs
             )
             if has_discontinuity:
-                segments.append(samples[segment_start:index])
-                segment_start = index
-    segments.append(samples[segment_start:])
-
-    kept_samples = []
-    segment_end_offsets = []
-    dropped_short_segment_samples = 0
-    for segment in segments:
-        if len(segment) < min_segment_frames:
-            dropped_short_segment_samples += len(segment)
-            continue
-        kept_samples.extend(segment)
-        segment_end_offsets.append(len(kept_samples))
-    return kept_samples, segment_end_offsets, dropped_short_segment_samples
+                discontinuities.append(
+                    {
+                        "previous_index": index - 1,
+                        "current_index": index,
+                        "previous_sample_index": previous_sample.get("sample_index"),
+                        "current_sample_index": current_sample.get("sample_index"),
+                    }
+                )
+    return discontinuities
 
 
 def build_plans(
@@ -348,10 +744,11 @@ def build_plans(
     limit_records: Optional[int],
     record_ids: Optional[set[str]],
     require_camera_intrinsics: bool,
-    require_valid_gaze: bool,
+    prepare_gaze: bool,
+    gaze_median_window: int,
     max_gaze_age_seconds: Optional[float],
     max_sample_gap_seconds: Optional[float],
-    min_segment_frames: int,
+    max_endpoint_trim_seconds: float,
 ) -> List[EpisodePlan]:
     plans = []
     total = 0
@@ -378,44 +775,42 @@ def build_plans(
             continue
 
         robot_states = load_robot_states(robot_states_path)
-        valid_samples = collect_valid_samples(
-            samples_path=samples_path,
-            robot_states_by_index=robot_states,
-            required_roles=(wrist_role, eye_role),
-            max_image_age_seconds=max_image_age_seconds,
-        )
-        dropped_stale_gaze = 0
-        dropped_invalid_gaze_projection = 0
-        if require_valid_gaze:
-            projected_samples = []
-            for sample in valid_samples:
-                aligned_time = sample.get("pc_perf_counter_seconds")
-                gaze_time = sample.get("quest_pc_receive_perf_counter_seconds")
-                if (
-                    max_gaze_age_seconds is not None
-                    and isinstance(aligned_time, (int, float))
-                    and isinstance(gaze_time, (int, float))
-                    and float(aligned_time) - float(gaze_time) > max_gaze_age_seconds
-                ):
-                    dropped_stale_gaze += 1
-                    continue
-                state_index = sample.get("robot_state_sample_index")
-                robot_state = robot_states.get(int(state_index)) if state_index is not None else None
-                projection = project_world_point(
-                    sample.get("quest_gaze3d_pc_world"),
-                    robot_state.get("T_world_end_camera") if robot_state else None,
-                    camera,
+        if prepare_gaze:
+            all_samples = [sample for sample in iter_jsonl(samples_path)]
+            invalid_rows = sum(1 for sample in all_samples if not sample.get("ok", False))
+            missing_robot_state = sum(
+                1 for sample in all_samples
+                if sample.get("robot_state_sample_index") is None
+                or int(sample["robot_state_sample_index"]) not in robot_states
+            )
+            valid_samples, video_reasons, video_metrics = trim_and_attach_video_timelines(
+                all_samples,
+                load_video_frame_timelines(episode_dir, (wrist_role, eye_role)),
+                roles=(wrist_role, eye_role),
+                max_image_age_seconds=max_image_age_seconds,
+                max_sample_gap_seconds=max_sample_gap_seconds,
+                max_endpoint_trim_seconds=max_endpoint_trim_seconds,
+            )
+            discontinuities = find_sample_timeline_discontinuities(
+                valid_samples,
+                max_gap_seconds=max_sample_gap_seconds,
+            )
+            if invalid_rows > 0 or missing_robot_state > 0 or video_reasons or discontinuities:
+                logger.warning(
+                    f"Skip {record_dir.name}: strict episode integrity failed "
+                    f"(invalid_rows={invalid_rows}, missing_robot_state={missing_robot_state}, "
+                    f"video_reasons={video_reasons}, timeline_discontinuities={len(discontinuities)})"
                 )
-                if projection is None:
-                    dropped_invalid_gaze_projection += 1
-                    continue
-                projected_samples.append(sample)
-            valid_samples = projected_samples
-        valid_samples, segment_end_offsets, dropped_short_segment_samples = split_samples_at_time_gaps(
-            samples=valid_samples,
-            max_gap_seconds=max_sample_gap_seconds if require_valid_gaze else None,
-            min_segment_frames=min_segment_frames if require_valid_gaze else 1,
-        )
+                continue
+        else:
+            valid_samples, _ = collect_valid_samples(
+                samples_path=samples_path,
+                robot_states_by_index=robot_states,
+                required_roles=(wrist_role, eye_role),
+                max_image_age_seconds=max_image_age_seconds,
+            )
+            video_metrics = None
+        segment_end_offsets = [len(valid_samples)] if valid_samples else []
         if len(valid_samples) < 2:
             logger.warning(f"Skip {record_dir.name}: only {len(valid_samples)} valid samples")
             continue
@@ -434,6 +829,27 @@ def build_plans(
             continue
 
         gripper_times, gripper_widths = load_gripper_timeline(gripper_path, default_gripper_width)
+        gaze_stats = None
+        if prepare_gaze:
+            gaze_stats = build_smoothed_interpolated_gaze(
+                valid_samples,
+                load_quest_gaze_rays(record_dir, gaze_median_window),
+                median_window=gaze_median_window,
+                segment_end_offsets=segment_end_offsets,
+                max_gaze_age_seconds=max_gaze_age_seconds,
+            )
+            projection_counts = {name: 0 for name in GAZE_PROJECTION_STATUS_NAMES.values()}
+            for sample in valid_samples:
+                state_index = sample.get("robot_state_sample_index")
+                robot_state = robot_states.get(int(state_index)) if state_index is not None else None
+                _, projection_status = project_world_point_with_status(
+                    sample.get("_gaze_world_pc"),
+                    robot_state.get("T_world_end_camera") if robot_state else None,
+                    camera,
+                )
+                projection_counts[GAZE_PROJECTION_STATUS_NAMES[projection_status]] += 1
+            gaze_stats.update({f"projection_{key}": value for key, value in projection_counts.items()})
+            gaze_stats["video_alignment"] = video_metrics
         start = total
         total += len(valid_samples)
         plans.append(EpisodePlan(
@@ -447,16 +863,12 @@ def build_plans(
             end_output_index=total,
             camera=camera,
             segment_end_offsets=segment_end_offsets,
-            dropped_stale_gaze=dropped_stale_gaze,
-            dropped_invalid_gaze_projection=dropped_invalid_gaze_projection,
-            dropped_short_segment_samples=dropped_short_segment_samples,
+            gaze_stats=gaze_stats,
         ))
         logger.info(
-            f"{record_dir.name}: {len(valid_samples)} valid samples in "
-            f"{len(segment_end_offsets)} segment(s) "
-            f"(dropped stale gaze={dropped_stale_gaze}, "
-            f"invalid projection={dropped_invalid_gaze_projection}, "
-            f"short segment samples={dropped_short_segment_samples})"
+            f"{record_dir.name}: {len(valid_samples)} action/image samples in "
+            f"one intact episode "
+            f"(gaze={gaze_stats})"
         )
 
     if not plans:
@@ -498,6 +910,9 @@ def create_output_zarr(
         data.create_dataset("action_abs_tcp", shape=(total_frames, 10), chunks=(10000, 10), dtype="float32", compressor=compressor)
         data.create_dataset("action_timestamp", shape=(total_frames,), chunks=(10000,), dtype="float64", compressor=compressor)
         data.create_dataset("gaze_xy", shape=(total_frames, 2), chunks=(10000, 2), dtype="float32", compressor=compressor)
+        data.create_dataset("gaze_world_pc", shape=(total_frames, 3), chunks=(10000, 3), dtype="float32", compressor=compressor)
+        data.create_dataset("gaze_3d_source", shape=(total_frames,), chunks=(10000,), dtype="uint8", compressor=compressor)
+        data.create_dataset("gaze_projection_status", shape=(total_frames,), chunks=(10000,), dtype="uint8", compressor=compressor)
         data.create_dataset("has_gaze_label", shape=(total_frames,), chunks=(10000,), dtype="bool", compressor=compressor)
         data.create_dataset("has_heatmap_image", shape=(total_frames,), chunks=(10000,), dtype="bool", compressor=compressor)
         data.create_dataset(
@@ -530,12 +945,15 @@ def write_lowdim_arrays(data, meta, plans: List[EpisodePlan], pose_frame: str, o
         robot_timestamps = np.zeros((n,), dtype=np.float64)
         gaze_timestamps = np.zeros((n,), dtype=np.float64)
         gaze_xy = np.zeros((n, 2), dtype=np.float32)
+        gaze_world_pc = np.zeros((n, 3), dtype=np.float32)
+        gaze_3d_source = np.zeros((n,), dtype=np.uint8)
+        gaze_projection_status = np.zeros((n,), dtype=np.uint8)
         has_gaze = np.zeros((n,), dtype=np.bool_)
 
         for i, sample in enumerate(plan.samples):
             state_idx = int(sample["robot_state_sample_index"])
             robot_state = plan.robot_states_by_index[state_idx]
-            timestamps[i] = float(sample.get("pc_perf_counter_seconds", i / 30.0))
+            timestamps[i] = sample_time(sample, i)
             image_timestamps[i] = float(
                 sample.get("videoFrames", {}).get("end", {}).get(
                     "capturedPerfCounterSeconds", timestamps[i]
@@ -551,12 +969,17 @@ def write_lowdim_arrays(data, meta, plans: List[EpisodePlan], pose_frame: str, o
                 plan.gripper_widths,
                 float(sample.get("pc_perf_counter_seconds", timestamps[i])),
             )
-            projection = project_world_point(
-                sample.get("quest_gaze3d_pc_world"),
+            point_world = sample.get("_gaze_world_pc")
+            if point_world is not None:
+                gaze_world_pc[i] = np.asarray(point_world, dtype=np.float32)
+            gaze_3d_source[i] = int(sample.get("_gaze_3d_source", GAZE_3D_SOURCE_MISSING))
+            projection, projection_status = project_world_point_with_status(
+                point_world,
                 robot_state.get("T_world_end_camera"),
                 plan.camera,
             )
-            if projection is not None:
+            gaze_projection_status[i] = projection_status
+            if projection_status == GAZE_PROJECTION_VALID and projection is not None:
                 gaze_xy[i] = projection
                 has_gaze[i] = True
 
@@ -571,6 +994,9 @@ def write_lowdim_arrays(data, meta, plans: List[EpisodePlan], pose_frame: str, o
             data["gripper_width"][start:end] = gripper[:, 0]
             data["action_abs_tcp"][start:end] = state
             data["gaze_xy"][start:end] = gaze_xy
+            data["gaze_world_pc"][start:end] = gaze_world_pc
+            data["gaze_3d_source"][start:end] = gaze_3d_source
+            data["gaze_projection_status"][start:end] = gaze_projection_status
             data["has_gaze_label"][start:end] = has_gaze
             data["has_heatmap_image"][start:end] = False
         else:
@@ -634,6 +1060,27 @@ def center_crop_and_resize_image(
     return cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_AREA)
 
 
+def flush_frame_batch(dataset, pending: List[Tuple[int, np.ndarray]]) -> None:
+    if not pending:
+        return
+    pending.sort(key=lambda item: item[0])
+    run_start = 0
+    while run_start < len(pending):
+        run_end = run_start + 1
+        while (
+            run_end < len(pending)
+            and pending[run_end][0] == pending[run_end - 1][0] + 1
+        ):
+            run_end += 1
+        output_start = pending[run_start][0]
+        output_end = pending[run_end - 1][0] + 1
+        dataset[output_start:output_end] = np.stack(
+            [image for _, image in pending[run_start:run_end]], axis=0
+        )
+        run_start = run_end
+    pending.clear()
+
+
 def write_video_role(
     dataset,
     video_path: Path,
@@ -656,6 +1103,8 @@ def write_video_role(
     current_frame = 0
     last_image = None
     missing = 0
+    pending: List[Tuple[int, np.ndarray]] = []
+    batch_size = 128
 
     while request_idx < len(requests):
         ok, frame = cap.read()
@@ -676,13 +1125,16 @@ def write_video_role(
                 ).astype(np.uint8)
             last_image = image
             while request_idx < len(requests) and requests[request_idx].frame_index == current_frame:
-                dataset[requests[request_idx].output_index] = image
+                pending.append((requests[request_idx].output_index, image))
                 request_idx += 1
+                if len(pending) >= batch_size:
+                    flush_frame_batch(dataset, pending)
             if request_idx < len(requests):
                 next_frame = requests[request_idx].frame_index
         current_frame += 1
 
     cap.release()
+    flush_frame_batch(dataset, pending)
 
     while request_idx < len(requests):
         if last_image is None:
@@ -693,9 +1145,10 @@ def write_video_role(
                 f"{role_name}: video ended before {missing_requests} requested frame(s) "
                 f"in {video_path}"
             )
-        dataset[requests[request_idx].output_index] = last_image
+        pending.append((requests[request_idx].output_index, last_image))
         missing += 1
         request_idx += 1
+    flush_frame_batch(dataset, pending)
 
     if missing:
         logger.warning(f"{role_name}: filled {missing} missing trailing frames with last decoded frame")
@@ -753,7 +1206,8 @@ def write_summary(output_path: Path, plans: List[EpisodePlan], args):
             else "legacy one-step-shifted absolute state"
         ),
         "gaze_semantics": (
-            "quest_gaze3d_pc_world projected into the full end-camera image"
+            "Quest ray depth causal-median filtered, internal missing 3D gaze linearly "
+            "interpolated in pc_world, then projected into the full end-camera image"
             if args.output_format == "gaze-wam"
             else None
         ),
@@ -766,9 +1220,7 @@ def write_summary(output_path: Path, plans: List[EpisodePlan], args):
                 "segment_end_offsets": plan.segment_end_offsets or [
                     plan.end_output_index - plan.start_output_index
                 ],
-                "dropped_stale_gaze": plan.dropped_stale_gaze,
-                "dropped_invalid_gaze_projection": plan.dropped_invalid_gaze_projection,
-                "dropped_short_segment_samples": plan.dropped_short_segment_samples,
+                "gaze_stats": plan.gaze_stats,
             }
             for plan in plans
         ],
@@ -805,10 +1257,11 @@ def convert_pc_recordings_to_zarr(args):
         limit_records=args.limit_records,
         record_ids=record_ids,
         require_camera_intrinsics=args.output_format == "gaze-wam",
-        require_valid_gaze=args.output_format == "gaze-wam",
+        prepare_gaze=args.output_format == "gaze-wam",
+        gaze_median_window=args.gaze_median_window,
         max_gaze_age_seconds=args.max_gaze_age_seconds,
         max_sample_gap_seconds=args.max_sample_gap_seconds,
-        min_segment_frames=args.min_segment_frames,
+        max_endpoint_trim_seconds=args.max_endpoint_trim_seconds,
     )
     total_frames = plans[-1].end_output_index
     logger.info(f"Total episodes: {len(plans)}")
@@ -842,8 +1295,20 @@ def convert_pc_recordings_to_zarr(args):
             "image_size": list(args.image_size),
             "image_resize_mode": "stretch",
             "gaze_is_normalized": True,
-            "gaze_projection_source": "quest_gaze3d_pc_world",
+            "gaze_projection_source": "causal_median_ray_depth_then_internal_linear_interpolation_pc_world",
             "gaze_projection_camera_role": args.wrist_role,
+            "gaze_median_filter": {
+                "kind": "causal_median_ray_depth",
+                "window": int(args.gaze_median_window),
+                "replay_aligned": True,
+            },
+            "gaze_interpolation": {
+                "kind": "linear_pc_world",
+                "scope": "internal_missing_rows_within_episode_only",
+                "extrapolate_edges": False,
+            },
+            "gaze_3d_source_values": GAZE_3D_SOURCE_NAMES,
+            "gaze_projection_status_values": GAZE_PROJECTION_STATUS_NAMES,
             "action_representation": "absolute",
             "action_semantics": "executed_tcp_pose_plus_gripper_at_current_aligned_row",
             "timestamp_key": "timestamp",
@@ -905,26 +1370,37 @@ def main():
         type=float,
         default=0.060,
         help=(
-            "For gaze-wam output, drop rows whose aligned sample uses a Quest gaze "
-            "source older than this many seconds. Default: 0.060."
+            "For gaze-wam output, treat Quest gaze older than this as a missing 3D "
+            "sample eligible for internal interpolation. The action row is retained. "
+            "Default: 0.060."
+        ),
+    )
+    parser.add_argument(
+        "--gaze-median-window",
+        type=int,
+        default=7,
+        help=(
+            "Causal median window for gaze ray depth, matching Collector replay. "
+            "Default: 7."
         ),
     )
     parser.add_argument(
         "--max-sample-gap-seconds",
         type=float,
-        default=0.200,
+        default=0.060,
         help=(
-            "For gaze-wam output, split a physical recording into separate training "
-            "episodes when retained aligned rows are farther apart than this. Default: 0.200."
+            "For gaze-wam output, reject a physical recording if the retained common "
+            "window contains a larger aligned or camera gap. Default: 0.060."
         ),
     )
     parser.add_argument(
-        "--min-segment-frames",
-        type=int,
-        default=16,
+        "--max-endpoint-trim-seconds",
+        type=float,
+        default=1.0,
         help=(
-            "For gaze-wam output, discard temporal segments shorter than this many "
-            "frames after gaze filtering. Default: 16."
+            "Allow at most this much trimming from each start/end of aligned and "
+            "camera timelines to form one continuous episode. Internal segments are "
+            "never extracted. Default: 1.0."
         ),
     )
     parser.add_argument("--limit-records", type=int, default=None, help="Convert only the first N records")
