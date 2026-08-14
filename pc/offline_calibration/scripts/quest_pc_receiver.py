@@ -161,7 +161,7 @@ SESSION_CONTROL_THREAD_JOIN_SECONDS = 1.0
 SESSION_WRITER_THREAD_JOIN_SECONDS = 10.0
 SESSION_CLOSE_THREAD_JOIN_SECONDS = 0.05
 REPLAY_VISUALIZATION_CACHE = "replay_visualization.json"
-REPLAY_VISUALIZATION_CACHE_VERSION = 5
+REPLAY_VISUALIZATION_CACHE_VERSION = 6
 REPLAY_VISUALIZATION_MAX_SAMPLES = 12000
 REPLAY_VISUALIZATION_MAX_ROBOT_STATES = 12000
 
@@ -2637,6 +2637,14 @@ class LiveTelemetryVisualizer:
                 if suffix not in ALLOWED_ARTIFACT_SUFFIXES:
                     self.send_error(403, "unsupported artifact type")
                     return
+                raw = (first_query(query, "raw") or "").strip().lower()
+                wants_gaze_viewer = suffix == ".mp4" and raw not in ("1", "true", "yes")
+                if wants_gaze_viewer:
+                    role = (first_query(query, "role") or "").strip().lower()
+                    if role not in ("end", "third"):
+                        role = "third" if path.name.lower().startswith("third_") else "end"
+                    self._send_artifact_gaze_viewer(path, role)
+                    return
                 content_type = artifact_content_type(suffix)
                 try:
                     send_http_path(self, path, content_type)
@@ -2645,6 +2653,23 @@ class LiveTelemetryVisualizer:
                     self.send_header("Content-Range", f"bytes */{path.stat().st_size}")
                     self.send_header("Cache-Control", "no-store")
                     self.end_headers()
+
+            def _send_artifact_gaze_viewer(self, path: Path, role: str) -> None:
+                record_dir = path.parent.parent.parent
+                record_id = record_dir.name if record_dir.name else path.stem
+                video_url = "/artifact?path=" + quote_path(str(path)) + "&raw=1"
+                html = build_artifact_gaze_viewer_html(
+                    video_url=video_url,
+                    record_id=record_id,
+                    role=role,
+                    title=path.name,
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self._write_response_body(html)
 
             def _send_urdf(self) -> None:
                 if not DEFAULT_RIZON_URDF.exists():
@@ -5901,6 +5926,7 @@ def replay_visualization_payload(
                 session_dir / "robot_realsense" / "session_summary.json",
                 session_dir / "robot_realsense" / "robot_hand_eye_result.json",
                 session_dir / "robot_realsense" / "robot_hand_eye_failure.json",
+                session_dir / "robot_realsense" / "cameras.json",
                 session_dir / DEFAULT_LATENCY_ANALYSIS_JSON,
             )
             if path is not None and path.exists()
@@ -6965,10 +6991,20 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
         session if isinstance(session, dict) else {},
         config if isinstance(config, dict) else {},
     )
+    camera_intrinsics = {
+        role: intrinsics
+        for role in ("end", "third")
+        if (intrinsics := robot_camera_intrinsics(robot_dir, role)) is not None
+    }
     return {
         "directory": str(robot_dir),
         "session": session if isinstance(session, dict) else None,
         "config": config if isinstance(config, dict) else None,
+        "cameraIntrinsics": camera_intrinsics,
+        "gazeReprojection": {
+            "filteredDepthWindow": 7,
+            "offsetM": 0.01,
+        },
         "samples": rows,
         "robotStates": robot_state_rows,
         "videoFrameCount": len(video_frame_rows),
@@ -6985,6 +7021,34 @@ def build_robot_realsense_replay(session_dir: Path, origin: list[float]) -> dict
         "result": result if isinstance(result, dict) else None,
         "failure": failure if isinstance(failure, dict) else None,
     }
+
+
+def robot_camera_intrinsics(robot_dir: Path, role: str) -> dict[str, Any] | None:
+    cameras = read_json_if_exists(robot_dir / "cameras.json")
+    camera = cameras.get(role) if isinstance(cameras, dict) else None
+    if not isinstance(camera, dict):
+        return None
+    required = ("width", "height", "fx", "fy", "cx", "cy")
+    if not all(is_number(camera.get(key)) for key in required):
+        return None
+    result: dict[str, Any] = {
+        "role": role,
+        "serial": camera.get("serial"),
+        "name": camera.get("name"),
+        "width": int(camera["width"]),
+        "height": int(camera["height"]),
+        "fx": float(camera["fx"]),
+        "fy": float(camera["fy"]),
+        "cx": float(camera["cx"]),
+        "cy": float(camera["cy"]),
+    }
+    distortion_model = camera.get("distortion_model")
+    if isinstance(distortion_model, str) and distortion_model:
+        result["distortionModel"] = distortion_model
+    distortion_coeffs = camera.get("distortion_coeffs")
+    if isinstance(distortion_coeffs, list) and all(is_number(value) for value in distortion_coeffs):
+        result["distortionCoeffs"] = [float(value) for value in distortion_coeffs]
+    return result
 
 
 def robot_image_artifacts(robot_dir: Path, images: dict[str, Any]) -> dict[str, Any]:
@@ -11159,6 +11223,12 @@ function escapeHtml(value) {
     .replaceAll("'", '&#39;');
 }
 
+function gazeArtifactViewerUrl(url, role) {
+  const text = String(url || '');
+  const separator = text.includes('?') ? '&' : '?';
+  return `${text}${separator}viewer=gaze&role=${encodeURIComponent(role)}`;
+}
+
 function draw(now = performance.now()) {
   requestAnimationFrame(draw);
   if (!state.renderDirty) return;
@@ -11846,6 +11916,319 @@ requestAnimationFrame(draw);
 """
 
 
+def build_artifact_gaze_viewer_html(*, video_url: str, record_id: str, role: str, title: str) -> str:
+    replacements = {
+        "__VIDEO_URL_JSON__": json.dumps(video_url, ensure_ascii=False),
+        "__RECORD_ID_JSON__": json.dumps(record_id, ensure_ascii=False),
+        "__ROLE_JSON__": json.dumps(role, ensure_ascii=False),
+        "__TITLE_JSON__": json.dumps(title, ensure_ascii=False),
+    }
+    html = ARTIFACT_GAZE_VIEWER_HTML
+    for placeholder, value in replacements.items():
+        html = html.replace(placeholder, value)
+    return html
+
+
+ARTIFACT_GAZE_VIEWER_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gaze video replay</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #080a0c;
+  --panel: #121820;
+  --line: #2c3846;
+  --text: #e8edf3;
+  --muted: #91a0af;
+}
+* { box-sizing: border-box; }
+html, body { width: 100%; height: 100%; margin: 0; }
+body {
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.35 system-ui, -apple-system, Segoe UI, sans-serif;
+}
+#app { display: flex; flex-direction: column; width: 100%; height: 100%; }
+#toolbar {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 48px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+#title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; }
+#status { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+a, button, select { color: var(--text); }
+a { color: #a8d8ff; text-decoration: none; }
+button, select {
+  padding: 5px 8px;
+  border: 1px solid #2b3a4f;
+  border-radius: 6px;
+  background: #182333;
+}
+label { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+#stage {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #080a0c;
+}
+#video, #overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+#video { z-index: 0; display: block; object-fit: contain; background: #080a0c; }
+#overlay { z-index: 1; display: block; pointer-events: none; background: transparent !important; }
+@media (max-width: 700px) {
+  #toolbar { gap: 6px; padding: 7px; }
+  #status { display: none; }
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="toolbar">
+    <a href="/recordings">? Recordings</a>
+    <span id="title"></span>
+    <label>Gaze
+      <select id="gazeMode">
+        <option value="raw">raw</option>
+        <option value="filtered">median depth</option>
+        <option value="board">board plane</option>
+        <option value="all">all</option>
+      </select>
+    </label>
+    <label><input id="gazeToggle" type="checkbox" checked> Wrist gaze</label>
+    <span id="status">Loading replay data...</span>
+  </div>
+  <div id="stage">
+    <video id="video" controls playsinline preload="auto"></video>
+    <canvas id="overlay" aria-hidden="true"></canvas>
+  </div>
+</div>
+<script>
+const videoUrl = __VIDEO_URL_JSON__;
+const recordId = __RECORD_ID_JSON__;
+const role = __ROLE_JSON__;
+const title = __TITLE_JSON__;
+const stage = document.getElementById('stage');
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const context = overlay.getContext('2d');
+const titleNode = document.getElementById('title');
+const statusNode = document.getElementById('status');
+const gazeMode = document.getElementById('gazeMode');
+const gazeToggle = document.getElementById('gazeToggle');
+let replay = null;
+let fps = 30;
+let mediaRows = [];
+let questRows = [];
+let robotRows = [];
+let animationFrame = 0;
+
+titleNode.textContent = title;
+video.src = videoUrl;
+
+function number(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function nearestRow(rows, target, valueOf) {
+  if (!Array.isArray(rows) || !rows.length) return null;
+  if (!Number.isFinite(target)) return rows[0];
+  let lo = 0;
+  let hi = rows.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (valueOf(rows[mid]) < target) lo = mid + 1;
+    else hi = mid;
+  }
+  const right = rows[lo];
+  const left = rows[Math.max(0, lo - 1)];
+  return Math.abs(valueOf(left) - target) <= Math.abs(valueOf(right) - target) ? left : right;
+}
+
+function normalize3(value) {
+  const norm = Math.hypot(Number(value?.[0] || 0), Number(value?.[1] || 0), Number(value?.[2] || 0));
+  if (!Number.isFinite(norm) || norm <= 1e-9) return [0, 0, 0];
+  return [Number(value[0]) / norm, Number(value[1]) / norm, Number(value[2]) / norm];
+}
+
+function add(a, b) { return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]; }
+function scale(a, factor) { return [a[0] * factor, a[1] * factor, a[2] * factor]; }
+
+function displayPointToCamera(matrix, point) {
+  if (!Array.isArray(matrix) || matrix.length < 3 || !Array.isArray(point) || point.length < 3) return null;
+  const dx = Number(point[0]) - Number(matrix[0]?.[3]);
+  const dy = Number(point[1]) - Number(matrix[1]?.[3]);
+  const dz = Number(point[2]) - Number(matrix[2]?.[3]);
+  const cameraPoint = [
+    Number(matrix[0]?.[0]) * dx + Number(matrix[1]?.[0]) * dy + Number(matrix[2]?.[0]) * dz,
+    Number(matrix[0]?.[1]) * dx + Number(matrix[1]?.[1]) * dy + Number(matrix[2]?.[1]) * dz,
+    Number(matrix[0]?.[2]) * dx + Number(matrix[1]?.[2]) * dy + Number(matrix[2]?.[2]) * dz,
+  ];
+  return cameraPoint.every(Number.isFinite) && cameraPoint[2] > 1e-9 ? cameraPoint : null;
+}
+
+function project(point, matrix, camera) {
+  const cameraPoint = displayPointToCamera(matrix, point);
+  if (!cameraPoint || !camera) return null;
+  const [x, y, z] = cameraPoint;
+  const u = Number(camera.fx) * x / z + Number(camera.cx);
+  const v = Number(camera.fy) * y / z + Number(camera.cy);
+  return Number.isFinite(u) && Number.isFinite(v) ? {u, v} : null;
+}
+
+function selectedPoints(sample) {
+  if (!sample) return [];
+  const mode = gazeMode.value || 'raw';
+  const offset = Number(replay?.robotRealSense?.gazeReprojection?.offsetM ?? 0.01);
+  const raw = Array.isArray(sample.gaze?.p) ? sample.gaze.p : null;
+  const filtered = Array.isArray(sample.gazeFiltered?.p) ? sample.gazeFiltered.p : null;
+  const board = Array.isArray(sample.gazeBoardPlane?.p) ? sample.gazeBoardPlane.p : null;
+  const direction = Array.isArray(sample.gazeRayDirection) ? sample.gazeRayDirection : null;
+  const shifted = filtered && direction ? add(filtered, scale(normalize3(direction), offset)) : filtered;
+  const points = [];
+  if ((mode === 'raw' || mode === 'all') && raw) points.push({point: raw, color: '#ff5c7a', label: 'raw'});
+  if ((mode === 'filtered' || mode === 'all') && shifted) points.push({point: shifted, color: '#ffd166', label: `median + ${(offset * 1000).toFixed(0)}mm`});
+  if ((mode === 'board' || mode === 'all') && board) points.push({point: board, color: '#60a5fa', label: 'board'});
+  return points;
+}
+
+function drawMarker(x, y, color, label) {
+  context.save();
+  context.strokeStyle = '#05070a';
+  context.lineWidth = 5;
+  context.beginPath();
+  context.arc(x, y, 10, 0, Math.PI * 2);
+  context.stroke();
+  context.strokeStyle = color;
+  context.lineWidth = 3;
+  context.beginPath();
+  context.arc(x, y, 10, 0, Math.PI * 2);
+  context.stroke();
+  context.beginPath();
+  context.moveTo(x - 18, y);
+  context.lineTo(x + 18, y);
+  context.moveTo(x, y - 18);
+  context.lineTo(x, y + 18);
+  context.stroke();
+  context.font = '14px system-ui';
+  context.lineWidth = 4;
+  context.strokeStyle = '#05070a';
+  context.strokeText(label, x + 15, Math.max(18, y - 15));
+  context.fillStyle = color;
+  context.fillText(label, x + 15, Math.max(18, y - 15));
+  context.restore();
+}
+
+function currentRows() {
+  const frame = Math.max(0, video.currentTime * fps);
+  const media = nearestRow(mediaRows, frame, row => Number(row.videos?.[role]?.frameIndex));
+  const timestamp = number(media?.recordingTimestampSeconds) ?? video.currentTime;
+  const sample = nearestRow(questRows, timestamp, row => Number(row.recordingTimestampSeconds));
+  const robot = nearestRow(robotRows, timestamp, row => Number(row.recordingTimestampSeconds));
+  return {frame, timestamp, sample, robot};
+}
+
+function resizeOverlay() {
+  const rect = stage.getBoundingClientRect();
+  const width = Math.max(1, Math.floor(rect.width));
+  const height = Math.max(1, Math.floor(rect.height));
+  const dpr = window.devicePixelRatio || 1;
+  overlay.width = Math.max(1, Math.floor(width * dpr));
+  overlay.height = Math.max(1, Math.floor(height * dpr));
+  context.setTransform(dpr, 0, 0, dpr, 0, 0);
+  drawOverlay(width, height);
+}
+
+function drawOverlay(width, height) {
+  context.clearRect(0, 0, width, height);
+  if (!replay || !gazeToggle.checked || role !== 'end') return;
+  const {frame, timestamp, sample, robot} = currentRows();
+  const matrix = robot?.T_display_end_camera?.matrix_4x4;
+  const camera = replay.robotRealSense?.cameraIntrinsics?.end;
+  if (!sample || !matrix || !camera) return;
+  const imageWidth = Number(camera.width) || Number(video.videoWidth) || 1280;
+  const imageHeight = Number(camera.height) || Number(video.videoHeight) || 720;
+  const boxAspect = width / height;
+  const imageAspect = imageWidth / imageHeight;
+  let drawWidth = width;
+  let drawHeight = height;
+  let offsetX = 0;
+  let offsetY = 0;
+  if (boxAspect > imageAspect) {
+    drawWidth = height * imageAspect;
+    offsetX = (width - drawWidth) * 0.5;
+  } else if (boxAspect < imageAspect) {
+    drawHeight = width / imageAspect;
+    offsetY = (height - drawHeight) * 0.5;
+  }
+  for (const entry of selectedPoints(sample)) {
+    const projected = project(entry.point, matrix, camera);
+    if (!projected || projected.u < 0 || projected.u >= imageWidth || projected.v < 0 || projected.v >= imageHeight) continue;
+    const x = offsetX + projected.u * drawWidth / imageWidth;
+    const y = offsetY + projected.v * drawHeight / imageHeight;
+    drawMarker(x, y, entry.color, entry.label);
+  }
+  statusNode.textContent = `${role} | frame ${Math.round(frame)} | ${timestamp.toFixed(3)}s | ${sample ? 'gaze ready' : 'gaze unavailable'}`;
+}
+
+function redraw() {
+  resizeOverlay();
+  if (!video.paused) animationFrame = requestAnimationFrame(redraw);
+}
+
+async function loadReplay() {
+  try {
+    const query = new URLSearchParams({recordId});
+    const response = await fetch('/recordings/replay?' + query.toString(), {cache: 'no-store'});
+    if (!response.ok) throw new Error(`replay HTTP ${response.status}`);
+    replay = await response.json();
+    fps = Number(replay.robotRealSense?.config?.fps) || 30;
+    questRows = (Array.isArray(replay.samples) ? replay.samples : [])
+      .filter(row => Number.isFinite(Number(row.recordingTimestampSeconds)));
+    robotRows = (Array.isArray(replay.robotRealSense?.robotStates) ? replay.robotRealSense.robotStates : [])
+      .filter(row => Number.isFinite(Number(row.recordingTimestampSeconds)));
+    mediaRows = (Array.isArray(replay.robotRealSense?.samples) ? replay.robotRealSense.samples : [])
+      .filter(row => Number.isFinite(Number(row.videos?.[role]?.frameIndex)))
+      .sort((a, b) => Number(a.videos[role].frameIndex) - Number(b.videos[role].frameIndex));
+    statusNode.textContent = role === 'end' ? 'Gaze replay ready' : 'Gaze overlay is available for the end camera';
+    resizeOverlay();
+  } catch (error) {
+    statusNode.textContent = `Gaze data unavailable: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+video.addEventListener('loadedmetadata', resizeOverlay);
+video.addEventListener('timeupdate', resizeOverlay);
+video.addEventListener('seeking', resizeOverlay);
+video.addEventListener('seeked', resizeOverlay);
+video.addEventListener('play', () => { cancelAnimationFrame(animationFrame); animationFrame = requestAnimationFrame(redraw); });
+video.addEventListener('pause', resizeOverlay);
+gazeMode.addEventListener('change', resizeOverlay);
+gazeToggle.addEventListener('change', resizeOverlay);
+window.addEventListener('resize', resizeOverlay);
+if (window.ResizeObserver) new ResizeObserver(resizeOverlay).observe(stage);
+loadReplay();
+</script>
+</body>
+</html>
+"""
+
+
 RECORDINGS_REPLAY_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -12104,6 +12487,28 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
   border-radius: 6px;
   background: #080a0c;
 }
+.camera-strip .camera-media {
+  position: relative;
+  width: 100%;
+  height: 120px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: transparent;
+}
+.camera-strip .camera-media video {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+.camera-strip .gaze-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 1;
+  background: transparent !important;
+}
 .ok { color: #9df09d; font-weight: 700; }
 .warn { color: #ffd18a; font-weight: 700; }
 .rec { color: #ff8c96; font-weight: 700; }
@@ -12148,6 +12553,7 @@ input[type=range], input[type=checkbox] { accent-color: #82adff; }
             <option value="all">all</option>
           </select>
         </label>
+        <label class="pill"><input id="gazeOverlayToggle" type="checkbox" checked> Wrist gaze</label>
       </div>
       <input id="scrub" class="scrub" type="range" min="0" max="0" value="0" step="1">
       <div class="row tiny">
@@ -12231,6 +12637,7 @@ const refreshBtn = document.getElementById('refreshBtn');
 const playBtn = document.getElementById('playBtn');
 const resetBtn = document.getElementById('resetBtn');
 const gazeMode = document.getElementById('gazeMode');
+const gazeOverlayToggle = document.getElementById('gazeOverlayToggle');
 const scrub = document.getElementById('scrub');
 const recordTitle = document.getElementById('recordTitle');
 const recordSub = document.getElementById('recordSub');
@@ -12275,6 +12682,7 @@ const state = {
   robotMediaTimedRows: [],
   robotMediaTimedRowsByRole: {},
   gripperTimedRows: [],
+  gazeOverlayEnabled: true,
   pendingDelete: null
 };
 
@@ -13008,8 +13416,11 @@ function renderCameraStrip(robot) {
       const label = `${role}${Number.isFinite(item.frameIndex) ? ` #${item.frameIndex}` : ''}`;
       if (String(item.url || '').toLowerCase().includes('.mp4')) {
         return `
-          <a href="${escapeHtml(item.url)}" target="_blank" data-camera-role="${escapeHtml(role)}">
-            <video src="${escapeHtml(item.url)}" muted playsinline preload="auto"></video>
+          <a href="${escapeHtml(gazeArtifactViewerUrl(item.url, role))}" target="_blank" data-camera-role="${escapeHtml(role)}">
+            <div class="camera-media">
+              <video src="${escapeHtml(rawArtifactUrl(item.url))}" muted playsinline preload="auto"></video>
+              <canvas class="gaze-overlay" aria-hidden="true"></canvas>
+            </div>
             <span>${escapeHtml(label)}</span>
           </a>`;
       }
@@ -13029,7 +13440,10 @@ function renderCameraStrip(robot) {
     const label = node.querySelector('span');
     if (label) label.textContent = `${role}${Number.isFinite(item.frameIndex) ? ` #${item.frameIndex}` : ''}`;
     const video = node.querySelector('video');
-    if (video) syncReplayVideo(video, item, fps);
+    if (video) {
+      syncReplayVideo(video, item, fps);
+      renderGazeOverlay(role, video, node.querySelector('.gaze-overlay'));
+    }
   }
 }
 
@@ -13081,6 +13495,133 @@ function syncVisibleReplayVideos(forceSeek = false) {
   const fps = replayVideoFps();
   for (const video of cameraStrip.querySelectorAll('video')) {
     applyReplayVideoState(video, fps, forceSeek);
+  }
+  redrawGazeOverlays();
+}
+
+function redrawGazeOverlays() {
+  for (const node of cameraStrip.querySelectorAll('[data-camera-role]')) {
+    const role = node.dataset.cameraRole || '';
+    const video = node.querySelector('video');
+    const overlay = node.querySelector('.gaze-overlay');
+    if (video) renderGazeOverlay(role, video, overlay);
+  }
+}
+
+function selectedGazeOverlayPoints(sample) {
+  if (!sample) return [];
+  const mode = gazeMode.value || 'filtered';
+  const offset = Number(state.data?.robotRealSense?.gazeReprojection?.offsetM ?? 0.01);
+  const raw = Array.isArray(sample.gaze?.p) ? sample.gaze.p : null;
+  const filtered = Array.isArray(sample.gazeFiltered?.p) ? sample.gazeFiltered.p : null;
+  const board = Array.isArray(sample.gazeBoardPlane?.p) ? sample.gazeBoardPlane.p : null;
+  const direction = Array.isArray(sample.gazeRayDirection) ? sample.gazeRayDirection : null;
+  const shiftedFiltered = filtered && direction ? add(filtered, scale(normalize3(direction), offset)) : filtered;
+  const points = [];
+  if (mode === 'raw' || mode === 'all') {
+    if (raw) points.push({point: raw, color: '#ff5c7a', label: 'raw'});
+  }
+  if (mode === 'filtered' || mode === 'all') {
+    if (shiftedFiltered) points.push({point: shiftedFiltered, color: '#ffd166', label: `median + ${(offset * 1000).toFixed(0)}mm`});
+  }
+  if (mode === 'board' || mode === 'all') {
+    if (board) points.push({point: board, color: '#60a5fa', label: 'board'});
+  }
+  return points;
+}
+
+function normalize3(value) {
+  const norm = Math.hypot(Number(value?.[0] || 0), Number(value?.[1] || 0), Number(value?.[2] || 0));
+  if (!Number.isFinite(norm) || norm <= 1e-9) return [0, 0, 0];
+  return [Number(value[0]) / norm, Number(value[1]) / norm, Number(value[2]) / norm];
+}
+
+function displayPointToCamera(matrix, point) {
+  if (!Array.isArray(matrix) || matrix.length < 3 || !Array.isArray(point) || point.length < 3) return null;
+  const dx = Number(point[0]) - Number(matrix[0]?.[3]);
+  const dy = Number(point[1]) - Number(matrix[1]?.[3]);
+  const dz = Number(point[2]) - Number(matrix[2]?.[3]);
+  const cameraPoint = [
+    Number(matrix[0]?.[0]) * dx + Number(matrix[1]?.[0]) * dy + Number(matrix[2]?.[0]) * dz,
+    Number(matrix[0]?.[1]) * dx + Number(matrix[1]?.[1]) * dy + Number(matrix[2]?.[1]) * dz,
+    Number(matrix[0]?.[2]) * dx + Number(matrix[1]?.[2]) * dy + Number(matrix[2]?.[2]) * dz,
+  ];
+  return cameraPoint.every(Number.isFinite) && cameraPoint[2] > 1e-9 ? cameraPoint : null;
+}
+
+function projectGazeOverlayPoint(point, matrix, camera) {
+  const cameraPoint = displayPointToCamera(matrix, point);
+  if (!cameraPoint || !camera) return null;
+  const [x, y, z] = cameraPoint;
+  const u = Number(camera.fx) * x / z + Number(camera.cx);
+  const v = Number(camera.fy) * y / z + Number(camera.cy);
+  return Number.isFinite(u) && Number.isFinite(v) ? {u, v} : null;
+}
+
+function drawGazeOverlayMarker(context, x, y, color, label) {
+  context.save();
+  context.strokeStyle = '#05070a';
+  context.lineWidth = 5;
+  context.beginPath();
+  context.arc(x, y, 8, 0, Math.PI * 2);
+  context.stroke();
+  context.strokeStyle = color;
+  context.lineWidth = 3;
+  context.beginPath();
+  context.arc(x, y, 8, 0, Math.PI * 2);
+  context.stroke();
+  context.beginPath();
+  context.moveTo(x - 14, y);
+  context.lineTo(x + 14, y);
+  context.moveTo(x, y - 14);
+  context.lineTo(x, y + 14);
+  context.stroke();
+  context.font = '11px system-ui';
+  context.lineWidth = 3;
+  context.strokeStyle = '#05070a';
+  context.strokeText(label, x + 12, Math.max(14, y - 12));
+  context.fillStyle = color;
+  context.fillText(label, x + 12, Math.max(14, y - 12));
+  context.restore();
+}
+
+function renderGazeOverlay(role, video, overlay) {
+  if (!overlay) return;
+  const width = Math.max(1, Math.floor(video.clientWidth || overlay.clientWidth || 1));
+  const height = Math.max(1, Math.floor(video.clientHeight || overlay.clientHeight || 1));
+  const dpr = window.devicePixelRatio || 1;
+  overlay.width = Math.max(1, Math.floor(width * dpr));
+  overlay.height = Math.max(1, Math.floor(height * dpr));
+  const context = overlay.getContext('2d');
+  context.setTransform(dpr, 0, 0, dpr, 0, 0);
+  context.clearRect(0, 0, width, height);
+  if (role !== 'end' || !state.gazeOverlayEnabled) return;
+  const sample = currentSample();
+  const robot = sample ? nearestRobotSample(sample.recordingTimestampSeconds) : null;
+  const matrix = robot?.T_display_end_camera?.matrix_4x4;
+  const camera = state.data?.robotRealSense?.cameraIntrinsics?.end;
+  if (!sample || !matrix || !camera) return;
+  const imageWidth = Number(camera.width) || Number(video.videoWidth) || 1280;
+  const imageHeight = Number(camera.height) || Number(video.videoHeight) || 720;
+  const boxAspect = width / height;
+  const imageAspect = imageWidth / imageHeight;
+  let drawWidth = width;
+  let drawHeight = height;
+  let offsetX = 0;
+  let offsetY = 0;
+  if (boxAspect > imageAspect) {
+    drawWidth = height * imageAspect;
+    offsetX = (width - drawWidth) * 0.5;
+  } else if (boxAspect < imageAspect) {
+    drawHeight = width / imageAspect;
+    offsetY = (height - drawHeight) * 0.5;
+  }
+  for (const entry of selectedGazeOverlayPoints(sample)) {
+    const projected = projectGazeOverlayPoint(entry.point, matrix, camera);
+    if (!projected || projected.u < 0 || projected.u >= imageWidth || projected.v < 0 || projected.v >= imageHeight) continue;
+    const x = offsetX + projected.u * drawWidth / imageWidth;
+    const y = offsetY + projected.v * drawHeight / imageHeight;
+    drawGazeOverlayMarker(context, x, y, entry.color, entry.label);
   }
 }
 
@@ -13661,6 +14202,16 @@ function sub(a,b){return [a[0]-b[0],a[1]-b[1],a[2]-b[2]]}
 function scale(a,s){return [a[0]*s,a[1]*s,a[2]*s]}
 function length(a){return Math.hypot(a[0],a[1],a[2])}
 function escapeHtml(text){return String(text).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}
+function gazeArtifactViewerUrl(url, role){
+  const text = String(url || '');
+  const separator = text.includes('?') ? '&' : '?';
+  return `${text}${separator}viewer=gaze&role=${encodeURIComponent(role)}`;
+}
+function rawArtifactUrl(url){
+  const text = String(url || '');
+  const separator = text.includes('?') ? '&' : '?';
+  return `${text}${separator}raw=1`;
+}
 
 canvas.addEventListener('pointerdown', event => {
   state.dragging = true;
@@ -13719,6 +14270,10 @@ gazeMode.onchange = () => {
   updateLabels(true);
   markReplayDirty();
 };
+gazeOverlayToggle.onchange = () => {
+  state.gazeOverlayEnabled = gazeOverlayToggle.checked;
+  redrawGazeOverlays();
+};
 refreshBtn.onclick = loadRecords;
 liveBtn.onclick = () => { window.location.href = '/'; };
 search.oninput = renderRecordList;
@@ -13731,6 +14286,7 @@ scrub.oninput = () => {
 };
 window.addEventListener('resize', () => {
   resize();
+  redrawGazeOverlays();
   markReplayDirty();
 });
 
