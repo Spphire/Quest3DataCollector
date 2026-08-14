@@ -100,6 +100,8 @@ GAZE_PROJECTION_STATUS_NAMES = {
     GAZE_PROJECTION_INVALID: "invalid",
 }
 
+IMAGE_RESIZE_MODES = ("stretch", "letterbox")
+
 
 def iter_jsonl(path: Path) -> Iterable[dict]:
     with path.open("r", encoding="utf-8") as f:
@@ -251,6 +253,59 @@ def project_world_point_with_status(
 def project_world_point(point_world: object, world_camera_pose: object, camera: dict) -> Optional[np.ndarray]:
     projection, status = project_world_point_with_status(point_world, world_camera_pose, camera)
     return projection if status == GAZE_PROJECTION_VALID else None
+
+
+def letterbox_geometry(
+    source_size: Tuple[int, int],
+    target_size: Tuple[int, int],
+) -> Dict[str, object]:
+    source_h, source_w = (int(source_size[0]), int(source_size[1]))
+    target_h, target_w = (int(target_size[0]), int(target_size[1]))
+    if min(source_h, source_w, target_h, target_w) <= 0:
+        raise ValueError("source and target image dimensions must be positive")
+
+    scale = min(float(target_w) / float(source_w), float(target_h) / float(source_h))
+    resized_w = min(target_w, max(1, int(round(float(source_w) * scale))))
+    resized_h = min(target_h, max(1, int(round(float(source_h) * scale))))
+    pad_left = (target_w - resized_w) // 2
+    pad_top = (target_h - resized_h) // 2
+    return {
+        "source_size": [source_h, source_w],
+        "target_size": [target_h, target_w],
+        "resized_size": [resized_h, resized_w],
+        "scale_xy": [float(resized_w) / float(source_w), float(resized_h) / float(source_h)],
+        "padding_ltrb": [
+            pad_left,
+            pad_top,
+            target_w - resized_w - pad_left,
+            target_h - resized_h - pad_top,
+        ],
+    }
+
+
+def remap_normalized_gaze_xy(
+    gaze_xy: np.ndarray,
+    *,
+    source_size: Tuple[int, int],
+    target_size: Tuple[int, int],
+    image_resize_mode: str,
+) -> np.ndarray:
+    point = np.asarray(gaze_xy, dtype=np.float64)
+    if point.shape != (2,) or not np.all(np.isfinite(point)):
+        raise ValueError("gaze_xy must contain two finite normalized coordinates")
+    if image_resize_mode == "stretch":
+        return point.astype(np.float32)
+    if image_resize_mode != "letterbox":
+        raise ValueError(f"Unsupported image resize mode: {image_resize_mode!r}")
+
+    geometry = letterbox_geometry(source_size, target_size)
+    source_h, source_w = geometry["source_size"]
+    target_h, target_w = geometry["target_size"]
+    scale_x, scale_y = geometry["scale_xy"]
+    pad_left, pad_top, _, _ = geometry["padding_ltrb"]
+    output_x = float(point[0]) * float(source_w) * float(scale_x) + float(pad_left)
+    output_y = float(point[1]) * float(source_h) * float(scale_y) + float(pad_top)
+    return np.asarray([output_x / float(target_w), output_y / float(target_h)], dtype=np.float32)
 
 
 def normalize_vector(value: object) -> Optional[np.ndarray]:
@@ -932,7 +987,15 @@ def create_output_zarr(
     return root, data, meta
 
 
-def write_lowdim_arrays(data, meta, plans: List[EpisodePlan], pose_frame: str, output_format: str):
+def write_lowdim_arrays(
+    data,
+    meta,
+    plans: List[EpisodePlan],
+    pose_frame: str,
+    output_format: str,
+    image_size: Tuple[int, int],
+    image_resize_mode: str,
+):
     episode_ends = []
     for plan in plans:
         start = plan.start_output_index
@@ -980,7 +1043,12 @@ def write_lowdim_arrays(data, meta, plans: List[EpisodePlan], pose_frame: str, o
             )
             gaze_projection_status[i] = projection_status
             if projection_status == GAZE_PROJECTION_VALID and projection is not None:
-                gaze_xy[i] = projection
+                gaze_xy[i] = remap_normalized_gaze_xy(
+                    projection,
+                    source_size=(int(plan.camera["height"]), int(plan.camera["width"])),
+                    target_size=image_size,
+                    image_resize_mode=image_resize_mode,
+                )
                 has_gaze[i] = True
 
         state = np.concatenate([tcp, gripper], axis=-1).astype(np.float32)
@@ -1060,6 +1128,27 @@ def center_crop_and_resize_image(
     return cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_AREA)
 
 
+def resize_image(
+    image: np.ndarray,
+    target_size: Tuple[int, int],
+    image_resize_mode: str,
+) -> np.ndarray:
+    target_h, target_w = target_size
+    if image_resize_mode == "stretch":
+        return cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    if image_resize_mode != "letterbox":
+        raise ValueError(f"Unsupported image resize mode: {image_resize_mode!r}")
+
+    geometry = letterbox_geometry(image.shape[:2], target_size)
+    resized_h, resized_w = geometry["resized_size"]
+    pad_left, pad_top, _, _ = geometry["padding_ltrb"]
+    resized = cv2.resize(image, (resized_w, resized_h), interpolation=cv2.INTER_AREA)
+    output_shape = (target_h, target_w) + image.shape[2:]
+    output = np.zeros(output_shape, dtype=image.dtype)
+    output[pad_top : pad_top + resized_h, pad_left : pad_left + resized_w] = resized
+    return output
+
+
 def flush_frame_batch(dataset, pending: List[Tuple[int, np.ndarray]]) -> None:
     if not pending:
         return
@@ -1088,6 +1177,7 @@ def write_video_role(
     image_size: Tuple[int, int],
     crop: bool,
     role_name: str,
+    image_resize_mode: str = "stretch",
     crop_anchor: str = "center",
     allow_trailing_fill: bool = True,
 ):
@@ -1119,9 +1209,15 @@ def write_video_role(
                 image = right_bottom_crop_and_resize_image(
                     frame, target_size=image_size
                 ).astype(np.uint8)
-            else:
+            elif crop:
                 image = center_crop_and_resize_image(
                     frame, target_size=image_size, crop=crop
+                ).astype(np.uint8)
+            else:
+                image = resize_image(
+                    frame,
+                    target_size=image_size,
+                    image_resize_mode=image_resize_mode,
                 ).astype(np.uint8)
             last_image = image
             while request_idx < len(requests) and requests[request_idx].frame_index == current_frame:
@@ -1161,6 +1257,7 @@ def write_images(
     eye_role: str,
     image_size: Tuple[int, int],
     output_format: str,
+    image_resize_mode: str,
 ):
     for plan in plans:
         wrist_video = resolve_video_path(plan.episode_dir, wrist_role, plan.samples)
@@ -1174,6 +1271,7 @@ def write_images(
             image_size=image_size,
             crop=False,
             role_name=f"{plan.record_id}/{wrist_role}",
+            image_resize_mode=image_resize_mode,
             crop_anchor="center",
             allow_trailing_fill=output_format != "gaze-wam",
         )
@@ -1187,6 +1285,7 @@ def write_images(
             image_size=image_size,
             crop=False,
             role_name=f"{plan.record_id}/{eye_role}",
+            image_resize_mode=image_resize_mode,
         )
 
 
@@ -1198,6 +1297,7 @@ def write_summary(output_path: Path, plans: List[EpisodePlan], args):
         "eye_role": args.eye_role,
         "pose_frame": args.pose_frame,
         "image_size": args.image_size,
+        "image_resize_mode": args.image_resize_mode,
         "output_format": args.output_format,
         "record_ids_file": str(Path(args.record_ids_file).resolve()) if args.record_ids_file else None,
         "action_semantics": (
@@ -1241,6 +1341,8 @@ def parse_image_size(value: str) -> Tuple[int, int]:
 def convert_pc_recordings_to_zarr(args):
     input_dir = Path(args.input_dir).resolve()
     output_path = Path(args.output).resolve()
+    if args.image_resize_mode is None:
+        args.image_resize_mode = "letterbox" if args.output_format == "gaze-wam" else "stretch"
     if args.output_format == "gaze-wam" and args.wrist_role != "end":
         raise ValueError(
             "The canonical Gaze-WAM converter currently projects gaze only into the "
@@ -1277,7 +1379,15 @@ def convert_pc_recordings_to_zarr(args):
         overwrite=not args.no_overwrite,
         output_format=args.output_format,
     )
-    write_lowdim_arrays(data, meta, plans, pose_frame=args.pose_frame, output_format=args.output_format)
+    write_lowdim_arrays(
+        data,
+        meta,
+        plans,
+        pose_frame=args.pose_frame,
+        output_format=args.output_format,
+        image_size=args.image_size,
+        image_resize_mode=args.image_resize_mode,
+    )
     write_images(
         data,
         plans,
@@ -1285,6 +1395,7 @@ def convert_pc_recordings_to_zarr(args):
         eye_role=args.eye_role,
         image_size=args.image_size,
         output_format=args.output_format,
+        image_resize_mode=args.image_resize_mode,
     )
     if args.output_format == "gaze-wam":
         meta.attrs.update({
@@ -1293,10 +1404,28 @@ def convert_pc_recordings_to_zarr(args):
             "camera_role": args.wrist_role,
             "camera_key": "camera0_rgb",
             "image_size": list(args.image_size),
-            "image_resize_mode": "stretch",
+            "image_resize_mode": args.image_resize_mode,
             "gaze_is_normalized": True,
             "gaze_projection_source": "causal_median_ray_depth_then_internal_linear_interpolation_pc_world",
             "gaze_projection_camera_role": args.wrist_role,
+            "gaze_projection_resize_transform": (
+                "source_normalized_to_letterboxed_output"
+                if args.image_resize_mode == "letterbox"
+                else "source_normalized_equals_stretched_output_normalized"
+            ),
+            "image_padding_rgb": [0, 0, 0] if args.image_resize_mode == "letterbox" else None,
+            "source_camera_size": [
+                int(plans[0].camera["height"]),
+                int(plans[0].camera["width"]),
+            ],
+            "image_resize_geometry": (
+                letterbox_geometry(
+                    (int(plans[0].camera["height"]), int(plans[0].camera["width"])),
+                    args.image_size,
+                )
+                if args.image_resize_mode == "letterbox"
+                else None
+            ),
             "gaze_median_filter": {
                 "kind": "causal_median_ray_depth",
                 "window": int(args.gaze_median_window),
@@ -1358,6 +1487,15 @@ def main():
         help="Robot TCP pose frame to convert into left_robot_tcp_pose",
     )
     parser.add_argument("--image-size", type=parse_image_size, default=(224, 224), help="Output image size as H,W")
+    parser.add_argument(
+        "--image-resize-mode",
+        choices=IMAGE_RESIZE_MODES,
+        default=None,
+        help=(
+            "Resize geometry for output images and normalized gaze. Defaults to "
+            "letterbox for gaze-wam and stretch for legacy UMI output."
+        ),
+    )
     parser.add_argument("--default-gripper-width", type=float, default=0.08)
     parser.add_argument(
         "--max-image-age-seconds",

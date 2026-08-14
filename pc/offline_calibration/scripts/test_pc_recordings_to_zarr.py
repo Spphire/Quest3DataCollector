@@ -69,6 +69,45 @@ class PcRecordingsToZarrTest(unittest.TestCase):
         self.assertEqual(outside, MODULE.GAZE_PROJECTION_OUT_OF_FRAME)
         self.assertTrue(np.allclose(outside_xy, [2.5, 0.5]))
 
+    def test_letterbox_geometry_and_gaze_remap_match_1280x720_to_256_square(self):
+        geometry = MODULE.letterbox_geometry((720, 1280), (256, 256))
+
+        self.assertEqual(geometry["resized_size"], [144, 256])
+        self.assertEqual(geometry["padding_ltrb"], [0, 56, 0, 56])
+        self.assertTrue(np.allclose(geometry["scale_xy"], [0.2, 0.2]))
+
+        remapped = MODULE.remap_normalized_gaze_xy(
+            np.asarray([0.25, 0.75], dtype=np.float32),
+            source_size=(720, 1280),
+            target_size=(256, 256),
+            image_resize_mode="letterbox",
+        )
+        self.assertTrue(np.allclose(remapped, [0.25, 0.640625]))
+        self.assertTrue(
+            np.allclose(
+                MODULE.remap_normalized_gaze_xy(
+                    np.asarray([0.25, 0.75], dtype=np.float32),
+                    source_size=(720, 1280),
+                    target_size=(256, 256),
+                    image_resize_mode="stretch",
+                ),
+                [0.25, 0.75],
+            )
+        )
+
+    def test_letterbox_image_has_expected_black_padding(self):
+        image = np.full((720, 1280, 3), [10, 20, 30], dtype=np.uint8)
+        output = MODULE.resize_image(
+            image,
+            target_size=(256, 256),
+            image_resize_mode="letterbox",
+        )
+
+        self.assertEqual(output.shape, (256, 256, 3))
+        self.assertFalse(np.any(output[:56]))
+        self.assertFalse(np.any(output[200:]))
+        self.assertTrue(np.all(output[56:200] == [10, 20, 30]))
+
     def test_replay_aligned_ray_depth_median_and_internal_interpolation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             record_dir = Path(temp_dir)
@@ -318,6 +357,8 @@ class PcRecordingsToZarrTest(unittest.TestCase):
             [plan],
             pose_frame="T_base_tool_tcp",
             output_format="gaze-wam",
+            image_size=(100, 100),
+            image_resize_mode="letterbox",
         )
 
         self.assertTrue(np.allclose(data["tcp_pose_abs"][:, 0], [0.1, 0.2]))
