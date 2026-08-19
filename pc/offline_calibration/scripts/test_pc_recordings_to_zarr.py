@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -26,6 +27,67 @@ class _MetaGroup:
 
 
 class PcRecordingsToZarrTest(unittest.TestCase):
+    def test_camera_source_size_reads_requested_role(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            episode_dir = Path(temp_dir)
+            (episode_dir / "cameras.json").write_text(
+                json.dumps(
+                    {
+                        "end": {"height": 720, "width": 1280},
+                        "third": {"height": 480, "width": 848},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(MODULE.camera_source_size(episode_dir, "third"), (480, 848))
+
+    def test_gaze_wam_dual_camera_writes_end_and_third_streams(self):
+        camera0 = np.zeros((1, 8, 8, 3), dtype=np.uint8)
+        camera1 = np.zeros((1, 8, 8, 3), dtype=np.uint8)
+        plan = MODULE.EpisodePlan(
+            record_id="record_test",
+            episode_dir=Path("."),
+            samples=[
+                {
+                    "videos": {
+                        "end": {"frameIndex": 3},
+                        "third": {"frameIndex": 5},
+                    }
+                }
+            ],
+            robot_states_by_index={},
+            gripper_times=[],
+            gripper_widths=[],
+            start_output_index=0,
+            end_output_index=1,
+            camera=None,
+        )
+
+        with mock.patch.object(
+            MODULE,
+            "resolve_video_path",
+            side_effect=lambda _episode, role, _samples: Path(f"{role}.mp4"),
+        ), mock.patch.object(MODULE, "write_video_role") as write_video_role:
+            MODULE.write_images(
+                {"camera0_rgb": camera0, "camera1_rgb": camera1},
+                [plan],
+                wrist_role="end",
+                eye_role="third",
+                image_size=(256, 256),
+                output_format="gaze-wam",
+                image_resize_mode="letterbox",
+                include_eye_camera=True,
+            )
+
+        self.assertEqual(write_video_role.call_count, 2)
+        self.assertIs(write_video_role.call_args_list[0].kwargs["dataset"], camera0)
+        self.assertIs(write_video_role.call_args_list[1].kwargs["dataset"], camera1)
+        self.assertEqual(write_video_role.call_args_list[0].kwargs["image_resize_mode"], "letterbox")
+        self.assertEqual(write_video_role.call_args_list[1].kwargs["image_resize_mode"], "letterbox")
+        self.assertEqual(write_video_role.call_args_list[0].kwargs["requests"][0].frame_index, 3)
+        self.assertEqual(write_video_role.call_args_list[1].kwargs["requests"][0].frame_index, 5)
+
     def test_batch_selection_report_records_exclusion_reasons(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -361,6 +423,7 @@ class PcRecordingsToZarrTest(unittest.TestCase):
         data = {
             "timestamp": np.zeros(total, dtype=np.float64),
             "image_timestamp": np.zeros(total, dtype=np.float64),
+            "camera1_image_timestamp": np.zeros(total, dtype=np.float64),
             "robot_state_timestamp": np.zeros(total, dtype=np.float64),
             "action_timestamp": np.zeros(total, dtype=np.float64),
             "gaze_timestamp": np.zeros(total, dtype=np.float64),
@@ -408,7 +471,8 @@ class PcRecordingsToZarrTest(unittest.TestCase):
                     "_gaze_world_pc": np.asarray([0.0, 0.0, 1.0]),
                     "_gaze_3d_source": MODULE.GAZE_3D_SOURCE_MEDIAN_FILTERED,
                     "videoFrames": {
-                        "end": {"capturedPerfCounterSeconds": 18.0 + index}
+                        "end": {"capturedPerfCounterSeconds": 18.0 + index},
+                        "third": {"capturedPerfCounterSeconds": 17.5 + index},
                     },
                 }
             )
@@ -433,10 +497,13 @@ class PcRecordingsToZarrTest(unittest.TestCase):
             output_format="gaze-wam",
             image_size=(100, 100),
             image_resize_mode="letterbox",
+            eye_role="third",
+            include_eye_camera=True,
         )
 
         self.assertTrue(np.allclose(data["tcp_pose_abs"][:, 0], [0.1, 0.2]))
         self.assertTrue(np.allclose(data["timestamp"], [30.0, 30.0 + 1.0 / 30.0]))
+        self.assertTrue(np.allclose(data["camera1_image_timestamp"], [17.5, 18.5]))
         self.assertTrue(np.allclose(data["action_abs_tcp"][:, 0], [0.1, 0.2]))
         self.assertTrue(np.allclose(data["action_abs_tcp"][:, 9], [0.08, 0.08]))
         self.assertTrue(np.allclose(data["gaze_xy"], [[0.5, 0.5], [0.5, 0.5]]))

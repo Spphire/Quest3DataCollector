@@ -24,6 +24,7 @@ The default ``umi`` output matches the legacy single-arm image datasets:
 
 The ``gaze-wam`` output writes the canonical robot contract:
   data/camera0_rgb                 [N, H, W, 3]
+  data/camera1_rgb                 [N, H, W, 3], optional third-person camera
   data/gaze_xy                    [N, 2], normalized to the end-camera image
   data/action_abs_tcp             [N, 10]
   data/tcp_pose_abs               [N, 9]
@@ -281,6 +282,21 @@ def letterbox_geometry(
             target_h - resized_h - pad_top,
         ],
     }
+
+
+def camera_source_size(episode_dir: Path, role: str) -> Tuple[int, int]:
+    cameras_path = episode_dir / "cameras.json"
+    cameras = json.loads(cameras_path.read_text(encoding="utf-8"))
+    camera = cameras.get(role)
+    if not isinstance(camera, dict):
+        raise KeyError(f"Camera role {role!r} is missing from {cameras_path}")
+    height = int(camera.get("height", 0))
+    width = int(camera.get("width", 0))
+    if height <= 0 or width <= 0:
+        raise ValueError(
+            f"Camera role {role!r} has invalid source size {width}x{height} in {cameras_path}"
+        )
+    return height, width
 
 
 def remap_normalized_gaze_xy(
@@ -1012,6 +1028,7 @@ def create_output_zarr(
     image_size: Tuple[int, int],
     overwrite: bool,
     output_format: str,
+    include_eye_camera: bool = False,
 ):
     import zarr
 
@@ -1052,6 +1069,21 @@ def create_output_zarr(
             dtype="uint8",
             compressor=compressor,
         )
+        if include_eye_camera:
+            data.create_dataset(
+                "camera1_image_timestamp",
+                shape=(total_frames,),
+                chunks=(10000,),
+                dtype="float64",
+                compressor=compressor,
+            )
+            data.create_dataset(
+                "camera1_rgb",
+                shape=(total_frames, h, w, 3),
+                chunks=(16, h, w, 3),
+                dtype="uint8",
+                compressor=compressor,
+            )
     else:
         data.create_dataset("left_robot_tcp_pose", shape=(total_frames, 9), chunks=(10000, 9), dtype="float32", compressor=compressor)
         data.create_dataset("left_robot_gripper_width", shape=(total_frames, 1), chunks=(10000, 1), dtype="float32", compressor=compressor)
@@ -1070,6 +1102,8 @@ def write_lowdim_arrays(
     output_format: str,
     image_size: Tuple[int, int],
     image_resize_mode: str,
+    eye_role: str = "third",
+    include_eye_camera: bool = False,
 ):
     episode_ends = []
     for plan in plans:
@@ -1080,6 +1114,7 @@ def write_lowdim_arrays(
         tcp = np.zeros((n, 9), dtype=np.float32)
         gripper = np.zeros((n, 1), dtype=np.float32)
         image_timestamps = np.zeros((n,), dtype=np.float64)
+        eye_image_timestamps = np.zeros((n,), dtype=np.float64)
         robot_timestamps = np.zeros((n,), dtype=np.float64)
         gaze_timestamps = np.zeros((n,), dtype=np.float64)
         gaze_xy = np.zeros((n, 2), dtype=np.float32)
@@ -1116,6 +1151,11 @@ def write_lowdim_arrays(
                 robot_state.get("T_world_end_camera"),
                 plan.camera,
             )
+            eye_image_timestamps[i] = float(
+                sample.get("videoFrames", {}).get(eye_role, {}).get(
+                    "capturedPerfCounterSeconds", timestamps[i]
+                )
+            )
             gaze_projection_status[i] = projection_status
             if projection_status == GAZE_PROJECTION_VALID and projection is not None:
                 gaze_xy[i] = remap_normalized_gaze_xy(
@@ -1130,6 +1170,8 @@ def write_lowdim_arrays(
         data["timestamp"][start:end] = timestamps
         if output_format == "gaze-wam":
             data["image_timestamp"][start:end] = image_timestamps
+            if include_eye_camera:
+                data["camera1_image_timestamp"][start:end] = eye_image_timestamps
             data["robot_state_timestamp"][start:end] = robot_timestamps
             data["action_timestamp"][start:end] = robot_timestamps
             data["gaze_timestamp"][start:end] = gaze_timestamps
@@ -1333,6 +1375,7 @@ def write_images(
     image_size: Tuple[int, int],
     output_format: str,
     image_resize_mode: str,
+    include_eye_camera: bool = False,
 ):
     for plan in plans:
         wrist_video = resolve_video_path(plan.episode_dir, wrist_role, plan.samples)
@@ -1350,11 +1393,12 @@ def write_images(
             crop_anchor="center",
             allow_trailing_fill=output_format != "gaze-wam",
         )
-        if output_format == "gaze-wam":
+        if output_format == "gaze-wam" and not include_eye_camera:
             continue
-        logger.info(f"{plan.record_id}: writing {eye_role} -> left_eye_img")
+        eye_key = "camera1_rgb" if output_format == "gaze-wam" else "left_eye_img"
+        logger.info(f"{plan.record_id}: writing {eye_role} -> {eye_key}")
         write_video_role(
-            dataset=data["left_eye_img"],
+            dataset=data[eye_key],
             video_path=eye_video,
             requests=build_frame_requests(plan, eye_role),
             image_size=image_size,
@@ -1382,6 +1426,15 @@ def write_summary(
         "output_zarr": str(output_path.resolve()),
         "wrist_role": args.wrist_role,
         "eye_role": args.eye_role,
+        "include_eye_camera": bool(getattr(args, "include_eye_camera", False)),
+        "camera_roles": (
+            {"camera0_rgb": args.wrist_role, "camera1_rgb": args.eye_role}
+            if args.output_format == "gaze-wam"
+            and bool(getattr(args, "include_eye_camera", False))
+            else {"camera0_rgb": args.wrist_role}
+            if args.output_format == "gaze-wam"
+            else {"left_wrist_img": args.wrist_role, "left_eye_img": args.eye_role}
+        ),
         "pose_frame": args.pose_frame,
         "image_size": args.image_size,
         "image_resize_mode": args.image_resize_mode,
@@ -1434,6 +1487,7 @@ def convert_pc_recordings_to_zarr(args):
     output_path = Path(args.output).resolve()
     if args.image_resize_mode is None:
         args.image_resize_mode = "letterbox" if args.output_format == "gaze-wam" else "stretch"
+    include_eye_camera = bool(getattr(args, "include_eye_camera", False))
     if args.output_format == "gaze-wam" and args.wrist_role != "end":
         raise ValueError(
             "The canonical Gaze-WAM converter currently projects gaze only into the "
@@ -1460,6 +1514,8 @@ def convert_pc_recordings_to_zarr(args):
             "missing_gaze_excludes_recording": False,
             "gaze_median_window": int(args.gaze_median_window),
             "image_resize_mode": args.image_resize_mode,
+            "include_eye_camera": include_eye_camera,
+            "eye_role": args.eye_role if include_eye_camera else None,
         },
     }
     plans = build_plans(
@@ -1499,6 +1555,7 @@ def convert_pc_recordings_to_zarr(args):
         image_size=args.image_size,
         overwrite=not args.no_overwrite,
         output_format=args.output_format,
+        include_eye_camera=include_eye_camera,
     )
     write_lowdim_arrays(
         data,
@@ -1508,6 +1565,8 @@ def convert_pc_recordings_to_zarr(args):
         output_format=args.output_format,
         image_size=args.image_size,
         image_resize_mode=args.image_resize_mode,
+        eye_role=args.eye_role,
+        include_eye_camera=include_eye_camera,
     )
     write_images(
         data,
@@ -1517,6 +1576,7 @@ def convert_pc_recordings_to_zarr(args):
         image_size=args.image_size,
         output_format=args.output_format,
         image_resize_mode=args.image_resize_mode,
+        include_eye_camera=include_eye_camera,
     )
     if args.output_format == "gaze-wam":
         meta.attrs.update({
@@ -1524,6 +1584,15 @@ def convert_pc_recordings_to_zarr(args):
             "canonical_schema": "gaze_wam_robot_v1",
             "camera_role": args.wrist_role,
             "camera_key": "camera0_rgb",
+            "camera_roles": {
+                "camera0_rgb": args.wrist_role,
+                **({"camera1_rgb": args.eye_role} if include_eye_camera else {}),
+            },
+            "camera_keys": (
+                ["camera0_rgb", "camera1_rgb"]
+                if include_eye_camera
+                else ["camera0_rgb"]
+            ),
             "image_size": list(args.image_size),
             "image_resize_mode": args.image_resize_mode,
             "gaze_is_normalized": True,
@@ -1539,6 +1608,17 @@ def convert_pc_recordings_to_zarr(args):
                 int(plans[0].camera["height"]),
                 int(plans[0].camera["width"]),
             ],
+            "source_camera_sizes": {
+                "camera0_rgb": [
+                    int(plans[0].camera["height"]),
+                    int(plans[0].camera["width"]),
+                ],
+                **(
+                    {"camera1_rgb": list(camera_source_size(plans[0].episode_dir, args.eye_role))}
+                    if include_eye_camera
+                    else {}
+                ),
+            },
             "image_resize_geometry": (
                 letterbox_geometry(
                     (int(plans[0].camera["height"]), int(plans[0].camera["width"])),
@@ -1547,6 +1627,26 @@ def convert_pc_recordings_to_zarr(args):
                 if args.image_resize_mode == "letterbox"
                 else None
             ),
+            "image_resize_geometry_by_camera": {
+                "camera0_rgb": (
+                    letterbox_geometry(
+                        (int(plans[0].camera["height"]), int(plans[0].camera["width"])),
+                        args.image_size,
+                    )
+                    if args.image_resize_mode == "letterbox"
+                    else None
+                ),
+                **(
+                    {
+                        "camera1_rgb": letterbox_geometry(
+                            camera_source_size(plans[0].episode_dir, args.eye_role),
+                            args.image_size,
+                        )
+                    }
+                    if include_eye_camera and args.image_resize_mode == "letterbox"
+                    else {}
+                ),
+            },
             "gaze_median_filter": {
                 "kind": "causal_median_ray_depth",
                 "window": int(args.gaze_median_window),
@@ -1564,6 +1664,15 @@ def convert_pc_recordings_to_zarr(args):
             "timestamp_key": "timestamp",
             "timestamp_stream_keys": {
                 "image_timestamp": {"output_key": "image_timestamp"},
+                **(
+                    {
+                        "camera1_image_timestamp": {
+                            "output_key": "camera1_image_timestamp"
+                        }
+                    }
+                    if include_eye_camera
+                    else {}
+                ),
                 "robot_state_timestamp": {"output_key": "robot_state_timestamp"},
                 "action_timestamp": {"output_key": "action_timestamp"},
                 "gaze_timestamp": {"output_key": "gaze_timestamp"},
@@ -1609,6 +1718,14 @@ def main():
     )
     parser.add_argument("--wrist-role", default="end", help="Camera role to write as left_wrist_img")
     parser.add_argument("--eye-role", default="third", help="Camera role to write as left_eye_img")
+    parser.add_argument(
+        "--include-eye-camera",
+        action="store_true",
+        help=(
+            "For gaze-wam output, also write --eye-role as data/camera1_rgb. "
+            "The stream uses the same image size and resize mode as camera0_rgb."
+        ),
+    )
     parser.add_argument(
         "--pose-frame",
         default="T_base_tool_tcp",
