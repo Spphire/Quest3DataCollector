@@ -434,6 +434,7 @@ class PcRecordingsToZarrTest(unittest.TestCase):
             "gaze_world_pc": np.zeros((total, 3), dtype=np.float32),
             "gaze_3d_source": np.zeros(total, dtype=np.uint8),
             "gaze_projection_status": np.zeros(total, dtype=np.uint8),
+            "has_gaze_condition": np.zeros(total, dtype=np.bool_),
             "has_gaze_label": np.zeros(total, dtype=np.bool_),
             "has_heatmap_image": np.ones(total, dtype=np.bool_),
         }
@@ -467,8 +468,8 @@ class PcRecordingsToZarrTest(unittest.TestCase):
                     "pc_perf_counter_seconds": 20.0 + index,
                     "robot_state_pc_perf_counter_seconds": 10.0 + index,
                     "quest_pc_receive_perf_counter_seconds": 19.0 + index,
-                    "quest_gaze3d_pc_world": [0.0, 0.0, 1.0],
-                    "_gaze_world_pc": np.asarray([0.0, 0.0, 1.0]),
+                    "quest_gaze3d_pc_world": [2.0 * index, 0.0, 1.0],
+                    "_gaze_world_pc": np.asarray([2.0 * index, 0.0, 1.0]),
                     "_gaze_3d_source": MODULE.GAZE_3D_SOURCE_MEDIAN_FILTERED,
                     "videoFrames": {
                         "end": {"capturedPerfCounterSeconds": 18.0 + index},
@@ -506,10 +507,14 @@ class PcRecordingsToZarrTest(unittest.TestCase):
         self.assertTrue(np.allclose(data["camera1_image_timestamp"], [17.5, 18.5]))
         self.assertTrue(np.allclose(data["action_abs_tcp"][:, 0], [0.1, 0.2]))
         self.assertTrue(np.allclose(data["action_abs_tcp"][:, 9], [0.08, 0.08]))
-        self.assertTrue(np.allclose(data["gaze_xy"], [[0.5, 0.5], [0.5, 0.5]]))
-        self.assertTrue(np.all(data["has_gaze_label"]))
-        self.assertTrue(np.allclose(data["gaze_world_pc"], [[0.0, 0.0, 1.0]] * 2))
-        self.assertTrue(np.all(data["gaze_projection_status"] == MODULE.GAZE_PROJECTION_VALID))
+        self.assertTrue(np.allclose(data["gaze_xy"], [[0.5, 0.5], [2.5, 0.5]]))
+        self.assertTrue(np.all(data["has_gaze_condition"]))
+        self.assertEqual(data["has_gaze_label"].tolist(), [True, False])
+        self.assertTrue(np.allclose(data["gaze_world_pc"], [[0.0, 0.0, 1.0], [2.0, 0.0, 1.0]]))
+        self.assertEqual(
+            data["gaze_projection_status"].tolist(),
+            [MODULE.GAZE_PROJECTION_VALID, MODULE.GAZE_PROJECTION_OUT_OF_FRAME],
+        )
         self.assertFalse(np.any(data["has_heatmap_image"]))
         self.assertTrue(np.array_equal(meta.values["episode_ends"], [1, 2]))
 

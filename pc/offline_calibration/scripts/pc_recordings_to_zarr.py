@@ -30,7 +30,7 @@ The ``gaze-wam`` output writes the canonical robot contract:
   data/tcp_pose_abs               [N, 9]
   data/gripper_width              [N]
   data/{timestamp,image_timestamp,robot_state_timestamp,gaze_timestamp}
-  data/{has_gaze_label,has_heatmap_image}
+  data/{has_gaze_condition,has_gaze_label,has_heatmap_image}
   data/{gaze_world_pc,gaze_3d_source,gaze_projection_status}
   meta/episode_ends
 """
@@ -1060,6 +1060,7 @@ def create_output_zarr(
         data.create_dataset("gaze_world_pc", shape=(total_frames, 3), chunks=(10000, 3), dtype="float32", compressor=compressor)
         data.create_dataset("gaze_3d_source", shape=(total_frames,), chunks=(10000,), dtype="uint8", compressor=compressor)
         data.create_dataset("gaze_projection_status", shape=(total_frames,), chunks=(10000,), dtype="uint8", compressor=compressor)
+        data.create_dataset("has_gaze_condition", shape=(total_frames,), chunks=(10000,), dtype="bool", compressor=compressor)
         data.create_dataset("has_gaze_label", shape=(total_frames,), chunks=(10000,), dtype="bool", compressor=compressor)
         data.create_dataset("has_heatmap_image", shape=(total_frames,), chunks=(10000,), dtype="bool", compressor=compressor)
         data.create_dataset(
@@ -1121,7 +1122,8 @@ def write_lowdim_arrays(
         gaze_world_pc = np.zeros((n, 3), dtype=np.float32)
         gaze_3d_source = np.zeros((n,), dtype=np.uint8)
         gaze_projection_status = np.zeros((n,), dtype=np.uint8)
-        has_gaze = np.zeros((n,), dtype=np.bool_)
+        has_gaze_condition = np.zeros((n,), dtype=np.bool_)
+        has_gaze_label = np.zeros((n,), dtype=np.bool_)
 
         for i, sample in enumerate(plan.samples):
             state_idx = int(sample["robot_state_sample_index"])
@@ -1157,14 +1159,18 @@ def write_lowdim_arrays(
                 )
             )
             gaze_projection_status[i] = projection_status
-            if projection_status == GAZE_PROJECTION_VALID and projection is not None:
+            if projection_status in (
+                GAZE_PROJECTION_VALID,
+                GAZE_PROJECTION_OUT_OF_FRAME,
+            ) and projection is not None:
                 gaze_xy[i] = remap_normalized_gaze_xy(
                     projection,
                     source_size=(int(plan.camera["height"]), int(plan.camera["width"])),
                     target_size=image_size,
                     image_resize_mode=image_resize_mode,
                 )
-                has_gaze[i] = True
+                has_gaze_condition[i] = True
+                has_gaze_label[i] = projection_status == GAZE_PROJECTION_VALID
 
         state = np.concatenate([tcp, gripper], axis=-1).astype(np.float32)
         data["timestamp"][start:end] = timestamps
@@ -1182,7 +1188,8 @@ def write_lowdim_arrays(
             data["gaze_world_pc"][start:end] = gaze_world_pc
             data["gaze_3d_source"][start:end] = gaze_3d_source
             data["gaze_projection_status"][start:end] = gaze_projection_status
-            data["has_gaze_label"][start:end] = has_gaze
+            data["has_gaze_condition"][start:end] = has_gaze_condition
+            data["has_gaze_label"][start:end] = has_gaze_label
             data["has_heatmap_image"][start:end] = False
         else:
             action = state.copy()
@@ -1677,7 +1684,11 @@ def convert_pc_recordings_to_zarr(args):
                 "action_timestamp": {"output_key": "action_timestamp"},
                 "gaze_timestamp": {"output_key": "gaze_timestamp"},
             },
-            "presence_mask_keys": ["has_gaze_label", "has_heatmap_image"],
+            "presence_mask_keys": [
+                "has_gaze_condition",
+                "has_gaze_label",
+                "has_heatmap_image",
+            ],
         })
     write_summary(output_path, plans, args, selection_report, selection_report_path)
     logger.info(f"Saved zarr: {output_path}")
