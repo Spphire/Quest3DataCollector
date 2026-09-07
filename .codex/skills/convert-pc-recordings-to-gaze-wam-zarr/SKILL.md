@@ -9,6 +9,11 @@ Treat each invocation as an independent batch job. Never silently reuse the hist
 
 Read [references/filtering-contract.md](references/filtering-contract.md) before changing thresholds, camera roles, image geometry, gaze handling, or action semantics.
 
+The default Quest-source quality policy is endpoint-aware: trim leading/trailing
+stale or terminal Quest-source reuse first, then evaluate the retained internal
+window. A cumulative reuse ratio of 10% is not by itself a hard rejection when
+the raw timeline is available.
+
 ## Required Inputs
 
 Resolve these values from the request or deployment context:
@@ -50,6 +55,8 @@ python pc/offline_calibration/scripts/pc_recordings_to_zarr.py \
   --image-resize-mode letterbox \
   --max-image-age-seconds 0.060 \
   --max-gaze-age-seconds 0.060 \
+  --max-consecutive-reuse 5 \
+  --max-fallback-reuse-ratio 0.20 \
   --max-sample-gap-seconds 0.060 \
   --max-endpoint-trim-seconds 1.0 \
   --gaze-median-window 7 \
@@ -57,6 +64,15 @@ python pc/offline_calibration/scripts/pc_recordings_to_zarr.py \
 ```
 
 Inspect `batch.selection.json`. Report the candidate, accepted, and excluded counts plus every exclusion reason. Stop if no recording survives.
+
+For each accepted episode, inspect the trim-before-filter metrics. Internal Quest
+source reuse of at most 5 consecutive aligned frames is accepted and must be
+interpolated between fresh gaze samples when possible; if it cannot be
+interpolated, keep the action row but mask the gaze condition/label. A terminal
+reuse run longer than 5 frames, or stale rows at the beginning/end, is trim-eligible
+and must not cause the whole physical recording to be discarded. Internal reuse
+longer than 5 frames remains an exclusion. The post-trim cumulative reuse ratio is
+only a configurable fallback guard (default 20%).
 
 3. Run the same command without `--dry-run`. Capture stdout/stderr in the artifact directory. Do not change thresholds between dry-run and conversion.
 
@@ -103,6 +119,8 @@ Always report:
 - Candidate/accepted/excluded recording counts and retained frame count.
 - Every excluded record with structured reasons.
 - Effective filter parameters, image geometry, gaze policy, and action semantics.
+- Trim-before-filter Quest metrics: original/trimmed frame counts, endpoint stale and
+  terminal-reuse frames, post-trim longest consecutive reuse, and post-trim ratio.
 - Validator result and any remaining training-readiness blocker.
 
 Do not claim success from file existence alone. Require completed conversion, `batch.selection.json`, and validator `"valid": true`.
