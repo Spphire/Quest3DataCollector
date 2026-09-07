@@ -27,6 +27,44 @@ class _MetaGroup:
 
 
 class PcRecordingsToZarrTest(unittest.TestCase):
+    def test_quest_endpoint_trim_removes_stale_and_long_terminal_reuse(self):
+        samples = [
+            {"pc_perf_counter_seconds": i / 30.0,
+             "quest_pc_receive_perf_counter_seconds": i / 30.0,
+             "aligned_source_reused": False}
+            for i in range(4)
+        ] + [
+            {"pc_perf_counter_seconds": (4 + i) / 30.0,
+             "quest_pc_receive_perf_counter_seconds": 0.0,
+             "aligned_source_reused": True}
+            for i in range(10)
+        ]
+        retained, metrics = MODULE.trim_quest_stale_endpoints(
+            samples, max_gaze_age_seconds=0.060, max_endpoint_reuse_frames=5
+        )
+        self.assertEqual(len(retained), 4)
+        self.assertEqual(metrics["trim_end_reuse_frames"], 10)
+
+    def test_short_reuse_rows_are_interpolated_not_replayed(self):
+        samples = [
+            {"quest_sample_index": 0, "pc_perf_counter_seconds": 0.0,
+             "quest_pc_receive_perf_counter_seconds": 0.0},
+            {"quest_sample_index": 0, "aligned_source_reused": True,
+             "pc_perf_counter_seconds": 1 / 30.0,
+             "quest_pc_receive_perf_counter_seconds": 1 / 30.0},
+            {"quest_sample_index": 2, "pc_perf_counter_seconds": 2 / 30.0,
+             "quest_pc_receive_perf_counter_seconds": 2 / 30.0},
+        ]
+        rays = {
+            0: {"filtered_point": np.asarray([0.0, 0.0, 1.0])},
+            2: {"filtered_point": np.asarray([0.0, 0.0, 3.0])},
+        }
+        MODULE.build_smoothed_interpolated_gaze(
+            samples, rays, median_window=3, segment_end_offsets=[3], max_gaze_age_seconds=0.060
+        )
+        self.assertEqual(samples[1]["_gaze_3d_source"], MODULE.GAZE_3D_SOURCE_INTERPOLATED)
+        self.assertTrue(np.allclose(samples[1]["_gaze_world_pc"], [0.0, 0.0, 2.0]))
+
     def test_camera_source_size_reads_requested_role(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             episode_dir = Path(temp_dir)

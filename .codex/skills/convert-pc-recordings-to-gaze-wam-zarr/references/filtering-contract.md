@@ -64,6 +64,37 @@ Required canonical keys include:
 - aligned timestamp arrays
 - `meta/episode_ends`
 
+## Quest Source Reuse And Endpoint Recovery
+
+Quest source reuse means reuse of the Quest telemetry/gaze/pose source while
+aligning PC rows. It does not mean reusing robot-state rows or end/third camera
+frames. Track Quest reuse, UDP sequence loss/ordering, source age, robot timing,
+and camera timing as separate metrics.
+
+Apply the following order when raw `samples.jsonl` is available:
+
+1. Identify leading/trailing rows whose Quest source age exceeds
+   `max_gaze_age_seconds` (default 60 ms), plus terminal reuse runs. Evaluate a
+   terminal reuse run before applying stale-age trim so a partly stale run is
+   removed in full.
+2. If a leading/trailing run of `aligned_source_reused` is longer than
+   `max_consecutive_reuse` (default 5 frames), treat it as a Quest stop/idle tail
+   and trim it. Do not trim short endpoint reuse unconditionally.
+3. On the retained internal window, accept runs up to 5 consecutive frames. For
+   internal reused rows, never use the repeated Quest payload as a fresh gaze label:
+   interpolate from surrounding fresh gaze in PC-world coordinates when both sides
+   exist; otherwise keep the action row and set `has_gaze_condition=false` and
+   `has_gaze_label=false`.
+4. Exclude when an internal run exceeds the configured consecutive threshold.
+5. Use post-trim cumulative reuse ratio only as a configurable fallback guard
+   (default 20%), never as the sole historical 10% hard gate.
+
+Endpoint trimming may recover a usable episode such as a recording whose final
+~2 seconds were written after Quest telemetry stopped. It must not hide independent
+robot, camera, or UDP/system failures; those checks remain recording-level gates.
+Quest endpoint recovery is a source-timeline policy and is not capped by the
+camera-only `max_endpoint_trim_seconds` limit.
+
 ## Optional Audit Prefilter
 
 Do not apply the historical rate/reuse filter by default. When explicitly requested, require:
@@ -71,9 +102,12 @@ Do not apply the historical rate/reuse filter by default. When explicitly reques
 - Flexiv robot-state effective rate / 90 Hz at least 0.95.
 - Aligned sample effective rate / 30 Hz at least 0.95.
 - End and third camera effective rates / 30 Hz at least 0.95.
-- `alignedReusedSourceSamples / alignedSamples.count` at most 0.10.
+- When raw timelines are unavailable, retain the legacy cumulative reuse check.
+  When raw timelines are available, report the post-trim reuse ratio and apply the
+  configured fallback guard instead of treating 10% as a hard gate.
 
-Generate audit reports and prefilter manifests only from the current batch so unrelated recordings cannot enter by timestamp ordering.
+Generate audit reports and prefilter manifests only from the current batch so unrelated recordings cannot enter by timestamp ordering. The selection report
+must include both pre-trim and post-trim reuse metrics and stable exclusion reasons.
 
 ## Acceptance
 
