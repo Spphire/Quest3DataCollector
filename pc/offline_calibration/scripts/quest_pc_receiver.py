@@ -182,6 +182,49 @@ def decode_quest_udp_datagram(data: bytes) -> tuple[dict[str, Any], dict[str, An
     }
 
 
+def send_tcp_bookmark_ack(
+    sock: socket.socket,
+    remote: tuple[str, int],
+    message: dict[str, Any],
+    event: dict[str, Any],
+) -> bool:
+    """Return a TCP bookmark save result to the fixed UDP listener on Quest."""
+    if not isinstance(message, dict) or not isinstance(event, dict):
+        return False
+    try:
+        reply_port = int(message.get("tcpBookmarkReplyPort") or 0)
+    except (TypeError, ValueError):
+        return False
+    if not 1 <= reply_port <= 65535:
+        return False
+
+    acknowledgement = {
+        "protocol": "quest_recording_telemetry_v1",
+        "type": "tcp_bookmark_ack",
+        "sequence": message.get("sequence"),
+        "sampleIndex": message.get("sampleIndex"),
+        "action": event.get("action"),
+        "ok": bool(event.get("ok")),
+        "reason": event.get("reason"),
+        "error": event.get("error"),
+        "targetFrame": event.get("targetFrame"),
+        "poseFormat": event.get("poseFormat"),
+        "targetPoseWxyz": event.get("targetPoseWxyz"),
+        "savedAtUtc": event.get("capturedAtUtc"),
+    }
+    try:
+        payload = json.dumps(acknowledgement, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        sock.sendto(payload, (str(remote[0]), reply_port))
+        return True
+    except OSError as exc:
+        print(
+            f"[tcp-bookmark] ACK send failed to {remote[0]}:{reply_port}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+
+
 def note_quest_udp_wire_datagram(
     data: bytes,
     remote_host: str,
@@ -1465,6 +1508,7 @@ class SessionWriter:
             "rightEyePosition": message.get("rightEyePosition"),
             "leftController": message.get("leftController"),
             "rightController": message.get("rightController"),
+            "tcpBookmarkTargetPoseWxyz": message.get("tcpBookmarkTargetPoseWxyz"),
         }
         robot_compact = self._compact_robot_row(robot_row)
         if robot_compact is not None:
@@ -3787,6 +3831,29 @@ def receive(args: argparse.Namespace) -> int:
 
             if visualizer is not None:
                 visualizer.note_udp_datagram(message, wrapper, len(data))
+
+            if (
+                is_sample
+                and not is_late_closed_record_sample
+                and robot_manager is not None
+            ):
+                bookmark_event = robot_manager.handle_quest_tcp_bookmark(
+                    message,
+                    source=f"{remote[0]}:{remote[1]}",
+                )
+                if bookmark_event is not None:
+                    send_tcp_bookmark_ack(sock, remote, message, bookmark_event)
+                    bookmark_event = {"type": "robot_tcp_bookmark", **bookmark_event}
+                    if visualizer is not None:
+                        visualizer.publish_event(bookmark_event)
+                    if not args.quiet:
+                        action = bookmark_event.get("action") or "unknown"
+                        result = "ok" if bookmark_event.get("ok") else "rejected"
+                        print(
+                            f"[tcp-bookmark] action={action} result={result} "
+                            f"reason={bookmark_event.get('reason') or '-'}",
+                            flush=True,
+                        )
 
             if msg_type == "recording_stop" or is_stop_like_sample:
                 if active is not None and record_id == active.record_id:
@@ -6228,6 +6295,8 @@ def compact_controller_input(value: Any) -> dict[str, Any]:
             "indexTriggerPressed",
             "aButton",
             "bButton",
+            "xButton",
+            "yButton",
             "teleopHeld",
         ),
     )
@@ -8497,6 +8566,8 @@ def controller_input_summary(controller: dict[str, Any]) -> dict[str, Any]:
             "indexTriggerPressed": nested_input.get("indexTriggerPressed"),
             "aButton": nested_input.get("aButton"),
             "bButton": nested_input.get("bButton"),
+            "xButton": nested_input.get("xButton"),
+            "yButton": nested_input.get("yButton"),
             "teleopHeld": bool(nested_input.get("teleopHeld")),
             "teleopThreshold": nested_input.get("teleopThreshold") if is_number(nested_input.get("teleopThreshold")) else 0.65,
         }
@@ -8530,9 +8601,20 @@ def controller_input_summary(controller: dict[str, Any]) -> dict[str, Any]:
     index_pressed = first_bool("indexTriggerPressed", "rightIndexTriggerPressed", "triggerPressed", "triggerButton")
     a_button = first_bool("aButton", "buttonA", "primaryButton")
     b_button = first_bool("bButton", "buttonB", "secondaryButton")
+    x_button = first_bool("xButton", "buttonX", "primaryButton")
+    y_button = first_bool("yButton", "buttonY", "secondaryButton")
     has_any = any(
         value is not None
-        for value in (hand_trigger, index_trigger, hand_pressed, index_pressed, a_button, b_button)
+        for value in (
+            hand_trigger,
+            index_trigger,
+            hand_pressed,
+            index_pressed,
+            a_button,
+            b_button,
+            x_button,
+            y_button,
+        )
     )
     teleop_held = bool(hand_pressed) or (hand_trigger is not None and hand_trigger >= 0.65)
     return {
@@ -8543,6 +8625,8 @@ def controller_input_summary(controller: dict[str, Any]) -> dict[str, Any]:
         "indexTriggerPressed": index_pressed,
         "aButton": a_button,
         "bButton": b_button,
+        "xButton": x_button,
+        "yButton": y_button,
         "teleopHeld": teleop_held,
         "teleopThreshold": 0.65,
     }
@@ -8570,6 +8654,10 @@ def controller_input_text(summary: dict[str, Any]) -> str:
         parts.append(f"A={bool(summary.get('aButton'))}")
     if summary.get("bButton") is not None:
         parts.append(f"B={bool(summary.get('bButton'))}")
+    if summary.get("xButton") is not None:
+        parts.append(f"X={bool(summary.get('xButton'))}")
+    if summary.get("yButton") is not None:
+        parts.append(f"Y={bool(summary.get('yButton'))}")
     parts.append(f"teleopHeld={bool(summary.get('teleopHeld'))}")
     return ", ".join(parts)
 
