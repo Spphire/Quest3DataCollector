@@ -99,7 +99,7 @@ DEFAULT_GRIPPER_DEVICE_CANDIDATES = [
     "gripper",
 ]
 DEFAULT_GRIPPER_OPEN_WIDTH_M = 0.08
-DEFAULT_GRIPPER_CLOSE_WIDTH_M = 0.0
+DEFAULT_GRIPPER_CLOSE_WIDTH_M = 0.01
 DEFAULT_GRIPPER_SPEED_MPS = 0.04
 DEFAULT_GRIPPER_FORCE_N = 20.0
 DEFAULT_GRIPPER_TRIGGER_CLOSE_THRESHOLD = 0.65
@@ -154,6 +154,43 @@ ROBOT_CARTESIAN_TARGET_POSITION_EPS_M = 0.001
 ROBOT_CARTESIAN_TARGET_ROTATION_EPS_DEG = 0.25
 POSE_DIVERSITY_MAX_PAIRWISE_SAMPLES = 512
 FREEDRIVE_FLOATING_CARTESIAN_PRIMITIVE = "FloatingCartesian()"
+
+
+def controller_input_sources(controller: Any) -> list[dict[str, Any]]:
+    if not isinstance(controller, dict):
+        return []
+    sources = [controller]
+    for key in ("input", "buttons"):
+        value = controller.get(key)
+        if isinstance(value, dict):
+            sources.append(value)
+    return sources
+
+
+def controller_button_pressed(controller: Any, *names: str) -> bool:
+    for source in controller_input_sources(controller):
+        for name in names:
+            value = source.get(name)
+            if isinstance(value, bool) and value:
+                return True
+    return False
+
+
+def controller_hand_trigger_held(controller: Any, threshold: float = 0.65) -> bool:
+    if controller_button_pressed(
+        controller,
+        "handTriggerPressed",
+        "rightHandTriggerPressed",
+        "gripPressed",
+        "gripButton",
+    ):
+        return True
+    for source in controller_input_sources(controller):
+        for name in ("handTrigger", "rightHandTrigger", "grip", "primaryHandTrigger"):
+            value = source.get(name)
+            if is_number(value) and float(value) >= float(threshold):
+                return True
+    return False
 
 
 def positive_cartesian_limit(value: Any, name: str) -> float:
@@ -403,6 +440,7 @@ class FlexivRobotClient:
         self.gripper_device: str | None = None
         self.gripper_last_error: str | None = None
         self.gripper_enable_attempts: list[dict[str, Any]] = []
+        self.gripper_initialized = False
         self.device_list_cache: dict[str, bool] | None = None
         self.device_list_last_error: str | None = None
         self.joint_limits = default_rizon4_joint_limits()
@@ -893,6 +931,33 @@ class FlexivRobotClient:
             guard["targetUpdateDurationSeconds"] = time.perf_counter() - started
             return guard
 
+    def restore_cartesian_target(
+        self,
+        target_pose_wxyz: list[float],
+        joint_limit_buffer_rad: float,
+        joint_limit_guard_enabled: bool,
+    ) -> dict[str, Any]:
+        """Send and continuously hold an absolute TCP target until another mode takes over."""
+        result = self.send_cartesian_target(
+            target_pose_wxyz,
+            joint_limit_buffer_rad,
+            joint_limit_guard_enabled,
+        )
+        if not isinstance(result, dict) or not bool(result.get("ok")):
+            return result
+
+        with self.lock:
+            if self.robot is None or not self.motion_armed or self.freedrive_enabled:
+                result["controlLoopStarted"] = False
+                return result
+            try:
+                self.start_cartesian_control_loop_locked()
+                result["controlLoopStarted"] = True
+            except Exception as exc:  # pragma: no cover - hardware path
+                result["controlLoopStarted"] = False
+                result["controlLoopError"] = str(exc)
+        return result
+
     def start_cartesian_control_loop_locked(self) -> None:
         if self.robot is None:
             raise RuntimeError("Flexiv robot is not connected")
@@ -1223,6 +1288,47 @@ class FlexivRobotClient:
                 candidates.append(name)
         return candidates
 
+    @staticmethod
+    def _gripper_requires_manual_init(device_name: str | None) -> bool:
+        """Return whether this device is known to need an explicit Init command."""
+        normalized = str(device_name or "").strip().lower()
+        # Flexiv's RDK example documents manual initialization for 48 V Grav
+        # grippers. Robotiq grippers initialize automatically on power-on.
+        return "grav" in normalized or "gn01" in normalized
+
+    def _switch_gripper_tool_locked(self, device_name: str) -> str | None:
+        """Select the gripper as the active Flexiv tool when it is configured."""
+        if self.robot is None:
+            return "Flexiv robot is not connected"
+        flexivrdk = sys.modules.get("flexivrdk") or import_flexivrdk(None)
+        try:
+            tool = flexivrdk.Tool(self.robot)
+            exists = getattr(tool, "exist", None)
+            if callable(exists) and not bool(exists(device_name)):
+                return None
+            tool.Switch(device_name)
+        except Exception as exc:
+            return str(exc)
+        return None
+
+    def _initialize_gripper_locked(self, *, init_on_enable: bool) -> tuple[str | None, bool]:
+        if self.gripper is None:
+            return "Flexiv gripper is not enabled", False
+        if not init_on_enable or not self._gripper_requires_manual_init(self.gripper_device):
+            self.gripper_initialized = True
+            return None, False
+        if self.gripper_initialized:
+            return None, False
+        try:
+            self.gripper.Init()
+        except Exception as exc:
+            self.gripper_initialized = False
+            self.gripper_last_error = str(exc)
+            return str(exc), False
+        self.gripper_initialized = True
+        self.gripper_last_error = None
+        return None, True
+
     def enable_gripper_locked(
         self,
         device_name: str,
@@ -1236,8 +1342,12 @@ class FlexivRobotClient:
         if self.gripper is not None and self.gripper_enabled:
             current = str(self.gripper_device or "").strip()
             if requested.lower() in ("auto", "default") or not current or current == requested:
-                status = self.gripper_status_locked()
+                init_error, initialized_now = self._initialize_gripper_locked(init_on_enable=init_on_enable)
+                status = self.gripper_status_locked(include_params=True, include_states=True)
                 status["reusedExisting"] = True
+                status["initializedNow"] = initialized_now
+                if init_error is not None:
+                    status["initError"] = init_error
                 return status
         attempts: list[dict[str, Any]] = []
         last_error: str | None = None
@@ -1245,18 +1355,22 @@ class FlexivRobotClient:
             gripper = flexivrdk.Gripper(self.robot)
             try:
                 gripper.Enable(device)
-                init_error: str | None = None
-                if init_on_enable:
-                    try:
-                        gripper.Init()
-                    except Exception as exc:
-                        # Some Robotiq/Flexiv gripper configurations initialize automatically on power-on.
-                        init_error = str(exc)
                 self.gripper = gripper
                 self.gripper_enabled = True
                 self.gripper_device = device
-                self.gripper_last_error = None
-                attempts.append({"device": device, "ok": True, "initError": init_error})
+                self.gripper_initialized = False
+                tool_error = self._switch_gripper_tool_locked(device)
+                if tool_error is not None:
+                    raise RuntimeError(f"Could not switch Flexiv tool to [{device}]: {tool_error}")
+                init_error, initialized_now = self._initialize_gripper_locked(init_on_enable=init_on_enable)
+                attempts.append(
+                    {
+                        "device": device,
+                        "ok": True,
+                        "initError": init_error,
+                        "initialized": self.gripper_initialized,
+                    }
+                )
                 self.gripper_enable_attempts = attempts
                 return self.gripper_status_locked(include_params=True, include_states=True)
             except Exception as exc:
@@ -1266,14 +1380,21 @@ class FlexivRobotClient:
                     self.gripper = gripper
                     self.gripper_enabled = True
                     self.gripper_device = device
-                    self.gripper_last_error = None
+                    self.gripper_initialized = False
+                    tool_error = self._switch_gripper_tool_locked(device)
+                    if tool_error is not None:
+                        raise RuntimeError(f"Could not switch Flexiv tool to [{device}]: {tool_error}")
+                    init_error, initialized_now = self._initialize_gripper_locked(init_on_enable=init_on_enable)
                     attempts[-1]["ok"] = True
                     attempts[-1]["reusedAlreadyEnabled"] = True
+                    attempts[-1]["initError"] = init_error
+                    attempts[-1]["initialized"] = self.gripper_initialized
                     self.gripper_enable_attempts = attempts
                     return self.gripper_status_locked(include_params=True, include_states=True)
         self.gripper = None
         self.gripper_enabled = False
         self.gripper_device = None
+        self.gripper_initialized = False
         self.gripper_last_error = last_error or "no gripper device candidates were available"
         self.gripper_enable_attempts = attempts
         tried = ", ".join(row.get("device", "") for row in attempts) or requested
@@ -1292,6 +1413,7 @@ class FlexivRobotClient:
         self.gripper = None
         self.gripper_enabled = False
         self.gripper_device = None
+        self.gripper_initialized = False
 
     def gripper_status_locked(
         self,
@@ -1302,6 +1424,7 @@ class FlexivRobotClient:
         payload: dict[str, Any] = {
             "enabled": self.gripper_enabled,
             "device": self.gripper_device,
+            "initialized": self.gripper_initialized,
             "lastError": self.gripper_last_error,
             "enableAttempts": self.gripper_enable_attempts[-12:],
         }
@@ -1348,9 +1471,13 @@ class FlexivRobotClient:
             if self.gripper is None:
                 self.enable_gripper_locked(
                     str(self.gripper_device or DEFAULT_GRIPPER_DEVICE),
-                    init_on_enable=DEFAULT_GRIPPER_INIT_ON_ENABLE,
+                    init_on_enable=True,
                 )
             assert self.gripper is not None
+            if not self.gripper_initialized:
+                init_error, _ = self._initialize_gripper_locked(init_on_enable=True)
+                if init_error is not None:
+                    raise RuntimeError(f"Flexiv gripper initialization failed: {init_error}")
             params_payload: dict[str, Any] = {}
             try:
                 params = self.gripper.params()
@@ -3579,7 +3706,12 @@ class RobotRealsenseSession:
                 self.config.gripper_device,
                 init_on_enable=self.config.gripper_init_on_enable,
             )
-            self.gripper_available = bool(status.get("enabled", True)) if isinstance(status, dict) else True
+            if isinstance(status, dict):
+                self.gripper_available = bool(status.get("enabled", True)) and (
+                    not self.config.gripper_init_on_enable or bool(status.get("initialized", True))
+                )
+            else:
+                self.gripper_available = True
             event = {
                 "ok": self.gripper_available,
                 "commandSent": False,
@@ -3966,6 +4098,22 @@ class FlexivRealSenseManager:
         self.active_session: RobotRealsenseSession | None = None
         self.last_calibration: dict[str, Any] | None = None
         self.last_error: str | None = None
+        self.tcp_bookmark_target_pose: list[float] | None = None
+        self.tcp_bookmark_saved_at_utc: str | None = None
+        self.tcp_bookmark_last_event: dict[str, Any] | None = None
+        self.tcp_bookmark_button_states: dict[str, tuple[bool, bool]] = {}
+
+    def _tcp_bookmark_status_locked(self) -> dict[str, Any]:
+        return {
+            "saved": self.tcp_bookmark_target_pose is not None,
+            "targetPoseWxyz": list(self.tcp_bookmark_target_pose)
+            if self.tcp_bookmark_target_pose is not None
+            else None,
+            "targetFrame": "robot_base",
+            "poseFormat": "[x,y,z,qw,qx,qy,qz]",
+            "savedAtUtc": self.tcp_bookmark_saved_at_utc,
+            "lastEvent": copy.deepcopy(self.tcp_bookmark_last_event),
+        }
 
     def status(self, *, lightweight: bool = False) -> dict[str, Any]:
         with self.lock:
@@ -3987,6 +4135,7 @@ class FlexivRealSenseManager:
                 "activeSession": active,
                 "realsenseStream": self.stream_hub.status(),
                 "lastCalibration": self.last_calibration,
+                "tcpBookmark": self._tcp_bookmark_status_locked(),
                 "lastError": self.last_error,
             }
 
@@ -4013,6 +4162,7 @@ class FlexivRealSenseManager:
                 "motionCommandsAllowed": self.motion_commands_allowed,
                 "robot": robot_status,
                 "activeSession": active,
+                "tcpBookmark": self._tcp_bookmark_status_locked(),
                 "lastError": self.last_error,
             }
 
@@ -4231,6 +4381,167 @@ class FlexivRealSenseManager:
         self.robot.disconnect()
         self.config.controller_motion_enabled = False
         return self.status()
+
+    def handle_quest_tcp_bookmark(
+        self,
+        message: dict[str, Any],
+        *,
+        source: str = "quest",
+    ) -> dict[str, Any] | None:
+        """Handle rising edges of left Y (save) and left X (restore) from Quest telemetry."""
+        if not isinstance(message, dict) or message.get("type") != "sample":
+            return None
+
+        left_controller = message.get("leftController")
+        x_button = controller_button_pressed(
+            left_controller,
+            "xButton",
+            "buttonX",
+            "primaryButton",
+        )
+        y_button = controller_button_pressed(
+            left_controller,
+            "yButton",
+            "buttonY",
+            "secondaryButton",
+        )
+        source_key = str(source or "quest")
+        with self.lock:
+            previous_x, previous_y = self.tcp_bookmark_button_states.get(source_key, (False, False))
+            self.tcp_bookmark_button_states[source_key] = (x_button, y_button)
+
+        x_down = x_button and not previous_x
+        y_down = y_button and not previous_y
+        if not x_down and not y_down:
+            return None
+        if y_down:
+            event = self._save_tcp_bookmark(message)
+        else:
+            event = self._restore_tcp_bookmark(message)
+        with self.lock:
+            self.tcp_bookmark_last_event = copy.deepcopy(event)
+        return event
+
+    def _save_tcp_bookmark(self, message: dict[str, Any]) -> dict[str, Any]:
+        base = {
+            "action": "save",
+            "recordId": message.get("recordId"),
+            "sampleIndex": message.get("sampleIndex"),
+            "capturedAtUtc": datetime.now(timezone.utc).isoformat(),
+            "targetFrame": "robot_base",
+            "poseFormat": "[x,y,z,qw,qx,qy,qz]",
+            "commandSent": False,
+        }
+        try:
+            target = self.robot.read_tcp_pose()
+        except Exception as exc:  # pragma: no cover - hardware path
+            return {
+                **base,
+                "ok": False,
+                "reason": "tcp_read_failed",
+                "error": str(exc),
+            }
+        if len(target) < 7 or not all(math.isfinite(float(value)) for value in target[:7]):
+            return {
+                **base,
+                "ok": False,
+                "reason": "tcp_pose_invalid",
+                "error": "Flexiv returned an invalid tcp_pose",
+            }
+
+        target = [float(value) for value in target[:7]]
+        saved_at = str(base["capturedAtUtc"])
+        with self.lock:
+            self.tcp_bookmark_target_pose = target
+            self.tcp_bookmark_saved_at_utc = saved_at
+        return {
+            **base,
+            "ok": True,
+            "targetPoseWxyz": list(target),
+            "message": "Saved current robot TCP; left X will restore it.",
+        }
+
+    def _restore_tcp_bookmark(self, message: dict[str, Any]) -> dict[str, Any]:
+        base = {
+            "action": "restore",
+            "recordId": message.get("recordId"),
+            "sampleIndex": message.get("sampleIndex"),
+            "capturedAtUtc": datetime.now(timezone.utc).isoformat(),
+            "targetFrame": "robot_base",
+            "poseFormat": "[x,y,z,qw,qx,qy,qz]",
+            "commandSent": False,
+        }
+        if controller_hand_trigger_held(message.get("rightController")):
+            return {
+                **base,
+                "ok": False,
+                "reason": "right_teleop_held",
+                "error": "Release the right-hand teleoperation trigger before restoring the TCP bookmark.",
+            }
+
+        quest_target = message.get("tcpBookmarkTargetPoseWxyz")
+        target_from_quest = None
+        if isinstance(quest_target, (list, tuple)) and len(quest_target) >= 7:
+            try:
+                candidate = [float(value) for value in quest_target[:7]]
+            except (TypeError, ValueError):
+                candidate = None
+            if candidate is not None and all(math.isfinite(value) for value in candidate):
+                target_from_quest = candidate
+                with self.lock:
+                    self.tcp_bookmark_target_pose = list(candidate)
+
+        with self.lock:
+            target = (
+                list(target_from_quest)
+                if target_from_quest is not None
+                else list(self.tcp_bookmark_target_pose)
+                if self.tcp_bookmark_target_pose is not None
+                else None
+            )
+            motion_allowed = self.motion_commands_allowed
+        target_source = "quest" if target_from_quest is not None else "pc_memory"
+        if target is None:
+            return {
+                **base,
+                "ok": False,
+                "reason": "no_saved_tcp",
+                "error": "No saved TCP target; press left Y first.",
+            }
+        if not motion_allowed:
+            return {
+                **base,
+                "ok": False,
+                "reason": "record_only_mode",
+                "error": "TCP restore is disabled in record_only mode.",
+                "targetPoseWxyz": target,
+                "targetSource": target_source,
+            }
+        try:
+            motion = self.robot.restore_cartesian_target(
+                target,
+                self.config.controller_joint_limit_buffer_rad,
+                self.config.controller_joint_limit_guard_enabled,
+            )
+        except Exception as exc:  # pragma: no cover - hardware path
+            return {
+                **base,
+                "ok": False,
+                "reason": "tcp_restore_failed",
+                "error": str(exc),
+                "targetPoseWxyz": target,
+                "targetSource": target_source,
+            }
+        return {
+            **base,
+            "ok": bool(motion.get("ok")),
+            "commandSent": bool(motion.get("commandSent")),
+            "targetPoseWxyz": target,
+            "targetSource": target_source,
+            "motion": motion,
+            "reason": motion.get("reason"),
+            "message": "Restoring saved robot TCP target.",
+        }
 
     def arm_motion(self) -> dict[str, Any]:
         if not self.motion_commands_allowed:

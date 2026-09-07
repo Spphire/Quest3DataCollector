@@ -104,6 +104,97 @@ GAZE_PROJECTION_STATUS_NAMES = {
 IMAGE_RESIZE_MODES = ("stretch", "letterbox")
 
 
+def trim_quest_stale_endpoints(
+    samples: List[dict],
+    *,
+    max_gaze_age_seconds: Optional[float],
+    max_endpoint_reuse_frames: Optional[int] = 5,
+) -> Tuple[List[dict], Dict[str, int]]:
+    """Trim stale rows and long terminal Quest-source reuse runs.
+
+    Internal stale/reused rows are deliberately retained for interpolation/masking.
+    A long reuse run at an episode edge is treated as a Quest stop/idle tail, while
+    short endpoint reuse (and all internal reuse) remains part of the episode.
+    """
+    if max_gaze_age_seconds is not None and max_gaze_age_seconds < 0.0:
+        raise ValueError("max_gaze_age_seconds must be non-negative")
+    if max_endpoint_reuse_frames is not None and max_endpoint_reuse_frames < 0:
+        raise ValueError("max_endpoint_reuse_frames must be non-negative")
+
+    def stale(row: dict) -> bool:
+        aligned = row.get("pc_perf_counter_seconds")
+        received = row.get("quest_pc_receive_perf_counter_seconds")
+        return max_gaze_age_seconds is not None and (
+            isinstance(aligned, (int, float))
+            and isinstance(received, (int, float))
+            and math.isfinite(float(aligned))
+            and math.isfinite(float(received))
+            and float(aligned) - float(received) > max_gaze_age_seconds
+        )
+
+    def reused(row: dict) -> bool:
+        return bool(row.get("aligned_source_reused"))
+
+    start = 0
+    end = len(samples)
+    stale_start = stale_end = reuse_start = reuse_end = 0
+    while True:
+        changed = False
+        if max_endpoint_reuse_frames is not None:
+            left = start
+            while left < end and reused(samples[left]):
+                left += 1
+            right = end
+            while right > start and reused(samples[right - 1]):
+                right -= 1
+            if left - start > max_endpoint_reuse_frames:
+                reuse_start += left - start
+                start = left
+                changed = True
+            if end - right > max_endpoint_reuse_frames:
+                reuse_end += end - right
+                end = right
+                changed = True
+        while start < end and stale(samples[start]):
+            start += 1
+            stale_start += 1
+            changed = True
+        while end > start and stale(samples[end - 1]):
+            end -= 1
+            stale_end += 1
+            changed = True
+        if not changed:
+            break
+    return samples[start:end], {
+        "trim_start_frames": start,
+        "trim_end_frames": len(samples) - end,
+        "trim_start_stale_frames": stale_start,
+        "trim_end_stale_frames": stale_end,
+        "trim_start_reuse_frames": reuse_start,
+        "trim_end_reuse_frames": reuse_end,
+    }
+
+
+def quest_reuse_metrics(samples: List[dict]) -> Dict[str, float | int]:
+    """Return post-trim Quest-source reuse metrics for episode selection."""
+    reused_count = 0
+    longest = 0
+    current = 0
+    for sample in samples:
+        if bool(sample.get("aligned_source_reused")):
+            reused_count += 1
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return {
+        "retained_frames": len(samples),
+        "reused_frames": reused_count,
+        "reuse_ratio": reused_count / len(samples) if samples else 1.0,
+        "max_consecutive_reuse": longest,
+    }
+
+
 def iter_jsonl(path: Path) -> Iterable[dict]:
     with path.open("r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
@@ -415,6 +506,12 @@ def build_smoothed_interpolated_gaze(
             and float(aligned_time) - float(gaze_time) > max_gaze_age_seconds
         )
         source_index = sample.get("quest_sample_index")
+        # A reused aligned row carries the previous Quest payload by design. Do not
+        # treat that payload as a fresh gaze label; internal short runs are filled
+        # from the surrounding fresh samples below, while endpoint runs are trimmed.
+        if bool(sample.get("aligned_source_reused")):
+            sample["_gaze_was_reused"] = True
+            source_index = None
         ray = (
             quest_rays_by_index.get(int(source_index))
             if source_index is not None and not gaze_is_stale
@@ -431,6 +528,7 @@ def build_smoothed_interpolated_gaze(
             if (
                 allow_xyz_fallback
                 and not gaze_is_stale
+                and not sample.get("_gaze_was_reused", False)
                 and raw_point.shape == (3,)
                 and np.all(np.isfinite(raw_point))
             ):
@@ -488,6 +586,7 @@ def build_smoothed_interpolated_gaze(
         ),
         "fallback_xyz_median": fallback_xyz_count,
         "stale_input_3d": sum(1 for sample in samples if sample.get("_gaze_was_stale")),
+        "reused_input_3d": sum(1 for sample in samples if sample.get("_gaze_was_reused")),
     }
 
 
@@ -820,6 +919,8 @@ def build_plans(
     max_gaze_age_seconds: Optional[float],
     max_sample_gap_seconds: Optional[float],
     max_endpoint_trim_seconds: float,
+    max_consecutive_reuse: Optional[int] = 5,
+    max_fallback_reuse_ratio: Optional[float] = 0.20,
     selection_report: Optional[dict] = None,
 ) -> List[EpisodePlan]:
     plans = []
@@ -891,11 +992,36 @@ def build_plans(
                 max_sample_gap_seconds=max_sample_gap_seconds,
                 max_endpoint_trim_seconds=max_endpoint_trim_seconds,
             )
+            valid_samples, quest_endpoint_trim = trim_quest_stale_endpoints(
+                valid_samples,
+                max_gaze_age_seconds=max_gaze_age_seconds,
+                max_endpoint_reuse_frames=max_consecutive_reuse,
+            )
+            reuse_metrics = quest_reuse_metrics(valid_samples)
+            if video_metrics is None:
+                video_metrics = {}
+            video_metrics["quest_endpoint_trim"] = quest_endpoint_trim
+            video_metrics["quest_source_reuse"] = reuse_metrics
             discontinuities = find_sample_timeline_discontinuities(
                 valid_samples,
                 max_gap_seconds=max_sample_gap_seconds,
             )
-            if invalid_rows > 0 or missing_robot_state > 0 or video_reasons or discontinuities:
+            excessive_reuse = (
+                max_consecutive_reuse is not None
+                and reuse_metrics["max_consecutive_reuse"] > max_consecutive_reuse
+            )
+            excessive_reuse_ratio = (
+                max_fallback_reuse_ratio is not None
+                and reuse_metrics["reuse_ratio"] > max_fallback_reuse_ratio
+            )
+            if (
+                invalid_rows > 0
+                or missing_robot_state > 0
+                or video_reasons
+                or discontinuities
+                or excessive_reuse
+                or excessive_reuse_ratio
+            ):
                 reasons = []
                 if invalid_rows > 0:
                     reasons.append("invalid_aligned_rows")
@@ -904,6 +1030,10 @@ def build_plans(
                 reasons.extend(video_reasons)
                 if discontinuities:
                     reasons.append("timeline_discontinuity")
+                if excessive_reuse:
+                    reasons.append("aligned_quest_consecutive_reuse")
+                if excessive_reuse_ratio:
+                    reasons.append("aligned_quest_reuse_ratio")
                 logger.warning(
                     f"Skip {record_dir.name}: strict episode integrity failed "
                     f"(invalid_rows={invalid_rows}, missing_robot_state={missing_robot_state}, "
@@ -918,6 +1048,7 @@ def build_plans(
                         "video_reasons": video_reasons,
                         "timeline_discontinuities": discontinuities,
                         "video_alignment": video_metrics,
+                        "quest_source_reuse": reuse_metrics,
                     },
                 )
                 continue
@@ -1519,6 +1650,9 @@ def convert_pc_recordings_to_zarr(args):
             "max_gaze_age_seconds": args.max_gaze_age_seconds,
             "max_sample_gap_seconds": args.max_sample_gap_seconds,
             "missing_gaze_excludes_recording": False,
+            "trim_quest_stale_endpoints": True,
+            "max_consecutive_reuse_for_selection": getattr(args, "max_consecutive_reuse", 5),
+            "max_fallback_reuse_ratio": getattr(args, "max_fallback_reuse_ratio", 0.20),
             "gaze_median_window": int(args.gaze_median_window),
             "image_resize_mode": args.image_resize_mode,
             "include_eye_camera": include_eye_camera,
@@ -1540,6 +1674,8 @@ def convert_pc_recordings_to_zarr(args):
         max_gaze_age_seconds=args.max_gaze_age_seconds,
         max_sample_gap_seconds=args.max_sample_gap_seconds,
         max_endpoint_trim_seconds=args.max_endpoint_trim_seconds,
+        max_consecutive_reuse=getattr(args, "max_consecutive_reuse", 5),
+        max_fallback_reuse_ratio=getattr(args, "max_fallback_reuse_ratio", 0.20),
         selection_report=selection_report,
     )
     selection_report["candidate_count"] = len(selection_report["candidate_record_ids"])
@@ -1769,6 +1905,21 @@ def main():
             "sample eligible for internal interpolation. The action row is retained. "
             "Default: 0.060."
         ),
+    )
+    parser.add_argument(
+        "--max-consecutive-reuse",
+        type=int,
+        default=5,
+        help=(
+            "Documented quality threshold for consecutive Quest-source reuse. "
+            "Short internal runs are interpolated; endpoint stale runs are trimmed. Default: 5."
+        ),
+    )
+    parser.add_argument(
+        "--max-fallback-reuse-ratio",
+        type=float,
+        default=0.20,
+        help="Maximum cumulative Quest-source reuse ratio after endpoint trim. Default: 0.20.",
     )
     parser.add_argument(
         "--gaze-median-window",
