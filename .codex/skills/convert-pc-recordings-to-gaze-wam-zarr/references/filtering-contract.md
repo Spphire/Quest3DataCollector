@@ -22,9 +22,9 @@ Apply these rules to each physical recording independently:
 
 - Require aligned samples, robot states, both required videos, and end-camera intrinsics.
 - Require every retained aligned row to be valid and linked to a robot state.
-- Require contiguous camera frame indexes and monotonically increasing aligned/capture timelines.
+- Require contiguous camera frame indexes within each source and monotonically increasing capture timelines.
 - Require image alignment age and internal sample/camera gaps to be at most 60 ms.
-- Search only for a common continuous window obtainable by trimming at most 1.0 second from each start/end of each aligned or camera stream.
+- Use the end/wrist camera as the master capture timeline. For every retained master frame, match the nearest third-camera frame by capture timestamp, requiring monotonic third frame indexes and a maximum timestamp delta of 60 ms. Do not require equal frame counts or equal frame indexes across devices.
 - Keep the retained window as one episode. Never extract an internal good segment around a bad middle interval.
 - Reject the entire physical recording when no valid common window exists or an internal discontinuity remains.
 - Require at least two retained samples and readable TCP pose/video paths.

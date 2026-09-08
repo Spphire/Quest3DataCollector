@@ -834,9 +834,64 @@ def trim_and_attach_video_timelines(
             )
 
     if not candidates:
-        return [], [
-            "no_continuous_common_window_within_endpoint_trim_and_timing_limits"
-        ], metrics
+        # Fall back to timestamp matching when independent 30 Hz clocks drift.
+        # The end camera remains the master device; each other stream is matched
+        # to its nearest monotonically increasing frame instead of by frame index.
+        master = timelines.get("end", [])
+        if master and len(samples) >= 2:
+            master_times = _finite_time_array(
+                frame.get("frame_captured_perf_counter_seconds") for frame in master
+            )
+            sample_times = _finite_time_array(
+                sample_time(sample, index) for index, sample in enumerate(samples)
+            )
+            if master_times is not None and sample_times is not None:
+                master_indices = np.searchsorted(master_times, sample_times, side="left")
+                master_indices = np.clip(master_indices, 0, len(master) - 1)
+                deltas = np.abs(master_times[master_indices] - sample_times)
+                if float(np.max(deltas)) <= float(max_image_age_seconds or np.inf):
+                    matched: Dict[str, List[int]] = {"end": master_indices.tolist()}
+                    ok = True
+                    for role in roles:
+                        if role == "end":
+                            continue
+                        frames = timelines[role]
+                        times = _finite_time_array(
+                            frame.get("frame_captured_perf_counter_seconds") for frame in frames
+                        )
+                        if times is None:
+                            ok = False
+                            break
+                        indices = np.searchsorted(times, master_times[master_indices], side="left")
+                        indices = np.clip(indices, 0, len(frames) - 1)
+                        nearest = np.minimum(
+                            np.abs(times[indices] - master_times[master_indices]),
+                            np.abs(times[np.maximum(indices - 1, 0)] - master_times[master_indices]),
+                        )
+                        if float(np.max(nearest)) > float(max_image_age_seconds or np.inf):
+                            ok = False
+                            break
+                        matched[role] = indices.tolist()
+                    if ok:
+                        retained_samples = samples
+                        metrics["retained_aligned_rows"] = len(retained_samples)
+                        metrics["alignment_strategy"] = "end_master_nearest_timestamp"
+                        for role in roles:
+                            frames = timelines[role]
+                            for sample, frame_index in zip(retained_samples, matched[role]):
+                                frame = frames[int(frame_index)]
+                                sample.setdefault("videos", {})[role] = {
+                                    "path": frame.get("video"),
+                                    "frameIndex": int(frame["frame_index"]),
+                                    "serial": frame.get("serial"),
+                                }
+                                sample.setdefault("videoFrames", {})[role] = {
+                                    "capturedPerfCounterSeconds": float(frame["frame_captured_perf_counter_seconds"]),
+                                    "capturedAtUtc": frame.get("frame_captured_at_utc"),
+                                    "streamSequence": frame.get("stream_sequence"),
+                                }
+                        return retained_samples, [], metrics
+        return [], ["no_continuous_common_window_within_endpoint_trim_and_timing_limits"], metrics
 
     best = min(candidates, key=lambda item: item["score"])
     retained_samples = samples[best["sample_start"]:best["sample_end"]]

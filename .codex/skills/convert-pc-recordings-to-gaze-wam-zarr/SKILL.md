@@ -14,6 +14,12 @@ stale or terminal Quest-source reuse first, then evaluate the retained internal
 window. A cumulative reuse ratio of 10% is not by itself a hard rejection when
 the raw timeline is available.
 
+Video alignment is master-timeline based: use the `end` camera as the master
+device and match each master frame to the nearest monotonically increasing
+`third` frame by capture timestamp. Different frame counts are expected and are
+not a rejection by themselves. Keep the 60 ms maximum match age and stream-gap
+checks; never reuse one camera frame for multiple master frames.
+
 ## Required Inputs
 
 Resolve these values from the request or deployment context:
